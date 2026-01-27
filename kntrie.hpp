@@ -17,7 +17,6 @@ class kntrie {
     static_assert(std::is_integral_v<KEY>, "KEY must be an integral type");
     
 public:
-    // Type aliases
     using key_type = KEY;
     using mapped_type = VALUE;
     using value_type = std::pair<const KEY, VALUE>;
@@ -34,24 +33,67 @@ private:
     static constexpr size_t max_leaf_entries = 64;
     static constexpr bool value_inline = sizeof(VALUE) <= 8 && std::is_trivially_copyable_v<VALUE>;
     
-    // Tag constants
+    // Pointer layout:
+    // Bit 63: leaf tag
+    // Bits 59-62: skip count (4 bits, 0-15)
+    // Bits 0-58: address (59 bits)
     static constexpr uint64_t LEAF_TAG = 1ULL << 63;
-    static constexpr uint64_t PTR_MASK = ~LEAF_TAG;
+    static constexpr uint64_t SKIP_SHIFT = 59;
+    static constexpr uint64_t SKIP_MASK = 0xFULL << SKIP_SHIFT;
+    static constexpr uint64_t ADDR_MASK = (1ULL << 59) - 1;
     
     // Value allocator type
     using value_alloc_type = typename std::allocator_traits<ALLOC>::template rebind_alloc<VALUE>;
     
     // Members
-    uint64_t root_;       // Tagged pointer to root node (stored as uint64_t)
+    uint64_t root_;
     size_t size_;
     [[no_unique_address]] ALLOC alloc_;
+    
+    // =========================================================================
+    // Bit utilities
+    // =========================================================================
+    
+    static constexpr bool high_bit_set(uint64_t v) noexcept {
+        return static_cast<int64_t>(v) < 0;
+    }
+    
+    // =========================================================================
+    // Pointer tagging
+    // =========================================================================
+    
+    static constexpr bool is_leaf(uint64_t ptr) noexcept {
+        return high_bit_set(ptr);
+    }
+    
+    static constexpr uint64_t get_skip(uint64_t ptr) noexcept {
+        return (ptr >> SKIP_SHIFT) & 0xF;
+    }
+    
+    static constexpr uint64_t* get_addr(uint64_t ptr) noexcept {
+        return reinterpret_cast<uint64_t*>(ptr & ADDR_MASK);
+    }
+    
+    static constexpr uint64_t make_ptr(uint64_t* addr, bool leaf, uint64_t skip) noexcept {
+        uint64_t ptr = reinterpret_cast<uint64_t>(addr);
+        if (leaf) ptr |= LEAF_TAG;
+        ptr |= (skip << SKIP_SHIFT);
+        return ptr;
+    }
+    
+    static constexpr uint64_t make_leaf_ptr(uint64_t* addr) noexcept {
+        return make_ptr(addr, true, 0);
+    }
+    
+    static constexpr uint64_t make_internal_ptr(uint64_t* addr, uint64_t skip = 0) noexcept {
+        return make_ptr(addr, false, skip);
+    }
     
     // =========================================================================
     // Key Conversion
     // =========================================================================
     
     static constexpr uint64_t key_to_internal(KEY k) noexcept {
-        // Convert to unsigned of same size
         uint64_t result;
         
         if constexpr (sizeof(KEY) == 1) {
@@ -64,57 +106,68 @@ private:
             result = static_cast<uint64_t>(k);
         }
         
-        // Flip sign bit for signed types to make sortable
-        // This maps: INT_MIN -> 0, 0 -> 0x80..., INT_MAX -> 0xFF...
         if constexpr (is_signed_key) {
             constexpr uint64_t sign_bit = 1ULL << (key_bits - 1);
             result ^= sign_bit;
         }
         
-        // Shift to high bits for MSB-first traversal
-        // No byteswap needed - shifting preserves numeric order
         result <<= (64 - key_bits);
-        
         return result;
     }
     
     static constexpr KEY internal_to_key(uint64_t internal) noexcept {
-        // Shift back from high bits
         internal >>= (64 - key_bits);
         
-        // Flip sign bit back for signed types
         if constexpr (is_signed_key) {
             constexpr uint64_t sign_bit = 1ULL << (key_bits - 1);
             internal ^= sign_bit;
         }
         
-        // No byteswap needed - just cast back
         return static_cast<KEY>(internal);
     }
     
-    // Extract 6-bit index at given shift position
     static constexpr uint8_t extract_index(uint64_t internal_key, size_t shift) noexcept {
         return static_cast<uint8_t>((internal_key >> shift) & 0x3F);
     }
     
+    // Extract prefix bits from key for given skip and shift
+    static constexpr uint64_t extract_prefix(uint64_t internal_key, size_t shift, size_t skip) noexcept {
+        // shift is the starting position, skip is number of 6-bit chunks
+        // We want bits [shift, shift - skip*6)
+        size_t prefix_bits = skip * 6;
+        size_t end_shift = shift - prefix_bits + 6; // +6 because shift points to current level
+        uint64_t mask = (1ULL << prefix_bits) - 1;
+        return (internal_key >> end_shift) & mask;
+    }
+    
     // =========================================================================
-    // Pointer Tagging
+    // Internal Node Layout (with skip)
+    // skip == 0: [bitmap][children...]
+    // skip > 0:  [prefix][bitmap][children...]
     // =========================================================================
     
-    static constexpr bool is_leaf(uint64_t tagged_ptr) noexcept {
-        return (tagged_ptr & LEAF_TAG) != 0;
+    static constexpr size_t bitmap_offset(uint64_t skip) noexcept {
+        return skip > 0 ? 1 : 0;
     }
     
-    static constexpr uint64_t* untag_ptr(uint64_t tagged_ptr) noexcept {
-        return reinterpret_cast<uint64_t*>(tagged_ptr & PTR_MASK);
+    static constexpr size_t children_offset(uint64_t skip) noexcept {
+        return bitmap_offset(skip) + 1;
     }
     
-    static constexpr uint64_t tag_as_leaf(uint64_t* ptr) noexcept {
-        return reinterpret_cast<uint64_t>(ptr) | LEAF_TAG;
+    static uint64_t get_bitmap(const uint64_t* node, uint64_t skip) noexcept {
+        return node[bitmap_offset(skip)];
     }
     
-    static constexpr uint64_t tag_as_internal(uint64_t* ptr) noexcept {
-        return reinterpret_cast<uint64_t>(ptr);
+    static uint64_t get_prefix(const uint64_t* node) noexcept {
+        return node[0]; // Only valid when skip > 0
+    }
+    
+    static uint64_t* get_children(uint64_t* node, uint64_t skip) noexcept {
+        return node + children_offset(skip);
+    }
+    
+    static const uint64_t* get_children(const uint64_t* node, uint64_t skip) noexcept {
+        return node + children_offset(skip);
     }
     
     // =========================================================================
@@ -131,7 +184,6 @@ private:
     
     // Allocate leaf: [count][keys...][values...]
     uint64_t* alloc_leaf(size_t entry_count) {
-        // count + keys + values
         size_t node_size = 1 + entry_count + entry_count;
         uint64_t* leaf = alloc_node(node_size);
         leaf[0] = entry_count;
@@ -144,18 +196,20 @@ private:
         dealloc_node(leaf, node_size);
     }
     
-    // Allocate internal node: [bitmap][children...]
-    uint64_t* alloc_internal(size_t child_count) {
-        size_t node_size = 1 + child_count;
+    // Allocate internal node
+    // skip == 0: [bitmap][children...] -> 1 + child_count
+    // skip > 0:  [prefix][bitmap][children...] -> 2 + child_count
+    uint64_t* alloc_internal(size_t child_count, uint64_t skip) {
+        size_t node_size = children_offset(skip) + child_count;
         uint64_t* node = alloc_node(node_size);
-        node[0] = 0; // empty bitmap
+        node[bitmap_offset(skip)] = 0; // empty bitmap
         return node;
     }
     
-    void dealloc_internal(uint64_t* node) noexcept {
-        uint64_t bitmap = node[0];
+    void dealloc_internal(uint64_t* node, uint64_t skip) noexcept {
+        uint64_t bitmap = get_bitmap(node, skip);
         size_t child_count = std::popcount(bitmap);
-        size_t node_size = 1 + child_count;
+        size_t node_size = children_offset(skip) + child_count;
         dealloc_node(node, node_size);
     }
     
@@ -186,17 +240,6 @@ private:
         }
     }
     
-    VALUE& value_ref(uint64_t stored) const noexcept {
-        if constexpr (value_inline) {
-            // Can't return ref to inline, this shouldn't be called
-            // This is only for pointer case
-            static VALUE dummy{};
-            return dummy;
-        } else {
-            return *reinterpret_cast<VALUE*>(stored);
-        }
-    }
-    
     void destroy_value(uint64_t stored) noexcept {
         if constexpr (!value_inline) {
             value_alloc_type va(alloc_);
@@ -210,97 +253,97 @@ private:
     // Internal Node Operations
     // =========================================================================
     
-    // Get child pointer (returns 0 if not found)
-    static uint64_t get_child(const uint64_t* node, uint8_t index) noexcept {
-        uint64_t bitmap = node[0];
-        uint64_t below = bitmap << (63 - index);
-        if (!(below & (1ULL << 63))) [[unlikely]] return 0;
-        int slot = std::popcount(below);
-        return node[slot];
-    }
-    
     // Calculate slot for index (assumes bit is set)
     static int calc_slot(uint64_t bitmap, uint8_t index) noexcept {
-        uint64_t below = bitmap << (63 - index);
-        return std::popcount(below);
+        uint64_t shifted = bitmap << (63 - index);
+        return std::popcount(shifted);
+    }
+    
+    // Get child pointer (returns 0 if not found)
+    static uint64_t get_child(const uint64_t* node, uint64_t skip, uint8_t index) noexcept {
+        uint64_t bitmap = get_bitmap(node, skip);
+        uint64_t shifted = bitmap << (63 - index);
+        if (!high_bit_set(shifted)) [[unlikely]] return 0;
+        int slot = std::popcount(shifted);
+        return get_children(node, skip)[slot - 1];
     }
     
     // Insert child into internal node, returns new node
-    uint64_t* insert_child(uint64_t* node, uint8_t index, uint64_t child_ptr) {
-        uint64_t bitmap = node[0];
+    uint64_t* insert_child(uint64_t* node, uint64_t skip, uint8_t index, uint64_t child_ptr) {
+        uint64_t bitmap = get_bitmap(node, skip);
         size_t old_count = std::popcount(bitmap);
         size_t new_count = old_count + 1;
         
-        // Allocate new node
-        uint64_t* new_node = alloc_node(1 + new_count);
-        new_node[0] = bitmap | (1ULL << index);
+        uint64_t new_bitmap = bitmap | (1ULL << index);
+        int slot = calc_slot(new_bitmap, index) - 1;
         
-        int slot = calc_slot(new_node[0], index);
+        uint64_t* new_node = alloc_internal(new_count, skip);
+        if (skip > 0) {
+            new_node[0] = node[0]; // copy prefix
+        }
+        new_node[bitmap_offset(skip)] = new_bitmap;
         
-        // Copy children before slot
-        for (int i = 1; i < slot; ++i) {
-            new_node[i] = node[i];
+        const uint64_t* old_children = get_children(node, skip);
+        uint64_t* new_children = get_children(new_node, skip);
+        
+        for (int i = 0; i < slot; ++i) {
+            new_children[i] = old_children[i];
+        }
+        new_children[slot] = child_ptr;
+        for (size_t i = slot; i < old_count; ++i) {
+            new_children[i + 1] = old_children[i];
         }
         
-        // Insert new child
-        new_node[slot] = child_ptr;
-        
-        // Copy children after slot
-        for (size_t i = slot; i <= old_count; ++i) {
-            new_node[i + 1] = node[i];
-        }
-        
-        // Dealloc old node
-        dealloc_node(node, 1 + old_count);
-        
+        dealloc_internal(node, skip);
         return new_node;
     }
     
     // Remove child from internal node, returns new node (or nullptr if empty)
-    uint64_t* remove_child(uint64_t* node, uint8_t index) {
-        uint64_t bitmap = node[0];
+    uint64_t* remove_child(uint64_t* node, uint64_t skip, uint8_t index) {
+        uint64_t bitmap = get_bitmap(node, skip);
         size_t old_count = std::popcount(bitmap);
         
         if (old_count == 1) {
-            // Node becomes empty
-            dealloc_node(node, 2);
+            dealloc_internal(node, skip);
             return nullptr;
         }
         
         size_t new_count = old_count - 1;
-        int slot = calc_slot(bitmap, index);
+        int slot = calc_slot(bitmap, index) - 1;
         
-        // Allocate new node
-        uint64_t* new_node = alloc_node(1 + new_count);
-        new_node[0] = bitmap & ~(1ULL << index);
+        uint64_t new_bitmap = bitmap & ~(1ULL << index);
         
-        // Copy children before slot
-        for (int i = 1; i < slot; ++i) {
-            new_node[i] = node[i];
+        uint64_t* new_node = alloc_internal(new_count, skip);
+        if (skip > 0) {
+            new_node[0] = node[0]; // copy prefix
+        }
+        new_node[bitmap_offset(skip)] = new_bitmap;
+        
+        const uint64_t* old_children = get_children(node, skip);
+        uint64_t* new_children = get_children(new_node, skip);
+        
+        for (int i = 0; i < slot; ++i) {
+            new_children[i] = old_children[i];
+        }
+        for (size_t i = slot + 1; i < old_count; ++i) {
+            new_children[i - 1] = old_children[i];
         }
         
-        // Skip removed child, copy rest
-        for (size_t i = slot + 1; i <= old_count; ++i) {
-            new_node[i - 1] = node[i];
-        }
-        
-        // Dealloc old node
-        dealloc_node(node, 1 + old_count);
-        
+        dealloc_internal(node, skip);
         return new_node;
     }
     
     // Update child pointer in internal node
-    void update_child(uint64_t* node, uint8_t index, uint64_t new_child_ptr) noexcept {
-        int slot = calc_slot(node[0], index);
-        node[slot] = new_child_ptr;
+    void update_child(uint64_t* node, uint64_t skip, uint8_t index, uint64_t new_child_ptr) noexcept {
+        uint64_t bitmap = get_bitmap(node, skip);
+        int slot = calc_slot(bitmap, index) - 1;
+        get_children(node, skip)[slot] = new_child_ptr;
     }
     
     // =========================================================================
     // Leaf Operations
     // =========================================================================
     
-    // Leaf layout: [count][key0][key1]...[keyN-1][val0][val1]...[valN-1]
     static size_t leaf_count(const uint64_t* leaf) noexcept {
         return static_cast<size_t>(leaf[0]);
     }
@@ -314,16 +357,14 @@ private:
     }
     
     static const uint64_t* leaf_values(const uint64_t* leaf) noexcept {
-        size_t count = leaf_count(leaf);
-        return leaf + 1 + count;
+        return leaf + 1 + leaf_count(leaf);
     }
     
     static uint64_t* leaf_values(uint64_t* leaf) noexcept {
-        size_t count = leaf_count(leaf);
-        return leaf + 1 + count;
+        return leaf + 1 + leaf_count(leaf);
     }
     
-    // Linear search in leaf, returns index if found, or ~insertion_point if not
+    // Linear search in leaf
     static size_t leaf_search(const uint64_t* leaf, uint64_t internal_key) noexcept {
         size_t count = leaf_count(leaf);
         const uint64_t* keys = leaf_keys(leaf);
@@ -332,14 +373,13 @@ private:
             if (keys[i] == internal_key) {
                 return i;
             }
-            if (keys[i] > internal_key) {
+            if (keys[i] > internal_key) [[unlikely]] {
                 return ~i;
             }
         }
         return ~count;
     }
     
-    // Find first key >= internal_key, returns count if all are less
     static size_t leaf_lower_bound(const uint64_t* leaf, uint64_t internal_key) noexcept {
         size_t count = leaf_count(leaf);
         const uint64_t* keys = leaf_keys(leaf);
@@ -352,7 +392,6 @@ private:
         return count;
     }
     
-    // Find first key > internal_key, returns count if all are <=
     static size_t leaf_upper_bound(const uint64_t* leaf, uint64_t internal_key) noexcept {
         size_t count = leaf_count(leaf);
         const uint64_t* keys = leaf_keys(leaf);
@@ -377,24 +416,18 @@ private:
         const uint64_t* old_keys = leaf_keys(leaf);
         const uint64_t* old_vals = leaf_values(leaf);
         
-        // Copy keys before pos
         for (size_t i = 0; i < pos; ++i) {
             new_keys[i] = old_keys[i];
         }
-        // Insert new key
         new_keys[pos] = internal_key;
-        // Copy keys after pos
         for (size_t i = pos; i < old_count; ++i) {
             new_keys[i + 1] = old_keys[i];
         }
         
-        // Copy values before pos
         for (size_t i = 0; i < pos; ++i) {
             new_vals[i] = old_vals[i];
         }
-        // Insert new value
         new_vals[pos] = stored_value;
-        // Copy values after pos
         for (size_t i = pos; i < old_count; ++i) {
             new_vals[i + 1] = old_vals[i];
         }
@@ -408,7 +441,6 @@ private:
         size_t old_count = leaf_count(leaf);
         
         if (old_count == 1) {
-            // Leaf becomes empty
             dealloc_leaf(leaf);
             return nullptr;
         }
@@ -422,7 +454,6 @@ private:
         const uint64_t* old_keys = leaf_keys(leaf);
         const uint64_t* old_vals = leaf_values(leaf);
         
-        // Copy keys, skipping pos
         for (size_t i = 0; i < pos; ++i) {
             new_keys[i] = old_keys[i];
         }
@@ -430,7 +461,6 @@ private:
             new_keys[i - 1] = old_keys[i];
         }
         
-        // Copy values, skipping pos
         for (size_t i = 0; i < pos; ++i) {
             new_vals[i] = old_vals[i];
         }
@@ -446,44 +476,39 @@ private:
     // Leaf Split
     // =========================================================================
     
-    // Split a full leaf into an internal node with child leaves
-    // Returns tagged pointer to new internal node
     uint64_t split_leaf(uint64_t* leaf, size_t shift) {
         size_t count = leaf_count(leaf);
         const uint64_t* keys = leaf_keys(leaf);
         const uint64_t* vals = leaf_values(leaf);
         
         // Group entries by their 6-bit index at current shift
-        // First pass: count entries per bucket
         size_t bucket_counts[64] = {0};
         for (size_t i = 0; i < count; ++i) {
             uint8_t idx = extract_index(keys[i], shift);
             bucket_counts[idx]++;
         }
         
-        // Count non-empty buckets
         size_t num_children = 0;
         for (size_t i = 0; i < 64; ++i) {
             if (bucket_counts[i] > 0) num_children++;
         }
         
-        // Allocate internal node
-        uint64_t* internal = alloc_node(1 + num_children);
+        // Allocate internal node (no skip for split result)
+        uint64_t* internal = alloc_internal(num_children, 0);
         uint64_t bitmap = 0;
         
-        // Create child leaves
-        size_t child_slot = 1;
+        size_t child_slot = 0;
+        uint64_t* children = get_children(internal, 0);
+        
         for (size_t bucket = 0; bucket < 64; ++bucket) {
             if (bucket_counts[bucket] == 0) continue;
             
             bitmap |= (1ULL << bucket);
             
-            // Allocate child leaf
             uint64_t* child = alloc_leaf(bucket_counts[bucket]);
             uint64_t* child_keys = leaf_keys(child);
             uint64_t* child_vals = leaf_values(child);
             
-            // Copy entries belonging to this bucket
             size_t dest = 0;
             for (size_t i = 0; i < count; ++i) {
                 uint8_t idx = extract_index(keys[i], shift);
@@ -494,33 +519,113 @@ private:
                 }
             }
             
-            internal[child_slot++] = tag_as_leaf(child);
+            children[child_slot++] = make_leaf_ptr(child);
         }
         
         internal[0] = bitmap;
-        
-        // Free old leaf (entries moved, not destroyed)
         dealloc_leaf(leaf);
         
-        return tag_as_internal(internal);
+        return make_internal_ptr(internal, 0);
     }
     
     // =========================================================================
-    // Leaf Merge Check
+    // Path Compression - Collapse check
     // =========================================================================
     
-    // Check if all children of internal node are leaves with total count <= 64
-    bool can_merge(const uint64_t* internal) const noexcept {
-        uint64_t bitmap = internal[0];
+    // Check if internal node has exactly one child
+    static bool has_single_child(const uint64_t* node, uint64_t skip) noexcept {
+        uint64_t bitmap = get_bitmap(node, skip);
+        return std::popcount(bitmap) == 1;
+    }
+    
+    // Get the single child (assumes has_single_child is true)
+    static uint64_t get_single_child(const uint64_t* node, uint64_t skip) noexcept {
+        return get_children(node, skip)[0];
+    }
+    
+    // Get index of single child
+    static uint8_t get_single_child_index(const uint64_t* node, uint64_t skip) noexcept {
+        uint64_t bitmap = get_bitmap(node, skip);
+        return static_cast<uint8_t>(std::countr_zero(bitmap));
+    }
+    
+    // Try to collapse a chain of single-child nodes
+    // Returns new tagged pointer with updated skip
+    uint64_t try_collapse(uint64_t ptr, size_t shift) {
+        if (is_leaf(ptr)) return ptr;
+        
+        uint64_t current_skip = get_skip(ptr);
+        uint64_t* node = get_addr(ptr);
+        
+        if (!has_single_child(node, current_skip)) return ptr;
+        
+        uint64_t child_ptr = get_single_child(node, current_skip);
+        
+        // Can't collapse if child is a leaf (different structure)
+        if (is_leaf(child_ptr)) return ptr;
+        
+        uint64_t child_skip = get_skip(child_ptr);
+        uint64_t* child_node = get_addr(child_ptr);
+        
+        // Calculate new skip
+        uint64_t new_skip = current_skip + 1 + child_skip;
+        
+        // Can't exceed 15 (4 bits)
+        if (new_skip > 15) return ptr;
+        
+        // Build new prefix
+        uint64_t parent_prefix = (current_skip > 0) ? get_prefix(node) : 0;
+        uint8_t my_index = get_single_child_index(node, current_skip);
+        uint64_t child_prefix = (child_skip > 0) ? get_prefix(child_node) : 0;
+        
+        // New prefix = parent_prefix | my_index | child_prefix
+        uint64_t new_prefix;
+        if (current_skip > 0) {
+            new_prefix = (parent_prefix << 6) | my_index;
+        } else {
+            new_prefix = my_index;
+        }
+        if (child_skip > 0) {
+            new_prefix = (new_prefix << (child_skip * 6)) | child_prefix;
+        }
+        
+        // Create new node with combined skip
+        uint64_t child_bitmap = get_bitmap(child_node, child_skip);
+        size_t num_children = std::popcount(child_bitmap);
+        
+        uint64_t* new_node = alloc_internal(num_children, new_skip);
+        new_node[0] = new_prefix;
+        new_node[bitmap_offset(new_skip)] = child_bitmap;
+        
+        const uint64_t* child_children = get_children(child_node, child_skip);
+        uint64_t* new_children = get_children(new_node, new_skip);
+        for (size_t i = 0; i < num_children; ++i) {
+            new_children[i] = child_children[i];
+        }
+        
+        // Free old nodes
+        dealloc_internal(node, current_skip);
+        dealloc_internal(child_node, child_skip);
+        
+        return make_internal_ptr(new_node, new_skip);
+    }
+    
+    // =========================================================================
+    // Merge check (for leaf merge)
+    // =========================================================================
+    
+    bool can_merge(const uint64_t* internal, uint64_t skip) const noexcept {
+        uint64_t bitmap = get_bitmap(internal, skip);
         size_t num_children = std::popcount(bitmap);
+        const uint64_t* children = get_children(internal, skip);
         
         size_t total = 0;
-        for (size_t i = 1; i <= num_children; ++i) {
-            uint64_t child_ptr = internal[i];
+        for (size_t i = 0; i < num_children; ++i) {
+            uint64_t child_ptr = children[i];
             if (!is_leaf(child_ptr)) {
                 return false;
             }
-            uint64_t* child = untag_ptr(child_ptr);
+            uint64_t* child = get_addr(child_ptr);
             total += leaf_count(child);
             if (total > max_leaf_entries) {
                 return false;
@@ -529,30 +634,27 @@ private:
         return true;
     }
     
-    // Merge all children of internal node into single leaf
-    uint64_t* merge_children(uint64_t* internal) {
-        uint64_t bitmap = internal[0];
+    uint64_t* merge_children(uint64_t* internal, uint64_t skip) {
+        uint64_t bitmap = get_bitmap(internal, skip);
         size_t num_children = std::popcount(bitmap);
+        const uint64_t* children_arr = get_children(internal, skip);
         
-        // Count total entries
         size_t total = 0;
-        for (size_t i = 1; i <= num_children; ++i) {
-            uint64_t* child = untag_ptr(internal[i]);
+        for (size_t i = 0; i < num_children; ++i) {
+            uint64_t* child = get_addr(children_arr[i]);
             total += leaf_count(child);
         }
         
-        // Allocate merged leaf
         uint64_t* merged = alloc_leaf(total);
         uint64_t* merged_keys = leaf_keys(merged);
         uint64_t* merged_vals = leaf_values(merged);
         
-        // Copy from children in order (they're already sorted by bucket)
         size_t dest = 0;
         for (uint8_t bucket = 0; bucket < 64; ++bucket) {
             if (!(bitmap & (1ULL << bucket))) continue;
             
-            int slot = calc_slot(bitmap, bucket);
-            uint64_t* child = untag_ptr(internal[slot]);
+            int slot = calc_slot(bitmap, bucket) - 1;
+            uint64_t* child = get_addr(children_arr[slot]);
             size_t child_cnt = leaf_count(child);
             const uint64_t* child_keys = leaf_keys(child);
             const uint64_t* child_vals = leaf_values(child);
@@ -563,13 +665,10 @@ private:
                 dest++;
             }
             
-            // Free child leaf
             dealloc_leaf(child);
         }
         
-        // Free internal node
-        dealloc_internal(internal);
-        
+        dealloc_internal(internal, skip);
         return merged;
     }
     
@@ -577,14 +676,13 @@ private:
     // Recursive clear
     // =========================================================================
     
-    void clear_node(uint64_t tagged_ptr) noexcept {
-        if (tagged_ptr == 0) return;
+    void clear_node(uint64_t ptr) noexcept {
+        if (ptr == 0) return;
         
-        if (is_leaf(tagged_ptr)) {
-            uint64_t* leaf = untag_ptr(tagged_ptr);
+        if (is_leaf(ptr)) {
+            uint64_t* leaf = get_addr(ptr);
             size_t count = leaf_count(leaf);
             
-            // Destroy values if not inline
             if constexpr (!value_inline) {
                 uint64_t* vals = leaf_values(leaf);
                 for (size_t i = 0; i < count; ++i) {
@@ -594,236 +692,267 @@ private:
             
             dealloc_leaf(leaf);
         } else {
-            uint64_t* internal = untag_ptr(tagged_ptr);
-            uint64_t bitmap = internal[0];
+            uint64_t skip = get_skip(ptr);
+            uint64_t* internal = get_addr(ptr);
+            uint64_t bitmap = get_bitmap(internal, skip);
             size_t num_children = std::popcount(bitmap);
+            const uint64_t* children = get_children(internal, skip);
             
-            // Recursively clear children
-            for (size_t i = 1; i <= num_children; ++i) {
-                clear_node(internal[i]);
+            for (size_t i = 0; i < num_children; ++i) {
+                clear_node(children[i]);
             }
             
-            dealloc_internal(internal);
+            dealloc_internal(internal, skip);
         }
     }
     
     // =========================================================================
-    // Find helpers (iterative for read path)
+    // Find (ITERATIVE - hot path)
     // =========================================================================
     
-    // Returns {leaf_ptr, index} or {nullptr, 0} if not found
     std::pair<uint64_t*, size_t> find_in_trie(uint64_t internal_key) const noexcept {
-        if (root_ == 0) return {nullptr, 0};
-        
-        uint64_t current = root_;
+        uint64_t ptr = root_;
         size_t shift = 64 - bits_per_level;
         
-        while (true) {
-            if (is_leaf(current)) {
-                uint64_t* leaf = untag_ptr(current);
-                size_t idx = leaf_search(leaf, internal_key);
-                if (idx < leaf_count(leaf)) { // Not inverted (found)
-                    return {leaf, idx};
+        // Hot loop: traverse internal nodes
+        while (!high_bit_set(ptr)) [[likely]] {
+            uint64_t skip = get_skip(ptr);
+            uint64_t* node = get_addr(ptr);
+            
+            // Check prefix if skip > 0
+            if (skip > 0) [[unlikely]] {
+                uint64_t expected = extract_prefix(internal_key, shift, skip);
+                uint64_t actual = get_prefix(node);
+                if (expected != actual) [[unlikely]] {
+                    return {nullptr, 0};
                 }
+                shift -= skip * 6;
+            }
+            
+            uint64_t bitmap = get_bitmap(node, skip);
+            uint8_t index = extract_index(internal_key, shift);
+            uint64_t shifted = bitmap << (63 - index);
+            
+            if (!high_bit_set(shifted)) [[unlikely]] {
                 return {nullptr, 0};
             }
             
-            uint64_t* node = untag_ptr(current);
-            uint8_t index = extract_index(internal_key, shift);
-            current = get_child(node, index);
-            
-            if (current == 0) return {nullptr, 0};
-            
-            shift -= bits_per_level;
+            int slot = std::popcount(shifted) - 1;
+            ptr = get_children(node, skip)[slot];
+            shift -= 6;
         }
+        
+        // Leaf search
+        uint64_t* leaf = get_addr(ptr);
+        size_t count = leaf_count(leaf);
+        const uint64_t* keys = leaf_keys(leaf);
+        
+        for (size_t i = 0; i < count; ++i) {
+            if (keys[i] == internal_key) {
+                return {leaf, i};
+            }
+            if (keys[i] > internal_key) [[unlikely]] {
+                return {nullptr, 0};
+            }
+        }
+        
+        return {nullptr, 0};
     }
     
     // Find minimum entry in subtree
-    std::pair<uint64_t*, size_t> find_min(uint64_t tagged_ptr) const noexcept {
-        if (tagged_ptr == 0) return {nullptr, 0};
+    std::pair<uint64_t*, size_t> find_min(uint64_t ptr) const noexcept {
+        if (ptr == 0) return {nullptr, 0};
         
-        uint64_t current = tagged_ptr;
-        
-        while (!is_leaf(current)) {
-            uint64_t* node = untag_ptr(current);
-            uint64_t bitmap = node[0];
-            // Find lowest set bit
-            int lowest = std::countr_zero(bitmap);
-            int slot = 1; // First child is always at slot 1
-            current = node[slot];
+        while (!is_leaf(ptr)) {
+            uint64_t skip = get_skip(ptr);
+            uint64_t* node = get_addr(ptr);
+            ptr = get_children(node, skip)[0]; // First child
         }
         
-        uint64_t* leaf = untag_ptr(current);
-        return {leaf, 0}; // First entry in leaf
+        return {get_addr(ptr), 0};
     }
     
     // Find maximum entry in subtree
-    std::pair<uint64_t*, size_t> find_max(uint64_t tagged_ptr) const noexcept {
-        if (tagged_ptr == 0) return {nullptr, 0};
+    std::pair<uint64_t*, size_t> find_max(uint64_t ptr) const noexcept {
+        if (ptr == 0) return {nullptr, 0};
         
-        uint64_t current = tagged_ptr;
-        
-        while (!is_leaf(current)) {
-            uint64_t* node = untag_ptr(current);
-            uint64_t bitmap = node[0];
+        while (!is_leaf(ptr)) {
+            uint64_t skip = get_skip(ptr);
+            uint64_t* node = get_addr(ptr);
+            uint64_t bitmap = get_bitmap(node, skip);
             size_t num_children = std::popcount(bitmap);
-            current = node[num_children]; // Last child
+            ptr = get_children(node, skip)[num_children - 1]; // Last child
         }
         
-        uint64_t* leaf = untag_ptr(current);
-        size_t count = leaf_count(leaf);
-        return {leaf, count - 1}; // Last entry in leaf
+        uint64_t* leaf = get_addr(ptr);
+        return {leaf, leaf_count(leaf) - 1};
     }
     
-    // Find next entry after given key (for iterator++)
+    // Find next entry after given key
     std::pair<uint64_t*, size_t> find_next(uint64_t internal_key) const noexcept {
-        // Strategy: find upper bound
         if (root_ == 0) return {nullptr, 0};
         
         uint64_t* best_leaf = nullptr;
         size_t best_idx = 0;
         
-        uint64_t current = root_;
+        uint64_t ptr = root_;
         size_t shift = 64 - bits_per_level;
         
-        while (true) {
-            if (is_leaf(current)) {
-                uint64_t* leaf = untag_ptr(current);
-                size_t idx = leaf_upper_bound(leaf, internal_key);
-                if (idx < leaf_count(leaf)) {
-                    return {leaf, idx};
+        while (!is_leaf(ptr)) {
+            uint64_t skip = get_skip(ptr);
+            uint64_t* node = get_addr(ptr);
+            
+            // Handle prefix
+            if (skip > 0) {
+                uint64_t expected = extract_prefix(internal_key, shift, skip);
+                uint64_t actual = get_prefix(node);
+                if (expected != actual) {
+                    // Prefix mismatch - determine if we should go left or right
+                    if (actual > expected) {
+                        // All keys in this subtree are greater
+                        auto [leaf, idx] = find_min(ptr);
+                        return {leaf, idx};
+                    }
+                    // All keys in this subtree are smaller
+                    return {best_leaf, best_idx};
                 }
-                // Return best found so far (from higher branch)
-                return {best_leaf, best_idx};
+                shift -= skip * 6;
             }
             
-            uint64_t* node = untag_ptr(current);
-            uint64_t bitmap = node[0];
+            uint64_t bitmap = get_bitmap(node, skip);
             uint8_t target_index = extract_index(internal_key, shift);
             
-            // Look for higher branches we could take later
+            // Look for higher branches
             uint64_t higher_mask = bitmap & ~((2ULL << target_index) - 1);
             if (higher_mask != 0) {
-                // There's a higher branch - find its minimum
                 int higher_bit = std::countr_zero(higher_mask);
-                int slot = calc_slot(bitmap, higher_bit);
-                auto [leaf, idx] = find_min(node[slot]);
+                int slot = calc_slot(bitmap, higher_bit) - 1;
+                auto [leaf, idx] = find_min(get_children(node, skip)[slot]);
                 if (leaf != nullptr) {
                     best_leaf = leaf;
                     best_idx = idx;
                 }
             }
             
-            // Try to follow target branch
-            uint64_t child = get_child(node, target_index);
+            uint64_t child = get_child(node, skip, target_index);
             if (child == 0) {
                 return {best_leaf, best_idx};
             }
             
-            current = child;
-            shift -= bits_per_level;
+            ptr = child;
+            shift -= 6;
         }
+        
+        uint64_t* leaf = get_addr(ptr);
+        size_t idx = leaf_upper_bound(leaf, internal_key);
+        if (idx < leaf_count(leaf)) {
+            return {leaf, idx};
+        }
+        return {best_leaf, best_idx};
     }
     
-    // Find previous entry before given key (for iterator--)
+    // Find previous entry before given key
     std::pair<uint64_t*, size_t> find_prev(uint64_t internal_key) const noexcept {
         if (root_ == 0) return {nullptr, 0};
         
         uint64_t* best_leaf = nullptr;
         size_t best_idx = 0;
         
-        uint64_t current = root_;
+        uint64_t ptr = root_;
         size_t shift = 64 - bits_per_level;
         
-        while (true) {
-            if (is_leaf(current)) {
-                uint64_t* leaf = untag_ptr(current);
-                size_t count = leaf_count(leaf);
-                const uint64_t* keys = leaf_keys(leaf);
-                
-                // Find largest key < internal_key
-                for (size_t i = count; i-- > 0;) {
-                    if (keys[i] < internal_key) {
-                        return {leaf, i};
+        while (!is_leaf(ptr)) {
+            uint64_t skip = get_skip(ptr);
+            uint64_t* node = get_addr(ptr);
+            
+            if (skip > 0) {
+                uint64_t expected = extract_prefix(internal_key, shift, skip);
+                uint64_t actual = get_prefix(node);
+                if (expected != actual) {
+                    if (actual < expected) {
+                        auto [leaf, idx] = find_max(ptr);
+                        return {leaf, idx};
                     }
+                    return {best_leaf, best_idx};
                 }
-                // Return best found so far (from lower branch)
-                return {best_leaf, best_idx};
+                shift -= skip * 6;
             }
             
-            uint64_t* node = untag_ptr(current);
-            uint64_t bitmap = node[0];
+            uint64_t bitmap = get_bitmap(node, skip);
             uint8_t target_index = extract_index(internal_key, shift);
             
-            // Look for lower branches we could take later
+            // Look for lower branches
             uint64_t lower_mask = bitmap & ((1ULL << target_index) - 1);
             if (lower_mask != 0) {
-                // There's a lower branch - find its maximum
                 int higher_bit = 63 - std::countl_zero(lower_mask);
-                int slot = calc_slot(bitmap, higher_bit);
-                auto [leaf, idx] = find_max(node[slot]);
+                int slot = calc_slot(bitmap, higher_bit) - 1;
+                auto [leaf, idx] = find_max(get_children(node, skip)[slot]);
                 if (leaf != nullptr) {
                     best_leaf = leaf;
                     best_idx = idx;
                 }
             }
             
-            // Try to follow target branch
-            uint64_t child = get_child(node, target_index);
+            uint64_t child = get_child(node, skip, target_index);
             if (child == 0) {
                 return {best_leaf, best_idx};
             }
             
-            current = child;
-            shift -= bits_per_level;
+            ptr = child;
+            shift -= 6;
         }
+        
+        uint64_t* leaf = get_addr(ptr);
+        const uint64_t* keys = leaf_keys(leaf);
+        size_t count = leaf_count(leaf);
+        
+        for (size_t i = count; i-- > 0;) {
+            if (keys[i] < internal_key) {
+                return {leaf, i};
+            }
+        }
+        return {best_leaf, best_idx};
     }
     
     // =========================================================================
     // Recursive Insert
     // =========================================================================
     
-    // Returns {new_tagged_ptr, inserted, old_value_if_updated}
     struct InsertResult {
         uint64_t new_ptr;
         bool inserted;
-        uint64_t old_stored_value; // Only valid if !inserted
+        uint64_t old_stored_value;
     };
     
-    InsertResult insert_recursive(uint64_t tagged_ptr, uint64_t internal_key, 
+    InsertResult insert_recursive(uint64_t ptr, uint64_t internal_key, 
                                    uint64_t stored_value, size_t shift) {
-        if (tagged_ptr == 0) {
-            // Create new leaf with single entry
+        if (ptr == 0) {
             uint64_t* leaf = alloc_leaf(1);
             leaf_keys(leaf)[0] = internal_key;
             leaf_values(leaf)[0] = stored_value;
-            return {tag_as_leaf(leaf), true, 0};
+            return {make_leaf_ptr(leaf), true, 0};
         }
         
-        if (is_leaf(tagged_ptr)) {
-            uint64_t* leaf = untag_ptr(tagged_ptr);
+        if (is_leaf(ptr)) {
+            uint64_t* leaf = get_addr(ptr);
             size_t search_result = leaf_search(leaf, internal_key);
             
             if (search_result < leaf_count(leaf)) {
-                // Key exists, update value
                 uint64_t* vals = leaf_values(leaf);
                 uint64_t old_val = vals[search_result];
                 vals[search_result] = stored_value;
-                return {tagged_ptr, false, old_val};
+                return {ptr, false, old_val};
             }
             
-            // Key not found, insert
             size_t insert_pos = ~search_result;
             size_t count = leaf_count(leaf);
             
             if (count < max_leaf_entries) {
-                // Room in leaf
                 uint64_t* new_leaf = leaf_insert(leaf, insert_pos, internal_key, stored_value);
-                return {tag_as_leaf(new_leaf), true, 0};
+                return {make_leaf_ptr(new_leaf), true, 0};
             }
             
-            // Need to split
-            // First insert into temporary oversized leaf, then split
+            // Split
             uint64_t* temp = alloc_leaf(count + 1);
             uint64_t* temp_keys = leaf_keys(temp);
             uint64_t* temp_vals = leaf_values(temp);
@@ -842,28 +971,114 @@ private:
             }
             
             dealloc_leaf(leaf);
-            
             return {split_leaf(temp, shift), true, 0};
         }
         
         // Internal node
-        uint64_t* node = untag_ptr(tagged_ptr);
+        uint64_t skip = get_skip(ptr);
+        uint64_t* node = get_addr(ptr);
+        
+        // Handle prefix mismatch
+        if (skip > 0) {
+            uint64_t expected = extract_prefix(internal_key, shift, skip);
+            uint64_t actual = get_prefix(node);
+            
+            if (expected != actual) {
+                // Find divergence point
+                size_t prefix_bits = skip * 6;
+                uint64_t diff = expected ^ actual;
+                size_t leading_zeros = std::countl_zero(diff);
+                size_t common_bits = (leading_zeros > (64 - prefix_bits)) ? 
+                                      prefix_bits : leading_zeros - (64 - prefix_bits);
+                size_t common_levels = common_bits / 6;
+                
+                // Create new structure at divergence point
+                uint8_t new_index = (expected >> (prefix_bits - (common_levels + 1) * 6)) & 0x3F;
+                uint8_t old_index = (actual >> (prefix_bits - (common_levels + 1) * 6)) & 0x3F;
+                
+                // New internal node at divergence
+                uint64_t* new_internal = alloc_internal(2, common_levels);
+                
+                if (common_levels > 0) {
+                    uint64_t common_prefix = actual >> (prefix_bits - common_levels * 6);
+                    new_internal[0] = common_prefix;
+                }
+                
+                uint64_t bitmap = (1ULL << new_index) | (1ULL << old_index);
+                new_internal[bitmap_offset(common_levels)] = bitmap;
+                
+                // Create new leaf for the new key
+                uint64_t* new_leaf = alloc_leaf(1);
+                leaf_keys(new_leaf)[0] = internal_key;
+                leaf_values(new_leaf)[0] = stored_value;
+                
+                // Adjust old node's skip and prefix
+                uint64_t remaining_skip = skip - common_levels - 1;
+                uint64_t* adjusted_old;
+                
+                if (remaining_skip == 0) {
+                    // Old node loses its prefix, becomes normal node
+                    uint64_t old_bitmap = get_bitmap(node, skip);
+                    size_t old_children_count = std::popcount(old_bitmap);
+                    adjusted_old = alloc_internal(old_children_count, 0);
+                    adjusted_old[0] = old_bitmap;
+                    const uint64_t* old_children = get_children(node, skip);
+                    uint64_t* new_children = get_children(adjusted_old, 0);
+                    for (size_t i = 0; i < old_children_count; ++i) {
+                        new_children[i] = old_children[i];
+                    }
+                    dealloc_internal(node, skip);
+                } else {
+                    // Old node keeps shorter prefix
+                    uint64_t old_bitmap = get_bitmap(node, skip);
+                    size_t old_children_count = std::popcount(old_bitmap);
+                    adjusted_old = alloc_internal(old_children_count, remaining_skip);
+                    uint64_t new_prefix = actual & ((1ULL << (remaining_skip * 6)) - 1);
+                    adjusted_old[0] = new_prefix;
+                    adjusted_old[bitmap_offset(remaining_skip)] = old_bitmap;
+                    const uint64_t* old_children = get_children(node, skip);
+                    uint64_t* new_children = get_children(adjusted_old, remaining_skip);
+                    for (size_t i = 0; i < old_children_count; ++i) {
+                        new_children[i] = old_children[i];
+                    }
+                    dealloc_internal(node, skip);
+                }
+                
+                // Place children in correct order
+                uint64_t* new_children = get_children(new_internal, common_levels);
+                if (new_index < old_index) {
+                    new_children[0] = make_leaf_ptr(new_leaf);
+                    new_children[1] = make_internal_ptr(adjusted_old, remaining_skip);
+                } else {
+                    new_children[0] = make_internal_ptr(adjusted_old, remaining_skip);
+                    new_children[1] = make_leaf_ptr(new_leaf);
+                }
+                
+                return {make_internal_ptr(new_internal, common_levels), true, 0};
+            }
+            
+            shift -= skip * 6;
+        }
+        
         uint8_t index = extract_index(internal_key, shift);
-        uint64_t child = get_child(node, index);
+        uint64_t child = get_child(node, skip, index);
         
         InsertResult result = insert_recursive(child, internal_key, stored_value, 
                                                 shift - bits_per_level);
         
         if (child == 0) {
-            // New child created
-            uint64_t* new_node = insert_child(node, index, result.new_ptr);
-            return {tag_as_internal(new_node), result.inserted, result.old_stored_value};
+            uint64_t* new_node = insert_child(node, skip, index, result.new_ptr);
+            uint64_t new_ptr = make_internal_ptr(new_node, skip);
+            new_ptr = try_collapse(new_ptr, shift + skip * 6);
+            return {new_ptr, result.inserted, result.old_stored_value};
         } else if (result.new_ptr != child) {
-            // Child changed
-            update_child(node, index, result.new_ptr);
+            update_child(node, skip, index, result.new_ptr);
+            uint64_t new_ptr = make_internal_ptr(node, skip);
+            new_ptr = try_collapse(new_ptr, shift + skip * 6);
+            return {new_ptr, result.inserted, result.old_stored_value};
         }
         
-        return {tagged_ptr, result.inserted, result.old_stored_value};
+        return {ptr, result.inserted, result.old_stored_value};
     }
     
     // =========================================================================
@@ -871,78 +1086,87 @@ private:
     // =========================================================================
     
     struct EraseResult {
-        uint64_t new_ptr;      // New tagged pointer for this subtree
-        bool erased;           // Was something erased?
-        bool check_merge;      // Should parent check for merge?
+        uint64_t new_ptr;
+        bool erased;
+        bool check_merge;
     };
     
-    EraseResult erase_recursive(uint64_t tagged_ptr, uint64_t internal_key, size_t shift) {
-        if (tagged_ptr == 0) {
+    EraseResult erase_recursive(uint64_t ptr, uint64_t internal_key, size_t shift) {
+        if (ptr == 0) {
             return {0, false, false};
         }
         
-        if (is_leaf(tagged_ptr)) {
-            uint64_t* leaf = untag_ptr(tagged_ptr);
+        if (is_leaf(ptr)) {
+            uint64_t* leaf = get_addr(ptr);
             size_t search_result = leaf_search(leaf, internal_key);
             
             if (search_result >= leaf_count(leaf)) {
-                // Not found (inverted result)
-                return {tagged_ptr, false, false};
+                return {ptr, false, false};
             }
             
-            // Found - destroy value and remove
             destroy_value(leaf_values(leaf)[search_result]);
             
             uint64_t* new_leaf = leaf_remove(leaf, search_result);
             if (new_leaf == nullptr) {
                 return {0, true, true};
             }
-            return {tag_as_leaf(new_leaf), true, true};
+            return {make_leaf_ptr(new_leaf), true, true};
         }
         
-        // Internal node
-        uint64_t* node = untag_ptr(tagged_ptr);
+        uint64_t skip = get_skip(ptr);
+        uint64_t* node = get_addr(ptr);
+        
+        // Check prefix
+        if (skip > 0) {
+            uint64_t expected = extract_prefix(internal_key, shift, skip);
+            uint64_t actual = get_prefix(node);
+            if (expected != actual) {
+                return {ptr, false, false};
+            }
+            shift -= skip * 6;
+        }
+        
         uint8_t index = extract_index(internal_key, shift);
-        uint64_t child = get_child(node, index);
+        uint64_t child = get_child(node, skip, index);
         
         if (child == 0) {
-            return {tagged_ptr, false, false};
+            return {ptr, false, false};
         }
         
         EraseResult result = erase_recursive(child, internal_key, shift - bits_per_level);
         
         if (!result.erased) {
-            return {tagged_ptr, false, false};
+            return {ptr, false, false};
         }
         
         if (result.new_ptr == 0) {
-            // Child was deleted
-            uint64_t* new_node = remove_child(node, index);
+            uint64_t* new_node = remove_child(node, skip, index);
             if (new_node == nullptr) {
                 return {0, true, true};
             }
             
-            // Check if we can merge
-            if (can_merge(new_node)) {
-                uint64_t* merged = merge_children(new_node);
-                return {tag_as_leaf(merged), true, true};
+            if (can_merge(new_node, skip)) {
+                uint64_t* merged = merge_children(new_node, skip);
+                return {make_leaf_ptr(merged), true, true};
             }
             
-            return {tag_as_internal(new_node), true, false};
+            uint64_t new_ptr = make_internal_ptr(new_node, skip);
+            new_ptr = try_collapse(new_ptr, shift + skip * 6);
+            return {new_ptr, true, false};
         }
         
-        // Update child pointer
         if (result.new_ptr != child) {
-            update_child(node, index, result.new_ptr);
+            update_child(node, skip, index, result.new_ptr);
         }
         
-        // Check merge if child suggests it
-        if (result.check_merge && can_merge(node)) {
-            uint64_t* merged = merge_children(node);
-            return {tag_as_leaf(merged), true, true};
+        if (result.check_merge && can_merge(node, skip)) {
+            uint64_t* merged = merge_children(node, skip);
+            return {make_leaf_ptr(merged), true, true};
         }
         
-        return {tagged_ptr, true, false};
+        uint64_t new_ptr = make_internal_ptr(node, skip);
+        new_ptr = try_collapse(new_ptr, shift + skip * 6);
+        return {new_ptr, true, false};
     }
     
 public:
@@ -977,7 +1201,6 @@ public:
         
         iterator_impl() : trie_(nullptr), key_{}, value_copy_{}, valid_(false) {}
         
-        // Convert non-const to const
         template<bool C = Const, typename = std::enable_if_t<C>>
         iterator_impl(const iterator_impl<false>& other)
             : trie_(other.trie_), key_(other.key_), 
@@ -1018,7 +1241,6 @@ public:
             if (!trie_) return *this;
             
             if (!valid_) {
-                // end() -> last element
                 auto [leaf, idx] = trie_->find_max(trie_->root_);
                 if (leaf != nullptr) {
                     key_ = internal_to_key(leaf_keys(leaf)[idx]);
@@ -1031,10 +1253,7 @@ public:
             uint64_t internal_key = key_to_internal(key_);
             auto [leaf, idx] = trie_->find_prev(internal_key);
             
-            if (leaf == nullptr) {
-                // No previous element - undefined behavior for std::map
-                // but we'll leave iterator at current position
-            } else {
+            if (leaf != nullptr) {
                 key_ = internal_to_key(leaf_keys(leaf)[idx]);
                 value_copy_ = trie_->load_value(leaf_values(leaf)[idx]);
             }
@@ -1057,7 +1276,6 @@ public:
             return !(*this == other);
         }
         
-        // Non-const iterator methods that delegate to parent
         template<bool C = Const, typename = std::enable_if_t<!C>>
         std::pair<iterator_impl, bool> insert(const KEY& k, const VALUE& v) {
             return trie_->insert(k, v);
@@ -1067,7 +1285,7 @@ public:
         iterator_impl erase() {
             if (!valid_) return *this;
             KEY k = key_;
-            ++(*this); // Move to next before erasing
+            ++(*this);
             trie_->erase(k);
             return *this;
         }
@@ -1082,29 +1300,37 @@ public:
     // Constructors / Destructor
     // =========================================================================
     
-    kntrie() : root_(0), size_(0), alloc_() {}
+    kntrie() : root_(0), size_(0), alloc_() {
+        // Start with empty leaf
+        uint64_t* leaf = alloc_leaf(0);
+        root_ = make_leaf_ptr(leaf);
+    }
     
-    explicit kntrie(const ALLOC& alloc) : root_(0), size_(0), alloc_(alloc) {}
+    explicit kntrie(const ALLOC& alloc) : root_(0), size_(0), alloc_(alloc) {
+        uint64_t* leaf = alloc_leaf(0);
+        root_ = make_leaf_ptr(leaf);
+    }
     
     ~kntrie() {
         clear();
     }
     
-    // Copy constructor
     kntrie(const kntrie& other) : root_(0), size_(0), alloc_(other.alloc_) {
+        uint64_t* leaf = alloc_leaf(0);
+        root_ = make_leaf_ptr(leaf);
         for (auto it = other.begin(); it != other.end(); ++it) {
             insert(it.key(), it.value());
         }
     }
     
-    // Move constructor
     kntrie(kntrie&& other) noexcept 
         : root_(other.root_), size_(other.size_), alloc_(std::move(other.alloc_)) {
-        other.root_ = 0;
+        uint64_t* leaf = other.alloc_.allocate(1);
+        leaf[0] = 0;
+        other.root_ = make_leaf_ptr(leaf);
         other.size_ = 0;
     }
     
-    // Copy assignment
     kntrie& operator=(const kntrie& other) {
         if (this != &other) {
             clear();
@@ -1115,14 +1341,16 @@ public:
         return *this;
     }
     
-    // Move assignment
     kntrie& operator=(kntrie&& other) noexcept {
         if (this != &other) {
-            clear();
+            clear_node(root_);
             root_ = other.root_;
             size_ = other.size_;
             alloc_ = std::move(other.alloc_);
-            other.root_ = 0;
+            
+            uint64_t* leaf = other.alloc_.allocate(1);
+            leaf[0] = 0;
+            other.root_ = make_leaf_ptr(leaf);
             other.size_ = 0;
         }
         return *this;
@@ -1143,7 +1371,7 @@ public:
     // =========================================================================
     
     iterator begin() noexcept {
-        if (root_ == 0) return end();
+        if (size_ == 0) return end();
         auto [leaf, idx] = find_min(root_);
         if (leaf == nullptr) return end();
         KEY k = internal_to_key(leaf_keys(leaf)[idx]);
@@ -1152,7 +1380,7 @@ public:
     }
     
     const_iterator begin() const noexcept {
-        if (root_ == 0) return end();
+        if (size_ == 0) return end();
         auto [leaf, idx] = find_min(root_);
         if (leaf == nullptr) return end();
         KEY k = internal_to_key(leaf_keys(leaf)[idx]);
@@ -1211,56 +1439,70 @@ public:
     iterator lower_bound(const KEY& key) {
         uint64_t internal_key = key_to_internal(key);
         
-        // First check exact match
         auto [leaf, idx] = find_in_trie(internal_key);
         if (leaf != nullptr) {
             VALUE v = load_value(leaf_values(leaf)[idx]);
             return iterator(this, key, v, true);
         }
         
-        // Find first >= key
-        // This is like find_next but for >= instead of >
-        if (root_ == 0) return end();
+        if (size_ == 0) return end();
         
         uint64_t* best_leaf = nullptr;
         size_t best_idx = 0;
         
-        uint64_t current = root_;
+        uint64_t ptr = root_;
         size_t shift = 64 - bits_per_level;
         
-        while (true) {
-            if (is_leaf(current)) {
-                uint64_t* lf = untag_ptr(current);
-                size_t i = leaf_lower_bound(lf, internal_key);
-                if (i < leaf_count(lf)) {
-                    KEY k = internal_to_key(leaf_keys(lf)[i]);
-                    VALUE v = load_value(leaf_values(lf)[i]);
-                    return iterator(this, k, v, true);
+        while (!is_leaf(ptr)) {
+            uint64_t skip = get_skip(ptr);
+            uint64_t* node = get_addr(ptr);
+            
+            if (skip > 0) {
+                uint64_t expected = extract_prefix(internal_key, shift, skip);
+                uint64_t actual = get_prefix(node);
+                if (expected != actual) {
+                    if (actual > expected) {
+                        auto [lf, i] = find_min(ptr);
+                        if (lf) {
+                            KEY k = internal_to_key(leaf_keys(lf)[i]);
+                            VALUE v = load_value(leaf_values(lf)[i]);
+                            return iterator(this, k, v, true);
+                        }
+                    }
+                    break;
                 }
-                break;
+                shift -= skip * 6;
             }
             
-            uint64_t* node = untag_ptr(current);
-            uint64_t bitmap = node[0];
+            uint64_t bitmap = get_bitmap(node, skip);
             uint8_t target_index = extract_index(internal_key, shift);
             
-            // Look for higher branches
             uint64_t higher_mask = bitmap & ~((1ULL << target_index) - 1) & ~(1ULL << target_index);
             if (higher_mask != 0) {
                 int higher_bit = std::countr_zero(higher_mask);
-                int slot = calc_slot(bitmap, higher_bit);
-                auto [lf, i] = find_min(node[slot]);
+                int slot = calc_slot(bitmap, higher_bit) - 1;
+                auto [lf, i] = find_min(get_children(node, skip)[slot]);
                 if (lf != nullptr) {
                     best_leaf = lf;
                     best_idx = i;
                 }
             }
             
-            uint64_t child = get_child(node, target_index);
+            uint64_t child = get_child(node, skip, target_index);
             if (child == 0) break;
             
-            current = child;
-            shift -= bits_per_level;
+            ptr = child;
+            shift -= 6;
+        }
+        
+        if (is_leaf(ptr)) {
+            uint64_t* lf = get_addr(ptr);
+            size_t i = leaf_lower_bound(lf, internal_key);
+            if (i < leaf_count(lf)) {
+                KEY k = internal_to_key(leaf_keys(lf)[i]);
+                VALUE v = load_value(leaf_values(lf)[i]);
+                return iterator(this, k, v, true);
+            }
         }
         
         if (best_leaf != nullptr) {
@@ -1317,8 +1559,6 @@ public:
             ++size_;
             return {iterator(this, key, value, true), true};
         } else {
-            // Key existed, value was updated, destroy our new stored value
-            // and return the old value
             destroy_value(stored_value);
             VALUE old_val = load_value(result.old_stored_value);
             return {iterator(this, key, old_val, true), false};
@@ -1327,8 +1567,6 @@ public:
     
     template<typename... Args>
     std::pair<iterator, bool> emplace(Args&&... args) {
-        // For now, just construct a pair and insert
-        // A more optimal implementation would construct in-place
         auto pair = std::pair<KEY, VALUE>(std::forward<Args>(args)...);
         return insert(pair.first, pair.second);
     }
@@ -1336,7 +1574,7 @@ public:
     iterator erase(iterator pos) {
         if (!pos.valid_) return pos;
         KEY k = pos.key_;
-        ++pos; // Move to next before erasing
+        ++pos;
         erase(k);
         return pos;
     }
@@ -1345,7 +1583,6 @@ public:
         if (!pos.valid_) return end();
         KEY k = pos.key_;
         erase(k);
-        // Find next element
         return upper_bound(k);
     }
     
@@ -1353,6 +1590,11 @@ public:
         uint64_t internal_key = key_to_internal(key);
         EraseResult result = erase_recursive(root_, internal_key, 64 - bits_per_level);
         root_ = result.new_ptr;
+        
+        if (root_ == 0) {
+            uint64_t* leaf = alloc_leaf(0);
+            root_ = make_leaf_ptr(leaf);
+        }
         
         if (result.erased) {
             --size_;
@@ -1370,8 +1612,10 @@ public:
     
     void clear() noexcept {
         clear_node(root_);
-        root_ = 0;
         size_ = 0;
+        uint64_t* leaf = alloc_.allocate(1);
+        leaf[0] = 0;
+        root_ = make_leaf_ptr(leaf);
     }
     
     void swap(kntrie& other) noexcept {
@@ -1389,7 +1633,6 @@ public:
     }
 };
 
-// Non-member swap
 template<typename K, typename V, typename A>
 void swap(kntrie<K, V, A>& lhs, kntrie<K, V, A>& rhs) noexcept {
     lhs.swap(rhs);
