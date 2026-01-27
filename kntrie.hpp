@@ -50,36 +50,29 @@ private:
     // Key Conversion
     // =========================================================================
     
-    static constexpr bool is_little_endian() noexcept {
-        return std::endian::native == std::endian::little;
-    }
-    
     static constexpr uint64_t key_to_internal(KEY k) noexcept {
+        // Convert to unsigned of same size
         uint64_t result;
         
         if constexpr (sizeof(KEY) == 1) {
             result = static_cast<uint8_t>(k);
         } else if constexpr (sizeof(KEY) == 2) {
-            uint16_t u = static_cast<uint16_t>(k);
-            if constexpr (is_little_endian()) u = std::byteswap(u);
-            result = u;
+            result = static_cast<uint16_t>(k);
         } else if constexpr (sizeof(KEY) == 4) {
-            uint32_t u = static_cast<uint32_t>(k);
-            if constexpr (is_little_endian()) u = std::byteswap(u);
-            result = u;
+            result = static_cast<uint32_t>(k);
         } else {
-            uint64_t u = static_cast<uint64_t>(k);
-            if constexpr (is_little_endian()) u = std::byteswap(u);
-            result = u;
+            result = static_cast<uint64_t>(k);
         }
         
         // Flip sign bit for signed types to make sortable
+        // This maps: INT_MIN -> 0, 0 -> 0x80..., INT_MAX -> 0xFF...
         if constexpr (is_signed_key) {
             constexpr uint64_t sign_bit = 1ULL << (key_bits - 1);
             result ^= sign_bit;
         }
         
-        // Shift to high bits for consistent traversal
+        // Shift to high bits for MSB-first traversal
+        // No byteswap needed - shifting preserves numeric order
         result <<= (64 - key_bits);
         
         return result;
@@ -95,21 +88,8 @@ private:
             internal ^= sign_bit;
         }
         
-        if constexpr (sizeof(KEY) == 1) {
-            return static_cast<KEY>(internal);
-        } else if constexpr (sizeof(KEY) == 2) {
-            uint16_t u = static_cast<uint16_t>(internal);
-            if constexpr (is_little_endian()) u = std::byteswap(u);
-            return static_cast<KEY>(u);
-        } else if constexpr (sizeof(KEY) == 4) {
-            uint32_t u = static_cast<uint32_t>(internal);
-            if constexpr (is_little_endian()) u = std::byteswap(u);
-            return static_cast<KEY>(u);
-        } else {
-            uint64_t u = internal;
-            if constexpr (is_little_endian()) u = std::byteswap(u);
-            return static_cast<KEY>(u);
-        }
+        // No byteswap needed - just cast back
+        return static_cast<KEY>(internal);
     }
     
     // Extract 6-bit index at given shift position
