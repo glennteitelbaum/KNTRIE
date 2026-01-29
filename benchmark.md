@@ -17,20 +17,20 @@ Comparison columns show how std::map/unordered_map compare to kntrie:
 
 | Metric | kntrie | std::map | std::unordered_map | kntrie vs map | kntrie vs umap |
 |--------|--------|----------|-------------------|---------------|----------------|
-| Find | 4.45 ms | 27.55 ms | 1.90 ms | 6.19x slower | 2.34x faster |
-| Iterate | 1.91 ms | 6.08 ms | 2.77 ms | 3.19x slower | 1.45x slower |
-| Insert | 10.31 ms | 18.59 ms | 12.97 ms | 1.80x slower | 1.26x slower |
-| Erase | 11.28 ms | 24.69 ms | 5.16 ms | 2.19x slower | 2.19x faster |
+| Find | 4.20 ms | 24.53 ms | 1.87 ms | 5.84x slower | 2.25x faster |
+| Iterate | 1.88 ms | 5.75 ms | 2.58 ms | 3.06x slower | 1.37x slower |
+| Insert | 10.38 ms | 17.51 ms | 12.92 ms | 1.69x slower | 1.24x slower |
+| Erase | 11.09 ms | 23.65 ms | 5.13 ms | 2.13x slower | 2.16x faster |
 | Memory | 1.59 MB | 3.81 MB | 3.27 MB | 2.40x larger | 2.06x larger |
 
 #### Sequential Pattern
 
 | Metric | kntrie | std::map | std::unordered_map | kntrie vs map | kntrie vs umap |
 |--------|--------|----------|-------------------|---------------|----------------|
-| Find | 0.87 ms | 6.19 ms | 0.31 ms | 7.16x slower | 2.80x faster |
-| Iterate | 2.64 ms | 0.83 ms | 0.32 ms | 3.17x faster | 8.37x faster |
-| Insert | 6.80 ms | 7.82 ms | 2.44 ms | 1.15x slower | 2.78x faster |
-| Erase | 6.45 ms | 3.67 ms | 1.30 ms | 1.76x faster | 4.94x faster |
+| Find | 0.93 ms | 6.22 ms | 0.31 ms | 6.66x slower | 3.02x faster |
+| Iterate | 2.68 ms | 0.93 ms | 0.29 ms | 2.89x faster | 9.13x faster |
+| Insert | 6.98 ms | 8.08 ms | 2.38 ms | 1.16x slower | 2.93x faster |
+| Erase | 7.59 ms | 3.68 ms | 1.12 ms | 2.06x faster | 6.81x faster |
 | Memory | 1.91 MB | 3.81 MB | 3.27 MB | 1.99x larger | 1.71x larger |
 
 ### int32_t key, Value256 (32 bytes) value
@@ -39,20 +39,20 @@ Comparison columns show how std::map/unordered_map compare to kntrie:
 
 | Metric | kntrie | std::map | std::unordered_map | kntrie vs map | kntrie vs umap |
 |--------|--------|----------|-------------------|---------------|----------------|
-| Find | 4.66 ms | 33.09 ms | 2.04 ms | 7.11x slower | 2.28x faster |
-| Iterate | 1.74 ms | 6.93 ms | 4.51 ms | 3.98x slower | 2.59x slower |
-| Insert | 16.32 ms | 25.89 ms | 13.63 ms | 1.59x slower | 1.20x faster |
-| Erase | 13.58 ms | 29.31 ms | 6.01 ms | 2.16x slower | 2.26x faster |
+| Find | 4.72 ms | 34.74 ms | 2.02 ms | 7.37x slower | 2.34x faster |
+| Iterate | 1.77 ms | 7.14 ms | 4.27 ms | 4.04x slower | 2.42x slower |
+| Insert | 16.38 ms | 25.18 ms | 13.46 ms | 1.54x slower | 1.22x faster |
+| Erase | 14.03 ms | 29.68 ms | 6.04 ms | 2.11x slower | 2.32x faster |
 | Memory | 4.64 MB | 6.87 MB | 5.90 MB | 1.48x larger | 1.27x larger |
 
 #### Sequential Pattern
 
 | Metric | kntrie | std::map | std::unordered_map | kntrie vs map | kntrie vs umap |
 |--------|--------|----------|-------------------|---------------|----------------|
-| Find | 0.94 ms | 7.26 ms | 0.35 ms | 7.70x slower | 2.66x faster |
-| Iterate | 2.78 ms | 2.58 ms | 0.55 ms | 1.08x faster | 5.07x faster |
-| Insert | 7.41 ms | 9.21 ms | 3.16 ms | 1.24x slower | 2.35x faster |
-| Erase | 6.47 ms | 4.12 ms | 1.34 ms | 1.57x faster | 4.83x faster |
+| Find | 0.88 ms | 7.14 ms | 0.34 ms | 8.11x slower | 2.60x faster |
+| Iterate | 2.73 ms | 2.37 ms | 0.59 ms | 1.15x faster | 4.66x faster |
+| Insert | 7.49 ms | 8.24 ms | 2.77 ms | 1.10x slower | 2.70x faster |
+| Erase | 6.30 ms | 4.00 ms | 1.37 ms | 1.58x faster | 4.60x faster |
 | Memory | 4.97 MB | 6.87 MB | 5.90 MB | 1.38x larger | 1.19x larger |
 
 ## uint64_t key
@@ -63,20 +63,20 @@ Comparison columns show how std::map/unordered_map compare to kntrie:
 
 | Metric | kntrie | std::map | std::unordered_map | kntrie vs map | kntrie vs umap |
 |--------|--------|----------|-------------------|---------------|----------------|
-| Find | 3.96 ms | 28.41 ms | 1.73 ms | 7.17x slower | 2.29x faster |
-| Iterate | 1.63 ms | 6.20 ms | 2.67 ms | 3.80x slower | 1.64x slower |
-| Insert | 9.49 ms | 20.77 ms | 9.27 ms | 2.19x slower | 1.02x faster |
-| Erase | 10.89 ms | 26.34 ms | 5.00 ms | 2.42x slower | 2.18x faster |
+| Find | 4.08 ms | 26.31 ms | 1.61 ms | 6.46x slower | 2.54x faster |
+| Iterate | 1.64 ms | 5.63 ms | 2.16 ms | 3.44x slower | 1.32x slower |
+| Insert | 9.67 ms | 19.40 ms | 8.53 ms | 2.01x slower | 1.13x faster |
+| Erase | 11.02 ms | 24.30 ms | 4.39 ms | 2.20x slower | 2.51x faster |
 | Memory | 1.59 MB | 4.58 MB | 3.92 MB | 2.88x larger | 2.47x larger |
 
 #### Sequential Pattern
 
 | Metric | kntrie | std::map | std::unordered_map | kntrie vs map | kntrie vs umap |
 |--------|--------|----------|-------------------|---------------|----------------|
-| Find | 2.39 ms | 6.71 ms | 0.31 ms | 2.81x slower | 7.73x faster |
-| Iterate | 4.88 ms | 0.67 ms | 0.28 ms | 7.25x faster | 17.36x faster |
-| Insert | 7.81 ms | 6.95 ms | 2.23 ms | 1.12x faster | 3.50x faster |
-| Erase | 7.19 ms | 3.55 ms | 1.20 ms | 2.02x faster | 5.97x faster |
+| Find | 2.44 ms | 6.35 ms | 0.31 ms | 2.60x slower | 7.99x faster |
+| Iterate | 4.88 ms | 0.55 ms | 0.25 ms | 8.89x faster | 19.65x faster |
+| Insert | 7.80 ms | 6.43 ms | 2.20 ms | 1.21x faster | 3.55x faster |
+| Erase | 7.23 ms | 3.42 ms | 1.09 ms | 2.11x faster | 6.61x faster |
 | Memory | 1.62 MB | 4.58 MB | 3.92 MB | 2.82x larger | 2.42x larger |
 
 ### uint64_t key, Value256 (32 bytes) value
@@ -85,19 +85,19 @@ Comparison columns show how std::map/unordered_map compare to kntrie:
 
 | Metric | kntrie | std::map | std::unordered_map | kntrie vs map | kntrie vs umap |
 |--------|--------|----------|-------------------|---------------|----------------|
-| Find | 4.31 ms | 32.63 ms | 2.08 ms | 7.57x slower | 2.07x faster |
-| Iterate | 1.65 ms | 6.96 ms | 4.52 ms | 4.23x slower | 2.75x slower |
-| Insert | 12.65 ms | 21.89 ms | 13.96 ms | 1.73x slower | 1.10x slower |
-| Erase | 16.88 ms | 28.70 ms | 6.71 ms | 1.70x slower | 2.52x faster |
+| Find | 4.24 ms | 28.01 ms | 1.98 ms | 6.61x slower | 2.14x faster |
+| Iterate | 1.65 ms | 6.28 ms | 4.43 ms | 3.81x slower | 2.69x slower |
+| Insert | 12.40 ms | 19.95 ms | 13.34 ms | 1.61x slower | 1.08x slower |
+| Erase | 16.00 ms | 26.58 ms | 6.50 ms | 1.66x slower | 2.46x faster |
 | Memory | 4.64 MB | 6.87 MB | 5.90 MB | 1.48x larger | 1.27x larger |
 
 #### Sequential Pattern
 
 | Metric | kntrie | std::map | std::unordered_map | kntrie vs map | kntrie vs umap |
 |--------|--------|----------|-------------------|---------------|----------------|
-| Find | 2.49 ms | 5.91 ms | 0.35 ms | 2.37x slower | 7.20x faster |
-| Iterate | 5.07 ms | 0.77 ms | 0.50 ms | 6.62x faster | 10.06x faster |
-| Insert | 9.19 ms | 7.87 ms | 2.95 ms | 1.17x faster | 3.11x faster |
-| Erase | 9.08 ms | 3.63 ms | 1.24 ms | 2.50x faster | 7.34x faster |
+| Find | 2.45 ms | 5.51 ms | 0.37 ms | 2.25x slower | 6.69x faster |
+| Iterate | 5.07 ms | 0.81 ms | 0.51 ms | 6.23x faster | 9.91x faster |
+| Insert | 8.90 ms | 7.60 ms | 2.87 ms | 1.17x faster | 3.10x faster |
+| Erase | 9.03 ms | 3.56 ms | 1.09 ms | 2.53x faster | 8.28x faster |
 | Memory | 4.67 MB | 6.87 MB | 5.90 MB | 1.47x larger | 1.26x larger |
 
