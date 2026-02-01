@@ -68,6 +68,11 @@ struct Bitmap256 {
         return slot;
     }
     
+    // Count set bits below the given index (not including it)
+    int count_below(uint8_t index) const noexcept {
+        return slot_for_insert(index);  // Same logic
+    }
+    
     int find_next_set(int start) const noexcept {
         if (start >= 256) return -1;
         
@@ -284,15 +289,22 @@ private:
         }
     }
     
-    // Bottom LEAF: [count:u32 padded][(BITS-8)-bit suffixes...][values...]
-    // This is a LIST with no bitmap - linear search through up to 256 entries
+    // Bottom LEAF: 
+    //   BITS=16: [bm_256][values...] - bitmap indicates which 8-bit suffixes are present
+    //   BITS>16: [count:u32 padded][(BITS-8)-bit suffixes...][values...]
     template<int BITS>
     static constexpr size_t bot_leaf_size_u64(size_t count) noexcept {
-        constexpr int suffix_bits = BITS - 8;
-        using S = typename suffix_traits<suffix_bits>::type;
-        size_t suffix_bytes = count * sizeof(S);
-        suffix_bytes = (suffix_bytes + 7) & ~size_t{7};
-        return 1 + suffix_bytes / 8 + count;  // 1 for count header
+        if constexpr (BITS == 16) {
+            // Bitmap-based: [bm_256][values...]
+            return BITMAP256_U64 + count;
+        } else {
+            // List-based: [count:u32 padded][suffixes...][values...]
+            constexpr int suffix_bits = BITS - 8;
+            using S = typename suffix_traits<suffix_bits>::type;
+            size_t suffix_bytes = count * sizeof(S);
+            suffix_bytes = (suffix_bytes + 7) & ~size_t{7};
+            return 1 + suffix_bytes / 8 + count;
+        }
     }
     
     // Bottom INTERNAL: [bm_256][child_ptrs...]
@@ -369,20 +381,42 @@ private:
         }
     }
     
-    // Bottom LEAF accessors: [count:u32 padded][(BITS-8)-bit suffixes...][values...]
-    // NO BITMAP - this is a linear list
+    // Bottom LEAF accessors:
+    //   BITS=16: [bm_256][values...] - bitmap based, O(1) lookup
+    //   BITS>16: [count:u32 padded][(BITS-8)-bit suffixes...][values...] - list based
+    
+    // For BITS=16: access the bitmap
+    template<int BITS>
+    static Bitmap256& bot_leaf_bitmap(uint64_t* bot) noexcept {
+        static_assert(BITS == 16, "bot_leaf_bitmap only for BITS=16");
+        return *reinterpret_cast<Bitmap256*>(bot);
+    }
+    
+    template<int BITS>
+    static const Bitmap256& bot_leaf_bitmap(const uint64_t* bot) noexcept {
+        static_assert(BITS == 16, "bot_leaf_bitmap only for BITS=16");
+        return *reinterpret_cast<const Bitmap256*>(bot);
+    }
+    
     template<int BITS>
     static uint32_t bot_leaf_count(const uint64_t* bot) noexcept {
-        return *reinterpret_cast<const uint32_t*>(bot);
+        if constexpr (BITS == 16) {
+            return bot_leaf_bitmap<16>(bot).popcount();
+        } else {
+            return *reinterpret_cast<const uint32_t*>(bot);
+        }
     }
     
     template<int BITS>
     static void set_bot_leaf_count(uint64_t* bot, uint32_t count) noexcept {
+        static_assert(BITS != 16, "set_bot_leaf_count not used for BITS=16 (count derived from bitmap)");
         *reinterpret_cast<uint32_t*>(bot) = count;
     }
     
+    // Suffixes only for BITS > 16 (list-based)
     template<int BITS>
     static auto bot_leaf_suffixes(uint64_t* bot) noexcept {
+        static_assert(BITS > 16, "bot_leaf_suffixes only for BITS>16");
         constexpr int suffix_bits = BITS - 8;
         using S = typename suffix_traits<suffix_bits>::type;
         return reinterpret_cast<S*>(bot + 1);  // After count
@@ -390,27 +424,36 @@ private:
     
     template<int BITS>
     static auto bot_leaf_suffixes(const uint64_t* bot) noexcept {
+        static_assert(BITS > 16, "bot_leaf_suffixes only for BITS>16");
         constexpr int suffix_bits = BITS - 8;
         using S = typename suffix_traits<suffix_bits>::type;
         return reinterpret_cast<const S*>(bot + 1);
     }
     
     template<int BITS>
-    static uint64_t* bot_leaf_values(uint64_t* bot, size_t count) noexcept {
-        constexpr int suffix_bits = BITS - 8;
-        using S = typename suffix_traits<suffix_bits>::type;
-        size_t suffix_bytes = count * sizeof(S);
-        suffix_bytes = (suffix_bytes + 7) & ~size_t{7};
-        return reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(bot + 1) + suffix_bytes);
+    static uint64_t* bot_leaf_values(uint64_t* bot, [[maybe_unused]] size_t count) noexcept {
+        if constexpr (BITS == 16) {
+            return bot + BITMAP256_U64;
+        } else {
+            constexpr int suffix_bits = BITS - 8;
+            using S = typename suffix_traits<suffix_bits>::type;
+            size_t suffix_bytes = count * sizeof(S);
+            suffix_bytes = (suffix_bytes + 7) & ~size_t{7};
+            return reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(bot + 1) + suffix_bytes);
+        }
     }
     
     template<int BITS>
-    static const uint64_t* bot_leaf_values(const uint64_t* bot, size_t count) noexcept {
-        constexpr int suffix_bits = BITS - 8;
-        using S = typename suffix_traits<suffix_bits>::type;
-        size_t suffix_bytes = count * sizeof(S);
-        suffix_bytes = (suffix_bytes + 7) & ~size_t{7};
-        return reinterpret_cast<const uint64_t*>(reinterpret_cast<const char*>(bot + 1) + suffix_bytes);
+    static const uint64_t* bot_leaf_values(const uint64_t* bot, [[maybe_unused]] size_t count) noexcept {
+        if constexpr (BITS == 16) {
+            return bot + BITMAP256_U64;
+        } else {
+            constexpr int suffix_bits = BITS - 8;
+            using S = typename suffix_traits<suffix_bits>::type;
+            size_t suffix_bytes = count * sizeof(S);
+            suffix_bytes = (suffix_bytes + 7) & ~size_t{7};
+            return reinterpret_cast<const uint64_t*>(reinterpret_cast<const char*>(bot + 1) + suffix_bytes);
+        }
     }
     
     // Bottom INTERNAL accessors: [bm_256][child_ptrs...]
@@ -732,23 +775,40 @@ private:
     
     template<int BITS>
     const VALUE* find_in_bot_leaf(const uint64_t* bot, uint64_t ik) const noexcept {
-        // Bottom LEAF is a list: [count][(BITS-8)-bit suffixes...][values...]
-        uint32_t count = bot_leaf_count<BITS>(bot);
-        
-        constexpr int suffix_bits = BITS - 8;
-        using S = typename suffix_traits<suffix_bits>::type;
-        S suffix = static_cast<S>(extract_suffix<suffix_bits>(ik));
-        
-        const S* suffixes = bot_leaf_suffixes<BITS>(bot);
-        const uint64_t* values = bot_leaf_values<BITS>(bot, count);
-        
-        int idx = binary_search(suffixes, count, suffix);
-        if (idx < 0) return nullptr;
-        
-        if constexpr (value_inline) {
-            return reinterpret_cast<const VALUE*>(&values[idx]);
+        if constexpr (BITS == 16) {
+            // Bitmap-based: [bm_256][values...]
+            uint8_t suffix = static_cast<uint8_t>(extract_suffix<8>(ik));
+            const Bitmap256& bm = bot_leaf_bitmap<16>(bot);
+            
+            if (!bm.has_bit(suffix)) return nullptr;
+            
+            int slot = bm.count_below(suffix);
+            const uint64_t* values = bot_leaf_values<16>(bot, 0);
+            
+            if constexpr (value_inline) {
+                return reinterpret_cast<const VALUE*>(&values[slot]);
+            } else {
+                return reinterpret_cast<const VALUE*>(values[slot]);
+            }
         } else {
-            return reinterpret_cast<const VALUE*>(values[idx]);
+            // List-based: [count][(BITS-8)-bit suffixes...][values...]
+            uint32_t count = bot_leaf_count<BITS>(bot);
+            
+            constexpr int suffix_bits = BITS - 8;
+            using S = typename suffix_traits<suffix_bits>::type;
+            S suffix = static_cast<S>(extract_suffix<suffix_bits>(ik));
+            
+            const S* suffixes = bot_leaf_suffixes<BITS>(bot);
+            const uint64_t* values = bot_leaf_values<BITS>(bot, count);
+            
+            int idx = binary_search(suffixes, count, suffix);
+            if (idx < 0) return nullptr;
+            
+            if constexpr (value_inline) {
+                return reinterpret_cast<const VALUE*>(&values[idx]);
+            } else {
+                return reinterpret_cast<const VALUE*>(values[idx]);
+            }
         }
     }
     
@@ -1022,37 +1082,73 @@ private:
             
             size_t bot_count = bucket_counts[top_idx];
             uint64_t* bot = alloc_node(bot_leaf_size_u64<BITS>(bot_count));
-            set_bot_leaf_count<BITS>(bot, static_cast<uint32_t>(bot_count));
             
-            S* suffixes = bot_leaf_suffixes<BITS>(bot);
-            uint64_t* values = bot_leaf_values<BITS>(bot, bot_count);
-            
-            bool need_insert_new = (new_top_idx == top_idx);
-            bool inserted_new = false;
-            size_t idx = 0;
-            
-            for (uint32_t i = 0; i < h->count; ++i) {
-                if ((old_keys[i] >> (BITS - 8)) == static_cast<uint64_t>(top_idx)) {
-                    S old_bot_suffix = static_cast<S>(old_keys[i] & suffix_mask);
-                    
-                    // Insert new entry before this one if it belongs here
-                    if (need_insert_new && !inserted_new && new_bot_suffix < old_bot_suffix) {
-                        suffixes[idx] = new_bot_suffix;
-                        values[idx] = new_value_u64;
-                        idx++;
-                        inserted_new = true;
+            if constexpr (BITS == 16) {
+                // Bitmap-based: [bm_256][values...]
+                Bitmap256& bot_bm = bot_leaf_bitmap<16>(bot);
+                bot_bm = Bitmap256{};  // Clear
+                uint64_t* values = bot_leaf_values<16>(bot, bot_count);
+                
+                // First pass: set bits and collect (suffix, value) pairs
+                struct Entry { uint8_t suffix; uint64_t value; };
+                Entry entries[256];
+                size_t entry_count = 0;
+                
+                bool need_insert_new = (new_top_idx == top_idx);
+                
+                for (uint32_t i = 0; i < h->count; ++i) {
+                    if ((old_keys[i] >> 8) == static_cast<uint64_t>(top_idx)) {
+                        uint8_t old_bot_suffix = static_cast<uint8_t>(old_keys[i] & 0xFF);
+                        entries[entry_count++] = {old_bot_suffix, old_values[i]};
+                        bot_bm.set_bit(old_bot_suffix);
                     }
-                    
-                    suffixes[idx] = old_bot_suffix;
-                    values[idx] = old_values[i];
-                    idx++;
                 }
-            }
-            
-            // Insert new entry at end if not yet inserted
-            if (need_insert_new && !inserted_new) {
-                suffixes[idx] = new_bot_suffix;
-                values[idx] = new_value_u64;
+                
+                if (need_insert_new) {
+                    uint8_t new_bot_suffix_8 = static_cast<uint8_t>(new_suffix & 0xFF);
+                    entries[entry_count++] = {new_bot_suffix_8, new_value_u64};
+                    bot_bm.set_bit(new_bot_suffix_8);
+                }
+                
+                // Second pass: write values in bitmap order
+                for (size_t i = 0; i < entry_count; ++i) {
+                    int slot = bot_bm.count_below(entries[i].suffix);
+                    values[slot] = entries[i].value;
+                }
+            } else {
+                // List-based: [count][suffixes...][values...]
+                set_bot_leaf_count<BITS>(bot, static_cast<uint32_t>(bot_count));
+                
+                S* suffixes = bot_leaf_suffixes<BITS>(bot);
+                uint64_t* values = bot_leaf_values<BITS>(bot, bot_count);
+                
+                bool need_insert_new = (new_top_idx == top_idx);
+                bool inserted_new = false;
+                size_t idx = 0;
+                
+                for (uint32_t i = 0; i < h->count; ++i) {
+                    if ((old_keys[i] >> (BITS - 8)) == static_cast<uint64_t>(top_idx)) {
+                        S old_bot_suffix = static_cast<S>(old_keys[i] & suffix_mask);
+                        
+                        // Insert new entry before this one if it belongs here
+                        if (need_insert_new && !inserted_new && new_bot_suffix < old_bot_suffix) {
+                            suffixes[idx] = new_bot_suffix;
+                            values[idx] = new_value_u64;
+                            idx++;
+                            inserted_new = true;
+                        }
+                        
+                        suffixes[idx] = old_bot_suffix;
+                        values[idx] = old_values[i];
+                        idx++;
+                    }
+                }
+                
+                // Insert new entry at end if not yet inserted
+                if (need_insert_new && !inserted_new) {
+                    suffixes[idx] = new_bot_suffix;
+                    values[idx] = new_value_u64;
+                }
             }
             
             new_top_ch[top_slot++] = reinterpret_cast<uint64_t>(bot);
@@ -1237,29 +1333,57 @@ private:
             } else {
                 // Normal case: create bot_leaf
                 uint64_t* bot = alloc_node(bot_leaf_size_u64<CHILD_BITS>(bot_count));
-                set_bot_leaf_count<CHILD_BITS>(bot, static_cast<uint32_t>(bot_count));
                 
-                using S = typename suffix_traits<suffix_bits>::type;
-                S* bot_suffixes = bot_leaf_suffixes<CHILD_BITS>(bot);
-                uint64_t* bot_values = bot_leaf_values<CHILD_BITS>(bot, bot_count);
-                
-                // Collect and sort entries for this bucket
-                size_t bi = 0;
-                for (size_t i = 0; i < count; ++i) {
-                    if ((suffixes[i] >> (CHILD_BITS - 8)) == static_cast<uint64_t>(bucket)) {
-                        S suf = static_cast<S>(suffixes[i] & suffix_mask);
-                        uint64_t val = values[i];
-                        
-                        // Insert in sorted order
-                        size_t j = bi;
-                        while (j > 0 && bot_suffixes[j-1] > suf) {
-                            bot_suffixes[j] = bot_suffixes[j-1];
-                            bot_values[j] = bot_values[j-1];
-                            j--;
+                if constexpr (CHILD_BITS == 16) {
+                    // Bitmap-based: [bm_256][values...]
+                    Bitmap256& bot_bm = bot_leaf_bitmap<16>(bot);
+                    bot_bm = Bitmap256{};
+                    uint64_t* bot_values = bot_leaf_values<16>(bot, bot_count);
+                    
+                    // Collect entries for this bucket, set bits, and populate values
+                    struct Entry { uint8_t suffix; uint64_t value; };
+                    Entry entries[256];
+                    size_t bi = 0;
+                    
+                    for (size_t i = 0; i < count; ++i) {
+                        if ((suffixes[i] >> 8) == static_cast<uint64_t>(bucket)) {
+                            uint8_t suf = static_cast<uint8_t>(suffixes[i] & 0xFF);
+                            entries[bi++] = {suf, values[i]};
+                            bot_bm.set_bit(suf);
                         }
-                        bot_suffixes[j] = suf;
-                        bot_values[j] = val;
-                        bi++;
+                    }
+                    
+                    // Write values in bitmap order
+                    for (size_t i = 0; i < bi; ++i) {
+                        int slot_idx = bot_bm.count_below(entries[i].suffix);
+                        bot_values[slot_idx] = entries[i].value;
+                    }
+                } else {
+                    // List-based: [count][suffixes...][values...]
+                    set_bot_leaf_count<CHILD_BITS>(bot, static_cast<uint32_t>(bot_count));
+                    
+                    using S = typename suffix_traits<suffix_bits>::type;
+                    S* bot_suffixes = bot_leaf_suffixes<CHILD_BITS>(bot);
+                    uint64_t* bot_values = bot_leaf_values<CHILD_BITS>(bot, bot_count);
+                    
+                    // Collect and sort entries for this bucket
+                    size_t bi = 0;
+                    for (size_t i = 0; i < count; ++i) {
+                        if ((suffixes[i] >> (CHILD_BITS - 8)) == static_cast<uint64_t>(bucket)) {
+                            S suf = static_cast<S>(suffixes[i] & suffix_mask);
+                            uint64_t val = values[i];
+                            
+                            // Insert in sorted order
+                            size_t j = bi;
+                            while (j > 0 && bot_suffixes[j-1] > suf) {
+                                bot_suffixes[j] = bot_suffixes[j-1];
+                                bot_values[j] = bot_values[j-1];
+                                j--;
+                            }
+                            bot_suffixes[j] = suf;
+                            bot_values[j] = val;
+                            bi++;
+                        }
                     }
                 }
                 
@@ -1350,20 +1474,37 @@ private:
         for (size_t i = insert_slot; i < old_top_count; ++i) new_ch[i + 1] = old_ch[i];
         
         // Create new bottom LEAF with single entry
-        constexpr int suffix_bits = BITS - 8;
-        using S = typename suffix_traits<suffix_bits>::type;
-        
         uint64_t* new_bot = alloc_node(bot_leaf_size_u64<BITS>(1));
-        set_bot_leaf_count<BITS>(new_bot, 1);
         
-        S* suffixes = bot_leaf_suffixes<BITS>(new_bot);
-        uint64_t* values = bot_leaf_values<BITS>(new_bot, 1);
-        
-        suffixes[0] = static_cast<S>(extract_suffix<suffix_bits>(ik));
-        if constexpr (value_inline) {
-            std::memcpy(&values[0], &value, sizeof(stored_value_type));
+        if constexpr (BITS == 16) {
+            // Bitmap-based: [bm_256][values...]
+            Bitmap256& new_bm = bot_leaf_bitmap<16>(new_bot);
+            new_bm = Bitmap256{};
+            uint8_t suffix = static_cast<uint8_t>(extract_suffix<8>(ik));
+            new_bm.set_bit(suffix);
+            
+            uint64_t* values = bot_leaf_values<16>(new_bot, 1);
+            if constexpr (value_inline) {
+                std::memcpy(&values[0], &value, sizeof(stored_value_type));
+            } else {
+                values[0] = static_cast<uint64_t>(value);
+            }
         } else {
-            values[0] = static_cast<uint64_t>(value);
+            // List-based: [count][suffixes...][values...]
+            constexpr int suffix_bits = BITS - 8;
+            using S = typename suffix_traits<suffix_bits>::type;
+            
+            set_bot_leaf_count<BITS>(new_bot, 1);
+            
+            S* suffixes = bot_leaf_suffixes<BITS>(new_bot);
+            uint64_t* values = bot_leaf_values<BITS>(new_bot, 1);
+            
+            suffixes[0] = static_cast<S>(extract_suffix<suffix_bits>(ik));
+            if constexpr (value_inline) {
+                std::memcpy(&values[0], &value, sizeof(stored_value_type));
+            } else {
+                values[0] = static_cast<uint64_t>(value);
+            }
         }
         
         new_ch[insert_slot] = reinterpret_cast<uint64_t>(new_bot);
@@ -1377,71 +1518,125 @@ private:
                                        uint64_t* bot, uint64_t ik, stored_value_type value)
         requires (BITS > 0)
     {
-        uint32_t count = bot_leaf_count<BITS>(bot);
-        
-        constexpr int suffix_bits = BITS - 8;
-        using S = typename suffix_traits<suffix_bits>::type;
-        S suffix = static_cast<S>(extract_suffix<suffix_bits>(ik));
-        
-        S* suffixes = bot_leaf_suffixes<BITS>(bot);
-        uint64_t* values = bot_leaf_values<BITS>(bot, count);
-        
-        // Binary search for existing or insertion point
-        int idx = binary_search(suffixes, count, suffix);
-        
-        if (idx >= 0) {
-            // Found existing - update value
-            if constexpr (!value_inline) {
-                destroy_value(static_cast<stored_value_type>(values[idx]));
+        if constexpr (BITS == 16) {
+            // Bitmap-based: [bm_256][values...]
+            uint8_t suffix = static_cast<uint8_t>(extract_suffix<8>(ik));
+            Bitmap256& bot_bm = bot_leaf_bitmap<16>(bot);
+            uint32_t count = bot_bm.popcount();
+            uint64_t* values = bot_leaf_values<16>(bot, count);
+            
+            if (bot_bm.has_bit(suffix)) {
+                // Found existing - update value
+                int slot = bot_bm.count_below(suffix);
+                if constexpr (!value_inline) {
+                    destroy_value(static_cast<stored_value_type>(values[slot]));
+                }
+                if constexpr (value_inline) {
+                    std::memcpy(&values[slot], &value, sizeof(stored_value_type));
+                } else {
+                    values[slot] = static_cast<uint64_t>(value);
+                }
+                return {node, false};
             }
+            
+            // Not found - add new entry
+            // Reallocate with new entry
+            uint32_t new_count = count + 1;
+            uint64_t* new_bot = alloc_node(bot_leaf_size_u64<16>(new_count));
+            Bitmap256& new_bm = bot_leaf_bitmap<16>(new_bot);
+            new_bm = bot_bm;
+            new_bm.set_bit(suffix);
+            
+            uint64_t* new_values = bot_leaf_values<16>(new_bot, new_count);
+            
+            // Copy values, inserting new one at correct slot
+            int insert_slot = new_bm.count_below(suffix);
+            
+            // Copy before insertion point
+            std::memcpy(new_values, values, insert_slot * sizeof(uint64_t));
+            
+            // Insert new value
             if constexpr (value_inline) {
-                std::memcpy(&values[idx], &value, sizeof(stored_value_type));
+                std::memcpy(&new_values[insert_slot], &value, sizeof(stored_value_type));
             } else {
-                values[idx] = static_cast<uint64_t>(value);
+                new_values[insert_slot] = static_cast<uint64_t>(value);
             }
-            return {node, false};
-        }
-        
-        // Not found - idx encodes insertion point
-        size_t insert_pos = static_cast<size_t>(-(idx + 1));
-        
-        // Need to add - check overflow
-        if (count >= BOT_LEAF_MAX) {
-            if constexpr (BITS > 16) {
-                return convert_bot_leaf_to_internal<BITS>(node, h, top_idx, top_slot, bot, count, ik, value);
-            }
-            // At BITS=16, can't overflow further
-        }
-        
-        // Reallocate with new entry in sorted position
-        uint32_t new_count = count + 1;
-        uint64_t* new_bot = alloc_node(bot_leaf_size_u64<BITS>(new_count));
-        set_bot_leaf_count<BITS>(new_bot, new_count);
-        
-        S* new_suffixes = bot_leaf_suffixes<BITS>(new_bot);
-        uint64_t* new_values = bot_leaf_values<BITS>(new_bot, new_count);
-        
-        // Copy before insertion point
-        std::memcpy(new_suffixes, suffixes, insert_pos * sizeof(S));
-        std::memcpy(new_values, values, insert_pos * sizeof(uint64_t));
-        
-        // Insert new entry
-        new_suffixes[insert_pos] = suffix;
-        if constexpr (value_inline) {
-            std::memcpy(&new_values[insert_pos], &value, sizeof(stored_value_type));
+            
+            // Copy after insertion point
+            std::memcpy(new_values + insert_slot + 1, values + insert_slot, (count - insert_slot) * sizeof(uint64_t));
+            
+            top_children<16>(node)[top_slot] = reinterpret_cast<uint64_t>(new_bot);
+            h->count++;
+            
+            dealloc_node(bot, bot_leaf_size_u64<16>(count));
+            return {node, true};
         } else {
-            new_values[insert_pos] = static_cast<uint64_t>(value);
+            // List-based: [count][suffixes...][values...]
+            uint32_t count = bot_leaf_count<BITS>(bot);
+            
+            constexpr int suffix_bits = BITS - 8;
+            using S = typename suffix_traits<suffix_bits>::type;
+            S suffix = static_cast<S>(extract_suffix<suffix_bits>(ik));
+            
+            S* suffixes = bot_leaf_suffixes<BITS>(bot);
+            uint64_t* values = bot_leaf_values<BITS>(bot, count);
+            
+            // Binary search for existing or insertion point
+            int idx = binary_search(suffixes, count, suffix);
+            
+            if (idx >= 0) {
+                // Found existing - update value
+                if constexpr (!value_inline) {
+                    destroy_value(static_cast<stored_value_type>(values[idx]));
+                }
+                if constexpr (value_inline) {
+                    std::memcpy(&values[idx], &value, sizeof(stored_value_type));
+                } else {
+                    values[idx] = static_cast<uint64_t>(value);
+                }
+                return {node, false};
+            }
+            
+            // Not found - idx encodes insertion point
+            size_t insert_pos = static_cast<size_t>(-(idx + 1));
+            
+            // Need to add - check overflow
+            if (count >= BOT_LEAF_MAX) {
+                if constexpr (BITS > 16) {
+                    return convert_bot_leaf_to_internal<BITS>(node, h, top_idx, top_slot, bot, count, ik, value);
+                }
+            }
+            
+            // Reallocate with new entry in sorted position
+            uint32_t new_count = count + 1;
+            uint64_t* new_bot = alloc_node(bot_leaf_size_u64<BITS>(new_count));
+            set_bot_leaf_count<BITS>(new_bot, new_count);
+            
+            S* new_suffixes = bot_leaf_suffixes<BITS>(new_bot);
+            uint64_t* new_values = bot_leaf_values<BITS>(new_bot, new_count);
+            
+            // Copy before insertion point
+            std::memcpy(new_suffixes, suffixes, insert_pos * sizeof(S));
+            std::memcpy(new_values, values, insert_pos * sizeof(uint64_t));
+            
+            // Insert new entry
+            new_suffixes[insert_pos] = suffix;
+            if constexpr (value_inline) {
+                std::memcpy(&new_values[insert_pos], &value, sizeof(stored_value_type));
+            } else {
+                new_values[insert_pos] = static_cast<uint64_t>(value);
+            }
+            
+            // Copy after insertion point
+            std::memcpy(new_suffixes + insert_pos + 1, suffixes + insert_pos, (count - insert_pos) * sizeof(S));
+            std::memcpy(new_values + insert_pos + 1, values + insert_pos, (count - insert_pos) * sizeof(uint64_t));
+            
+            top_children<BITS>(node)[top_slot] = reinterpret_cast<uint64_t>(new_bot);
+            h->count++;
+            
+            dealloc_node(bot, bot_leaf_size_u64<BITS>(count));
+            return {node, true};
         }
-        
-        // Copy after insertion point
-        std::memcpy(new_suffixes + insert_pos + 1, suffixes + insert_pos, (count - insert_pos) * sizeof(S));
-        std::memcpy(new_values + insert_pos + 1, values + insert_pos, (count - insert_pos) * sizeof(uint64_t));
-        
-        top_children<BITS>(node)[top_slot] = reinterpret_cast<uint64_t>(new_bot);
-        h->count++;
-        
-        dealloc_node(bot, bot_leaf_size_u64<BITS>(count));
-        return {node, true};
     }
 
     template<int BITS>
@@ -1808,7 +2003,9 @@ public:
     struct DebugStats {
         struct Level {
             size_t compact_leaf = 0;
+            size_t compact_leaf_compressed = 0;  // With skip > 0
             size_t split_nodes = 0;
+            size_t split_nodes_compressed = 0;   // With skip > 0
             size_t bot_leaf = 0;
             size_t bot_internal = 0;
             size_t entries = 0;
@@ -1840,19 +2037,38 @@ private:
         else {
             if (!node) return;
             
-            constexpr int level_idx = (64 - BITS) / 16;
-            auto& L = s.levels[level_idx];
-            
             const NodeHeader* h = get_header(node);
+            
+            // Handle skip - dispatch to correct bit width
+            if (h->skip > 0) {
+                int actual_bits = BITS - h->skip * 16;
+                if (actual_bits == 48) { collect_stats_at_bits<48>(node, h, s, true); return; }
+                if (actual_bits == 32) { collect_stats_at_bits<32>(node, h, s, true); return; }
+                if (actual_bits == 16) { collect_stats_at_bits<16>(node, h, s, true); return; }
+                return;
+            }
+            
+            collect_stats_at_bits<BITS>(node, h, s, false);
+        }
+    }
+    
+    template<int BITS>
+    void collect_stats_at_bits(const uint64_t* node, const NodeHeader* h, DebugStats& s, bool compressed) const noexcept {
+        if constexpr (BITS <= 0) return;
+        else {
+            constexpr int level_idx = (static_cast<int>(key_bits) - BITS) / 16;
+            auto& L = s.levels[level_idx < 4 ? level_idx : 3];
             
             if (h->is_leaf() && !h->is_split()) {
                 L.compact_leaf++;
+                if (compressed) L.compact_leaf_compressed++;
                 L.nodes++;
                 L.entries += h->count;
                 L.bytes += leaf_compact_size_u64<BITS>(h->count) * 8;
                 L.leaf_hist[h->count < 257 ? h->count : 257]++;
             } else if (h->is_split()) {
                 L.split_nodes++;
+                if (compressed) L.split_nodes_compressed++;
                 L.nodes++;
                 L.bytes += split_top_size_u64<BITS>(h->top_count) * 8;
                 
@@ -1871,14 +2087,16 @@ private:
                         L.entries += bot_count;
                         L.bytes += bot_leaf_size_u64<BITS>(bot_count) * 8;
                     } else {
-                        L.bot_internal++;
-                        const Bitmap256& bot_bm = bot_bitmap(bot);
-                        int bot_count = bot_bm.popcount();
-                        L.bytes += bot_internal_size_u64(bot_count) * 8;
-                        
-                        const uint64_t* children = bot_internal_children(bot);
-                        for (int i = 0; i < bot_count; ++i) {
-                            collect_stats<BITS - 16>(reinterpret_cast<const uint64_t*>(children[i]), s);
+                        if constexpr (BITS > 16) {
+                            L.bot_internal++;
+                            const Bitmap256& bot_bm = bot_bitmap(bot);
+                            int bot_count = bot_bm.popcount();
+                            L.bytes += bot_internal_size_u64(bot_count) * 8;
+                            
+                            const uint64_t* children = bot_internal_children(bot);
+                            for (int i = 0; i < bot_count; ++i) {
+                                collect_stats<BITS - 16>(reinterpret_cast<const uint64_t*>(children[i]), s);
+                            }
                         }
                     }
                     ++slot;
