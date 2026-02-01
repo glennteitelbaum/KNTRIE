@@ -114,14 +114,14 @@ private:
     using value_alloc_type = typename std::allocator_traits<ALLOC>::template rebind_alloc<VALUE>;
     
     // ==========================================================================
-    // Node Header (16 bytes)
+    // Node Header (8 bytes base, +8 bytes if skip > 0 for prefix)
     // ==========================================================================
     struct NodeHeader {
         uint32_t count;      // Total entries
         uint16_t top_count;  // For split: number of top-level entries
         uint8_t skip;        // Skip compression levels (each = 16 bits)
         uint8_t flags;       // Bit 0: is_leaf, Bit 1: is_split
-        uint64_t prefix;     // Skip prefix
+        // prefix follows immediately after if skip > 0
         
         bool is_leaf() const noexcept { return flags & 1; }
         bool is_split() const noexcept { return flags & 2; }
@@ -129,7 +129,7 @@ private:
         void set_split(bool v) noexcept { flags = (flags & ~2) | (v ? 2 : 0); }
     };
     
-    static_assert(sizeof(NodeHeader) == 16, "NodeHeader must be 16 bytes");
+    static_assert(sizeof(NodeHeader) == 8, "NodeHeader base must be 8 bytes");
     
     static NodeHeader* get_header(uint64_t* node) noexcept {
         return reinterpret_cast<NodeHeader*>(node);
@@ -138,7 +138,19 @@ private:
         return reinterpret_cast<const NodeHeader*>(node);
     }
     
-    static constexpr size_t HEADER_U64 = 2;  // 16 bytes
+    // Get prefix (only valid when skip > 0)
+    static uint64_t get_prefix(const uint64_t* node) noexcept {
+        return node[1];  // Prefix is second u64 when present
+    }
+    static void set_prefix(uint64_t* node, uint64_t prefix) noexcept {
+        node[1] = prefix;
+    }
+    
+    // Header size: 1 u64 for skip=0, 2 u64 for skip>0
+    static constexpr size_t header_u64(uint8_t skip) noexcept {
+        return skip > 0 ? 2 : 1;
+    }
+    
     static constexpr size_t BITMAP256_U64 = 4;  // 32 bytes
     static constexpr size_t COMPACT_MAX = 4096;
     static constexpr size_t BOT_LEAF_MAX = 4096;
@@ -354,7 +366,7 @@ private:
     
     // Compact leaf: [header][idx1...][idx2...][keys...][values...]
     template<int BITS>
-    static constexpr size_t leaf_compact_size_u64(size_t count) noexcept {
+    static constexpr size_t leaf_compact_size_u64(size_t count, uint8_t skip) noexcept {
         using K = typename suffix_traits<BITS>::type;
         int i1 = idx1_count(static_cast<int>(count));
         int i2 = idx2_count(static_cast<int>(count));
@@ -364,17 +376,17 @@ private:
         key_bytes = (key_bytes + 7) & ~size_t{7};
         size_t val_bytes = count * sizeof(value_slot_type);
         val_bytes = (val_bytes + 7) & ~size_t{7};
-        return HEADER_U64 + (idx_bytes + key_bytes + val_bytes) / 8;
+        return header_u64(skip) + (idx_bytes + key_bytes + val_bytes) / 8;
     }
     
     // Split top: [header][top_bm_256][bot_is_leaf_bm_256][bot_ptrs...]
     // At BITS=16: [header][top_bm_256][bot_ptrs...] (no bot_is_leaf needed)
     template<int BITS>
-    static constexpr size_t split_top_size_u64(size_t top_count) noexcept {
+    static constexpr size_t split_top_size_u64(size_t top_count, uint8_t skip) noexcept {
         if constexpr (BITS == 16) {
-            return HEADER_U64 + BITMAP256_U64 + top_count;
+            return header_u64(skip) + BITMAP256_U64 + top_count;
         } else {
-            return HEADER_U64 + BITMAP256_U64 + BITMAP256_U64 + top_count;
+            return header_u64(skip) + BITMAP256_U64 + BITMAP256_U64 + top_count;
         }
     }
     
@@ -419,87 +431,99 @@ private:
     template<int BITS>
     static auto leaf_keys(uint64_t* node) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        return reinterpret_cast<K*>(node + HEADER_U64);
+        uint8_t skip = get_header(node)->skip;
+        return reinterpret_cast<K*>(node + header_u64(skip));
     }
     
     template<int BITS>
     static auto leaf_keys(const uint64_t* node) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        return reinterpret_cast<const K*>(node + HEADER_U64);
+        uint8_t skip = get_header(node)->skip;
+        return reinterpret_cast<const K*>(node + header_u64(skip));
     }
     
     // Returns pointer to actual keys (after idx1 and idx2)
     template<int BITS>
     static auto leaf_keys_data(uint64_t* node, size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
+        uint8_t skip = get_header(node)->skip;
         int idx_total_count = idx_total(static_cast<int>(count));
-        return reinterpret_cast<K*>(node + HEADER_U64) + idx_total_count;
+        return reinterpret_cast<K*>(node + header_u64(skip)) + idx_total_count;
     }
     
     template<int BITS>
     static auto leaf_keys_data(const uint64_t* node, size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
+        uint8_t skip = get_header(node)->skip;
         int idx_total_count = idx_total(static_cast<int>(count));
-        return reinterpret_cast<const K*>(node + HEADER_U64) + idx_total_count;
+        return reinterpret_cast<const K*>(node + header_u64(skip)) + idx_total_count;
     }
     
     template<int BITS>
     static value_slot_type* leaf_values(uint64_t* node, size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
+        uint8_t skip = get_header(node)->skip;
         int i1 = idx1_count(static_cast<int>(count));
         int i2 = idx2_count(static_cast<int>(count));
         size_t idx_bytes = (i1 + i2) * sizeof(K);
         idx_bytes = (idx_bytes + 7) & ~size_t{7};
         size_t key_bytes = count * sizeof(K);
         key_bytes = (key_bytes + 7) & ~size_t{7};
-        return reinterpret_cast<value_slot_type*>(reinterpret_cast<char*>(node + HEADER_U64) + idx_bytes + key_bytes);
+        return reinterpret_cast<value_slot_type*>(reinterpret_cast<char*>(node + header_u64(skip)) + idx_bytes + key_bytes);
     }
     
     template<int BITS>
     static const value_slot_type* leaf_values(const uint64_t* node, size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
+        uint8_t skip = get_header(node)->skip;
         int i1 = idx1_count(static_cast<int>(count));
         int i2 = idx2_count(static_cast<int>(count));
         size_t idx_bytes = (i1 + i2) * sizeof(K);
         idx_bytes = (idx_bytes + 7) & ~size_t{7};
         size_t key_bytes = count * sizeof(K);
         key_bytes = (key_bytes + 7) & ~size_t{7};
-        return reinterpret_cast<const value_slot_type*>(reinterpret_cast<const char*>(node + HEADER_U64) + idx_bytes + key_bytes);
+        return reinterpret_cast<const value_slot_type*>(reinterpret_cast<const char*>(node + header_u64(skip)) + idx_bytes + key_bytes);
     }
     
     // Split top accessors
     static Bitmap256& top_bitmap(uint64_t* node) noexcept {
-        return *reinterpret_cast<Bitmap256*>(node + HEADER_U64);
+        uint8_t skip = get_header(node)->skip;
+        return *reinterpret_cast<Bitmap256*>(node + header_u64(skip));
     }
     
     static const Bitmap256& top_bitmap(const uint64_t* node) noexcept {
-        return *reinterpret_cast<const Bitmap256*>(node + HEADER_U64);
+        uint8_t skip = get_header(node)->skip;
+        return *reinterpret_cast<const Bitmap256*>(node + header_u64(skip));
     }
     
     // bot_is_leaf bitmap (only for BITS > 16)
     static Bitmap256& bot_is_leaf_bitmap(uint64_t* node) noexcept {
-        return *reinterpret_cast<Bitmap256*>(node + HEADER_U64 + BITMAP256_U64);
+        uint8_t skip = get_header(node)->skip;
+        return *reinterpret_cast<Bitmap256*>(node + header_u64(skip) + BITMAP256_U64);
     }
     
     static const Bitmap256& bot_is_leaf_bitmap(const uint64_t* node) noexcept {
-        return *reinterpret_cast<const Bitmap256*>(node + HEADER_U64 + BITMAP256_U64);
+        uint8_t skip = get_header(node)->skip;
+        return *reinterpret_cast<const Bitmap256*>(node + header_u64(skip) + BITMAP256_U64);
     }
     
     template<int BITS>
     static uint64_t* top_children(uint64_t* node) noexcept {
+        uint8_t skip = get_header(node)->skip;
         if constexpr (BITS == 16) {
-            return node + HEADER_U64 + BITMAP256_U64;
+            return node + header_u64(skip) + BITMAP256_U64;
         } else {
-            return node + HEADER_U64 + BITMAP256_U64 + BITMAP256_U64;
+            return node + header_u64(skip) + BITMAP256_U64 + BITMAP256_U64;
         }
     }
     
     template<int BITS>
     static const uint64_t* top_children(const uint64_t* node) noexcept {
+        uint8_t skip = get_header(node)->skip;
         if constexpr (BITS == 16) {
-            return node + HEADER_U64 + BITMAP256_U64;
+            return node + header_u64(skip) + BITMAP256_U64;
         } else {
-            return node + HEADER_U64 + BITMAP256_U64 + BITMAP256_U64;
+            return node + header_u64(skip) + BITMAP256_U64 + BITMAP256_U64;
         }
     }
     
@@ -683,9 +707,10 @@ public:
     // ==========================================================================
     
     kntrie3() : size_(0), alloc_() {
-        root_ = alloc_node(leaf_compact_size_u64<static_cast<int>(key_bits)>(0));
+        root_ = alloc_node(leaf_compact_size_u64<static_cast<int>(key_bits)>(0, 0));
         NodeHeader* h = get_header(root_);
         h->count = 0;
+        h->skip = 0;
         h->set_leaf(true);
     }
     
@@ -701,11 +726,10 @@ public:
     
     void clear() noexcept {
         remove_all();
-        root_ = alloc_node(leaf_compact_size_u64<static_cast<int>(key_bits)>(0));
+        root_ = alloc_node(leaf_compact_size_u64<static_cast<int>(key_bits)>(0, 0));
         NodeHeader* h = get_header(root_);
         h->count = 0;
         h->skip = 0;
-        h->prefix = 0;
         h->set_leaf(true);
         h->set_split(false);
         size_ = 0;
@@ -756,7 +780,7 @@ private:
                         destroy_value(static_cast<value_slot_type>(values[i]));
                     }
                 }
-                dealloc_node(node, leaf_compact_size_u64<BITS>(h->count));
+                dealloc_node(node, leaf_compact_size_u64<BITS>(h->count, h->skip));
             } else if (h->is_split()) {
                 remove_all_split<BITS>(node, h);
             }
@@ -805,7 +829,7 @@ private:
                 }
                 ++slot;
             }
-            dealloc_node(node, split_top_size_u64<BITS>(h->top_count));
+            dealloc_node(node, split_top_size_u64<BITS>(h->top_count, h->skip));
         }
     }
     
@@ -822,7 +846,8 @@ public:
     
     RootInfo debug_root_info() const {
         const NodeHeader* h = get_header(root_);
-        return {h->count, h->top_count, h->skip, h->is_leaf(), h->is_split(), h->prefix};
+        uint64_t prefix_val = h->skip > 0 ? get_prefix(root_) : 0;
+        return {h->count, h->top_count, h->skip, h->is_leaf(), h->is_split(), prefix_val};
     }
     
     uint64_t debug_key_to_internal(KEY k) const {
@@ -959,11 +984,12 @@ private:
             skip_left--;
         } else if (h.skip >= 1) {
             // New node has skip - check top 16 bits
-            uint16_t skip_chunk = get_skip_chunk(h.prefix, h.skip, h.skip);
+            uint64_t node_prefix = get_prefix(node);
+            uint16_t skip_chunk = get_skip_chunk(node_prefix, h.skip, h.skip);
             if (key_chunk != skip_chunk) return nullptr;
             
             if (h.skip > 1) {
-                skip = h.prefix;
+                skip = node_prefix;
                 skip_left = h.skip - 1;
             }
             h.skip = 0;  // consumed - won't re-trigger
@@ -1178,7 +1204,8 @@ private:
         // Handle skip
         if (h->skip > 0) [[unlikely]] {
             uint64_t expected = extract_prefix<BITS>(ik, h->skip);
-            if (expected != h->prefix) {
+            uint64_t actual = get_prefix(node);
+            if (expected != actual) {
                 return split_on_prefix<BITS>(node, h, ik, value, expected);
             }
             
@@ -1247,10 +1274,13 @@ private:
         
         // Add entry in sorted position - create new node
         size_t new_count = h->count + 1;
-        uint64_t* new_node = alloc_node(leaf_compact_size_u64<BITS>(new_count));
+        uint64_t* new_node = alloc_node(leaf_compact_size_u64<BITS>(new_count, h->skip));
         NodeHeader* new_h = get_header(new_node);
         *new_h = *h;
         new_h->count = static_cast<uint32_t>(new_count);
+        if (h->skip > 0) {
+            set_prefix(new_node, get_prefix(node));
+        }
         
         // Build new keys array with inserted element
         K* new_keys_data = leaf_keys_data<BITS>(new_node, new_count);
@@ -1276,7 +1306,7 @@ private:
         K* new_idx_start = leaf_keys<BITS>(new_node);
         build_indices(new_idx_start, new_keys_data, static_cast<int>(new_count));
         
-        dealloc_node(node, leaf_compact_size_u64<BITS>(h->count));
+        dealloc_node(node, leaf_compact_size_u64<BITS>(h->count, h->skip));
         return {new_node, true};
     }
     
@@ -1352,28 +1382,58 @@ private:
                     // Update skip/prefix on child - add our prefix at HIGH bits
                     uint64_t* child_node = reinterpret_cast<uint64_t*>(child_ptr);
                     NodeHeader* child_h = get_header(child_node);
-                    uint64_t old_prefix = child_h->prefix;
+                    uint64_t old_child_prefix = child_h->skip > 0 ? get_prefix(child_node) : 0;
                     uint8_t old_skip = child_h->skip;
                     // Combine parent's skip with child's skip, plus our new level
-                    child_h->skip = h->skip + old_skip + 1;
+                    uint8_t new_skip = h->skip + old_skip + 1;
                     // Build combined prefix: parent_prefix | our_skip_prefix | child_prefix
-                    uint64_t combined = h->prefix;
+                    uint64_t parent_prefix = h->skip > 0 ? get_prefix(node) : 0;
+                    uint64_t combined = parent_prefix;
                     combined = (combined << 16) | skip_prefix;
-                    combined = (combined << (16 * old_skip)) | old_prefix;
-                    child_h->prefix = combined;
+                    combined = (combined << (16 * old_skip)) | old_child_prefix;
                     
-                    dealloc_node(node, leaf_compact_size_u64<BITS>(h->count));
+                    // Need to reallocate child if skip changed from 0 to non-zero
+                    if (old_skip == 0 && new_skip > 0) {
+                        // Child needs prefix space now - reallocate
+                        size_t old_size = leaf_compact_size_u64<child_bits>(total_count, 0);
+                        size_t new_size = leaf_compact_size_u64<child_bits>(total_count, new_skip);
+                        uint64_t* new_child = alloc_node(new_size);
+                        // Copy header
+                        *get_header(new_child) = *child_h;
+                        get_header(new_child)->skip = new_skip;
+                        set_prefix(new_child, combined);
+                        // Copy data (keys and values)
+                        using CK = typename suffix_traits<child_bits>::type;
+                        auto* old_keys_ptr = leaf_keys<child_bits>(child_node);
+                        auto* new_keys_ptr = leaf_keys<child_bits>(new_child);
+                        int idx_cnt = idx_total(static_cast<int>(total_count));
+                        std::memcpy(new_keys_ptr, old_keys_ptr, (idx_cnt + total_count) * sizeof(CK));
+                        std::memcpy(leaf_values<child_bits>(new_child, total_count),
+                                    leaf_values<child_bits>(child_node, total_count),
+                                    total_count * sizeof(value_slot_type));
+                        dealloc_node(child_node, old_size);
+                        child_node = new_child;
+                    } else {
+                        child_h->skip = new_skip;
+                        if (new_skip > 0) {
+                            set_prefix(child_node, combined);
+                        }
+                    }
+                    
+                    dealloc_node(node, leaf_compact_size_u64<BITS>(h->count, h->skip));
                     return {child_node, true};
                 }
             }
         }
         
-        uint64_t* new_node = alloc_node(split_top_size_u64<BITS>(new_top_count));
+        uint64_t* new_node = alloc_node(split_top_size_u64<BITS>(new_top_count, h->skip));
         NodeHeader* new_h = get_header(new_node);
         new_h->count = h->count + 1;
         new_h->top_count = static_cast<uint16_t>(new_top_count);
         new_h->skip = h->skip;
-        new_h->prefix = h->prefix;
+        if (h->skip > 0) {
+            set_prefix(new_node, get_prefix(node));
+        }
         new_h->set_leaf(true);  // All bottoms start as leaves
         new_h->set_split(true);
         
@@ -1474,7 +1534,7 @@ private:
             new_top_ch[top_slot++] = reinterpret_cast<uint64_t>(bot);
         }
         
-        dealloc_node(node, leaf_compact_size_u64<BITS>(h->count));
+        dealloc_node(node, leaf_compact_size_u64<BITS>(h->count, h->skip));
         return {new_node, true};
     }
     
@@ -1485,11 +1545,11 @@ private:
     {
         // If it fits in a compact leaf, create one
         if (count <= COMPACT_MAX) {
-            uint64_t* child = alloc_node(leaf_compact_size_u64<CHILD_BITS>(count));
+            uint64_t* child = alloc_node(leaf_compact_size_u64<CHILD_BITS>(count, 0));
             NodeHeader* child_h = get_header(child);
             child_h->count = static_cast<uint32_t>(count);
             child_h->skip = 0;
-            child_h->prefix = 0;
+            // No prefix when skip=0
             child_h->set_leaf(true);
             
             using ChildK = typename suffix_traits<CHILD_BITS>::type;
@@ -1562,22 +1622,44 @@ private:
                     // Our skip_prefix goes at the HIGH bits (we're a level above the child)
                     uint64_t* child_node = reinterpret_cast<uint64_t*>(child_ptr);
                     NodeHeader* child_h = get_header(child_node);
-                    uint64_t old_prefix = child_h->prefix;
+                    uint64_t old_child_prefix = child_h->skip > 0 ? get_prefix(child_node) : 0;
                     uint8_t old_skip = child_h->skip;
-                    child_h->skip = old_skip + 1;
-                    child_h->prefix = (static_cast<uint64_t>(skip_prefix) << (16 * old_skip)) | old_prefix;
+                    uint8_t new_skip = old_skip + 1;
+                    uint64_t combined = (static_cast<uint64_t>(skip_prefix) << (16 * old_skip)) | old_child_prefix;
                     
-                    return child_ptr;
+                    // Need to reallocate if skip was 0 (no prefix space)
+                    if (old_skip == 0) {
+                        size_t old_size = leaf_compact_size_u64<child_bits>(count, 0);
+                        size_t new_size = leaf_compact_size_u64<child_bits>(count, new_skip);
+                        uint64_t* new_child = alloc_node(new_size);
+                        *get_header(new_child) = *child_h;
+                        get_header(new_child)->skip = new_skip;
+                        set_prefix(new_child, combined);
+                        using CK = typename suffix_traits<child_bits>::type;
+                        auto* old_keys_ptr = leaf_keys<child_bits>(child_node);
+                        auto* new_keys_ptr = leaf_keys<child_bits>(new_child);
+                        int idx_cnt = idx_total(static_cast<int>(count));
+                        std::memcpy(new_keys_ptr, old_keys_ptr, (idx_cnt + count) * sizeof(CK));
+                        std::memcpy(leaf_values<child_bits>(new_child, count),
+                                    leaf_values<child_bits>(child_node, count),
+                                    count * sizeof(value_slot_type));
+                        dealloc_node(child_node, old_size);
+                        return reinterpret_cast<uint64_t>(new_child);
+                    } else {
+                        child_h->skip = new_skip;
+                        set_prefix(child_node, combined);
+                        return child_ptr;
+                    }
                 }
             }
         }
         
-        uint64_t* split_node = alloc_node(split_top_size_u64<CHILD_BITS>(top_count));
+        uint64_t* split_node = alloc_node(split_top_size_u64<CHILD_BITS>(top_count, 0));
         NodeHeader* split_h = get_header(split_node);
         split_h->count = static_cast<uint32_t>(count);
         split_h->top_count = static_cast<uint16_t>(top_count);
         split_h->skip = 0;
-        split_h->prefix = 0;
+        // No prefix when skip=0
         split_h->set_split(true);
         split_h->set_leaf(true);
         
@@ -1779,11 +1861,14 @@ private:
         
         int insert_slot = top_bm.slot_for_insert(top_idx);
         
-        uint64_t* new_node = alloc_node(split_top_size_u64<BITS>(new_top_count));
+        uint64_t* new_node = alloc_node(split_top_size_u64<BITS>(new_top_count, h->skip));
         NodeHeader* new_h = get_header(new_node);
         *new_h = *h;
         new_h->count = h->count + 1;
         new_h->top_count = static_cast<uint16_t>(new_top_count);
+        if (h->skip > 0) {
+            set_prefix(new_node, get_prefix(node));
+        }
         
         Bitmap256& new_top_bm = top_bitmap(new_node);
         new_top_bm = top_bm;
@@ -1841,7 +1926,7 @@ private:
         
         new_ch[insert_slot] = reinterpret_cast<uint64_t>(new_bot);
         
-        dealloc_node(node, split_top_size_u64<BITS>(old_top_count));
+        dealloc_node(node, split_top_size_u64<BITS>(old_top_count, h->skip));
         return {new_node, true};
     }
     
@@ -2022,9 +2107,10 @@ private:
             if (!bot_bm.has_bit(bot_idx)) continue;
             
             size_t child_count = bucket_counts[bot_idx];
-            uint64_t* child = alloc_node(leaf_compact_size_u64<child_bits>(child_count));
+            uint64_t* child = alloc_node(leaf_compact_size_u64<child_bits>(child_count, 0));
             NodeHeader* child_h = get_header(child);
             child_h->count = static_cast<uint32_t>(child_count);
+            child_h->skip = 0;
             child_h->set_leaf(true);
             
             ChildK* child_keys_data = leaf_keys_data<child_bits>(child, child_count);
@@ -2117,9 +2203,10 @@ private:
             for (int i = insert_slot; i < bot_count; ++i) new_children[i + 1] = children[i];
             
             constexpr int child_bits = BITS - 16;
-            uint64_t* child = alloc_node(leaf_compact_size_u64<child_bits>(1));
+            uint64_t* child = alloc_node(leaf_compact_size_u64<child_bits>(1, 0));
             NodeHeader* child_h = get_header(child);
             child_h->count = 1;
+            child_h->skip = 0;
             child_h->set_leaf(true);
             
             using ChildK = typename suffix_traits<child_bits>::type;
@@ -2150,7 +2237,7 @@ private:
     {
         // Prefix mismatch - need to create a new structure
         // Find where the prefixes diverge (which 16-bit chunk)
-        uint64_t actual = h->prefix;
+        uint64_t actual = get_prefix(node);  // Old node has skip > 0, so prefix exists
         int skip = h->skip;
         
         // Find first differing 16-bit chunk (scanning from HIGH to LOW)
@@ -2179,16 +2266,15 @@ private:
             uint8_t old_bot = old_chunk & 0xFF;
             
             // Create new SPLIT node with one bucket
-            uint64_t* split_node = alloc_node(split_top_size_u64<BITS>(1));
+            uint8_t split_skip = static_cast<uint8_t>(common_levels);
+            uint64_t* split_node = alloc_node(split_top_size_u64<BITS>(1, split_skip));
             NodeHeader* split_h = get_header(split_node);
             split_h->count = h->count + 1;
             split_h->top_count = 1;
-            split_h->skip = static_cast<uint8_t>(common_levels);
+            split_h->skip = split_skip;
             if (common_levels > 0) {
                 // Extract common prefix from expected (high common_levels chunks)
-                split_h->prefix = expected >> ((skip - common_levels) * 16);
-            } else {
-                split_h->prefix = 0;
+                set_prefix(split_node, expected >> ((skip - common_levels) * 16));
             }
             split_h->set_split(true);
             split_h->set_leaf(false);
@@ -2215,21 +2301,19 @@ private:
             h->skip = static_cast<uint8_t>(remaining_skip);
             if (remaining_skip > 0) {
                 uint64_t mask = (1ULL << (remaining_skip * 16)) - 1;
-                h->prefix = actual & mask;
-            } else {
-                h->prefix = 0;
+                set_prefix(node, actual & mask);
             }
+            // Note: if remaining_skip == 0, old node keeps its prefix space but it's unused
             
             // Create new leaf for the new key
             constexpr int child_bits = BITS - 16;
-            uint64_t* new_leaf = alloc_node(leaf_compact_size_u64<child_bits>(1));
+            uint8_t new_leaf_skip = static_cast<uint8_t>(remaining_skip);
+            uint64_t* new_leaf = alloc_node(leaf_compact_size_u64<child_bits>(1, new_leaf_skip));
             NodeHeader* new_h = get_header(new_leaf);
             new_h->count = 1;
-            new_h->skip = static_cast<uint8_t>(remaining_skip);
+            new_h->skip = new_leaf_skip;
             if (remaining_skip > 0) {
-                new_h->prefix = expected & ((1ULL << (remaining_skip * 16)) - 1);
-            } else {
-                new_h->prefix = 0;
+                set_prefix(new_leaf, expected & ((1ULL << (remaining_skip * 16)) - 1));
             }
             new_h->set_leaf(true);
             
@@ -2259,15 +2343,14 @@ private:
             return {split_node, true};
         } else {
             // Different top 8 bits - create SPLIT with 2 buckets
-            uint64_t* split_node = alloc_node(split_top_size_u64<BITS>(2));
+            uint8_t split_skip = static_cast<uint8_t>(common_levels);
+            uint64_t* split_node = alloc_node(split_top_size_u64<BITS>(2, split_skip));
             NodeHeader* split_h = get_header(split_node);
             split_h->count = h->count + 1;
             split_h->top_count = 2;
-            split_h->skip = static_cast<uint8_t>(common_levels);
+            split_h->skip = split_skip;
             if (common_levels > 0) {
-                split_h->prefix = expected >> ((skip - common_levels) * 16);
-            } else {
-                split_h->prefix = 0;
+                set_prefix(split_node, expected >> ((skip - common_levels) * 16));
             }
             split_h->set_split(true);
             split_h->set_leaf(false);  // Children are bot_internal, not bot_leaf
@@ -2295,23 +2378,21 @@ private:
             h->skip = static_cast<uint8_t>(remaining_skip);
             if (remaining_skip > 0) {
                 uint64_t mask = (1ULL << (remaining_skip * 16)) - 1;
-                h->prefix = actual & mask;
-            } else {
-                h->prefix = 0;
+                set_prefix(node, actual & mask);
             }
+            // Note: if remaining_skip == 0, old node keeps its prefix space but it's unused
             bot_internal_children(old_bot_leaf)[0] = reinterpret_cast<uint64_t>(node);
             
             // Create bot_leaf for new entry
             uint8_t new_bot = new_chunk & 0xFF;
             constexpr int child_bits = BITS - 16;
-            uint64_t* new_leaf = alloc_node(leaf_compact_size_u64<child_bits>(1));
+            uint8_t new_leaf_skip = static_cast<uint8_t>(remaining_skip);
+            uint64_t* new_leaf = alloc_node(leaf_compact_size_u64<child_bits>(1, new_leaf_skip));
             NodeHeader* new_h = get_header(new_leaf);
             new_h->count = 1;
-            new_h->skip = static_cast<uint8_t>(remaining_skip);
+            new_h->skip = new_leaf_skip;
             if (remaining_skip > 0) {
-                new_h->prefix = expected & ((1ULL << (remaining_skip * 16)) - 1);
-            } else {
-                new_h->prefix = 0;
+                set_prefix(new_leaf, expected & ((1ULL << (remaining_skip * 16)) - 1));
             }
             new_h->set_leaf(true);
             
@@ -2379,6 +2460,10 @@ public:
         return s;
     }
     
+    size_t memory_usage() const noexcept {
+        return debug_stats().total_bytes;
+    }
+    
 private:
     template<int BITS>
     void collect_stats(const uint64_t* node, DebugStats& s) const noexcept {
@@ -2413,13 +2498,13 @@ private:
                 if (compressed) L.compact_leaf_compressed++;
                 L.nodes++;
                 L.entries += h->count;
-                L.bytes += leaf_compact_size_u64<BITS>(h->count) * 8;
+                L.bytes += leaf_compact_size_u64<BITS>(h->count, h->skip) * 8;
                 L.leaf_hist[h->count < 257 ? h->count : 257]++;
             } else if (h->is_split()) {
                 L.split_nodes++;
                 if (compressed) L.split_nodes_compressed++;
                 L.nodes++;
-                L.bytes += split_top_size_u64<BITS>(h->top_count) * 8;
+                L.bytes += split_top_size_u64<BITS>(h->top_count, h->skip) * 8;
                 
                 const Bitmap256& top_bm = top_bitmap(node);
                 const uint64_t* top_ch = top_children<BITS>(node);
