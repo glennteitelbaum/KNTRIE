@@ -861,6 +861,68 @@ private:
         
         size_t new_top_count = new_top_bm.popcount();
         
+        // PREFIX COMPRESSION: If all entries fall into ONE bucket, use skip
+        // Only possible when BITS > 16 (need at least 16 bits to skip)
+        if constexpr (BITS > 16) {
+            if (new_top_count == 1) {
+                // All entries share same high 8 bits - check next 8 bits too
+                // We can skip entire 16-bit levels if they're uniform
+                
+                // Build bitmap for bottom 8 bits (within the top bucket)
+                Bitmap256 bot_bm{};
+                constexpr int suffix_bits = BITS - 8;
+                for (uint32_t i = 0; i < h->count; ++i) {
+                    uint8_t bot_idx = static_cast<uint8_t>(old_keys[i] >> (suffix_bits - 8));
+                    bot_bm.set_bit(bot_idx);
+                }
+                uint8_t new_bot_idx = static_cast<uint8_t>(new_suffix >> (suffix_bits - 8));
+                bot_bm.set_bit(new_bot_idx);
+                
+                if (bot_bm.popcount() == 1) {
+                    // Entire 16-bit level is uniform - accumulate skip and recurse
+                    uint8_t skip_prefix_hi = new_top_idx;
+                    uint8_t skip_prefix_lo = new_bot_idx;
+                    uint16_t skip_prefix = (static_cast<uint16_t>(skip_prefix_hi) << 8) | skip_prefix_lo;
+                    
+                    // Shift all suffixes down by 16 bits and recurse
+                    constexpr int child_bits = BITS - 16;
+                    constexpr uint64_t child_mask = (1ULL << child_bits) - 1;
+                    
+                    // Collect entries with shifted keys
+                    size_t total_count = h->count + 1;
+                    std::unique_ptr<uint64_t[]> child_suffixes(new uint64_t[total_count]);
+                    std::unique_ptr<uint64_t[]> child_values(new uint64_t[total_count]);
+                    
+                    uint64_t new_value_u64;
+                    if constexpr (value_inline) {
+                        std::memcpy(&new_value_u64, &value, sizeof(stored_value_type));
+                    } else {
+                        new_value_u64 = static_cast<uint64_t>(value);
+                    }
+                    
+                    for (uint32_t i = 0; i < h->count; ++i) {
+                        child_suffixes[i] = static_cast<uint64_t>(old_keys[i]) & child_mask;
+                        child_values[i] = old_values[i];
+                    }
+                    child_suffixes[h->count] = static_cast<uint64_t>(new_suffix) & child_mask;
+                    child_values[h->count] = new_value_u64;
+                    
+                    // Create child node at lower BITS level
+                    uint64_t child_ptr = create_child_no_prefix<child_bits>(
+                        child_suffixes.get(), child_values.get(), total_count);
+                    
+                    // Update skip/prefix on child
+                    uint64_t* child_node = reinterpret_cast<uint64_t*>(child_ptr);
+                    NodeHeader* child_h = get_header(child_node);
+                    child_h->skip = h->skip + 1;
+                    child_h->prefix = (h->prefix << 16) | skip_prefix;
+                    
+                    dealloc_node(node, leaf_compact_size_u64<BITS>(h->count));
+                    return {child_node, true};
+                }
+            }
+        }
+        
         uint64_t* new_node = alloc_node(split_top_size_u64<BITS>(new_top_count));
         NodeHeader* new_h = get_header(new_node);
         new_h->count = h->count + 1;
@@ -935,6 +997,228 @@ private:
         
         dealloc_node(node, leaf_compact_size_u64<BITS>(h->count));
         return {new_node, true};
+    }
+    
+    // Create a child node, with recursive prefix compression if needed
+    template<int CHILD_BITS>
+    uint64_t create_child_no_prefix(uint64_t* suffixes, uint64_t* values, size_t count)
+        requires (CHILD_BITS > 0)
+    {
+        // If it fits in a compact leaf, create one
+        if (count <= COMPACT_MAX) {
+            uint64_t* child = alloc_node(leaf_compact_size_u64<CHILD_BITS>(count));
+            NodeHeader* child_h = get_header(child);
+            child_h->count = static_cast<uint32_t>(count);
+            child_h->skip = 0;
+            child_h->prefix = 0;
+            child_h->set_leaf(true);
+            
+            using ChildK = typename suffix_traits<CHILD_BITS>::type;
+            ChildK* child_keys = leaf_keys<CHILD_BITS>(child);
+            uint64_t* child_values = leaf_values<CHILD_BITS>(child, count);
+            
+            // Sort and copy using insertion sort
+            for (size_t i = 0; i < count; ++i) {
+                ChildK key = static_cast<ChildK>(suffixes[i]);
+                uint64_t val = values[i];
+                size_t j = i;
+                while (j > 0 && child_keys[j-1] > key) {
+                    child_keys[j] = child_keys[j-1];
+                    child_values[j] = child_values[j-1];
+                    j--;
+                }
+                child_keys[j] = key;
+                child_values[j] = val;
+            }
+            
+            return reinterpret_cast<uint64_t>(child);
+        }
+        
+        // Too many entries - need to create SPLIT structure
+        Bitmap256 top_bm{};
+        uint16_t bucket_counts[256] = {0};
+        
+        for (size_t i = 0; i < count; ++i) {
+            uint8_t idx = static_cast<uint8_t>(suffixes[i] >> (CHILD_BITS - 8));
+            top_bm.set_bit(idx);
+            bucket_counts[idx]++;
+        }
+        
+        size_t top_count = top_bm.popcount();
+        
+        // PREFIX COMPRESSION: If all entries share high 8 bits AND we have room to skip
+        if constexpr (CHILD_BITS > 16) {
+            if (top_count == 1) {
+                // Check if the next 8 bits are also uniform
+                int single_top = top_bm.find_next_set(0);
+                Bitmap256 bot_bm{};
+                constexpr int suffix_bits = CHILD_BITS - 8;
+                
+                for (size_t i = 0; i < count; ++i) {
+                    uint8_t bot_idx = static_cast<uint8_t>(suffixes[i] >> (suffix_bits - 8));
+                    bot_bm.set_bit(bot_idx);
+                }
+                
+                if (bot_bm.popcount() == 1) {
+                    // Both 8-bit levels are uniform - skip this 16-bit level
+                    int single_bot = bot_bm.find_next_set(0);
+                    uint16_t skip_prefix = (static_cast<uint16_t>(single_top) << 8) | single_bot;
+                    
+                    constexpr int child_bits = CHILD_BITS - 16;
+                    constexpr uint64_t child_mask = (1ULL << child_bits) - 1;
+                    
+                    // Shift all suffixes down by 16 bits
+                    for (size_t i = 0; i < count; ++i) {
+                        suffixes[i] = suffixes[i] & child_mask;
+                    }
+                    
+                    // Recurse
+                    uint64_t child_ptr = create_child_no_prefix<child_bits>(suffixes, values, count);
+                    
+                    // Add the skip prefix to the child
+                    uint64_t* child_node = reinterpret_cast<uint64_t*>(child_ptr);
+                    NodeHeader* child_h = get_header(child_node);
+                    child_h->prefix = (child_h->prefix << 16) | skip_prefix;
+                    // Shift existing prefix up and add our prefix at the bottom
+                    // Actually we need to be careful with prefix ordering
+                    // The skip count tells how many 16-bit levels to skip
+                    // The prefix stores those skipped bits
+                    // Let's just increment skip and prepend the prefix
+                    uint64_t old_prefix = child_h->prefix;
+                    child_h->skip += 1;
+                    child_h->prefix = (static_cast<uint64_t>(skip_prefix) << (16 * (child_h->skip - 1))) | old_prefix;
+                    
+                    return child_ptr;
+                }
+            }
+        }
+        
+        uint64_t* split_node = alloc_node(split_top_size_u64<CHILD_BITS>(top_count));
+        NodeHeader* split_h = get_header(split_node);
+        split_h->count = static_cast<uint32_t>(count);
+        split_h->top_count = static_cast<uint16_t>(top_count);
+        split_h->skip = 0;
+        split_h->prefix = 0;
+        split_h->set_split(true);
+        split_h->set_leaf(true);
+        
+        top_bitmap(split_node) = top_bm;
+        if constexpr (CHILD_BITS > 16) {
+            bot_is_leaf_bitmap(split_node) = top_bm;
+        }
+        
+        uint64_t* top_ch = top_children<CHILD_BITS>(split_node);
+        constexpr int suffix_bits = CHILD_BITS - 8;
+        constexpr uint64_t suffix_mask = (1ULL << suffix_bits) - 1;
+        
+        int slot = 0;
+        for (int bucket = 0; bucket < 256; ++bucket) {
+            if (!top_bm.has_bit(bucket)) continue;
+            
+            size_t bot_count = bucket_counts[bucket];
+            
+            // Check if bot_count would exceed BOT_LEAF_MAX (only possible when CHILD_BITS > 16)
+            bool need_bot_internal = false;
+            if constexpr (CHILD_BITS > 16) {
+                need_bot_internal = (bot_count > BOT_LEAF_MAX);
+            }
+            
+            if (need_bot_internal) {
+                if constexpr (CHILD_BITS > 16) {
+                // Need to create bot_internal, not bot_leaf
+                // First, further subdivide by next 8 bits
+                Bitmap256 bot_inner_bm{};
+                uint16_t bot_inner_counts[256] = {0};
+                
+                for (size_t i = 0; i < count; ++i) {
+                    if ((suffixes[i] >> (CHILD_BITS - 8)) == static_cast<uint64_t>(bucket)) {
+                        uint8_t inner_idx = static_cast<uint8_t>((suffixes[i] >> (suffix_bits - 8)) & 0xFF);
+                        bot_inner_bm.set_bit(inner_idx);
+                        bot_inner_counts[inner_idx]++;
+                    }
+                }
+                
+                size_t bot_inner_count = bot_inner_bm.popcount();
+                uint64_t* bot_internal = alloc_node(bot_internal_size_u64(bot_inner_count));
+                bot_bitmap(bot_internal) = bot_inner_bm;
+                uint64_t* bot_children = bot_internal_children(bot_internal);
+                
+                constexpr int child_bits = CHILD_BITS - 16;
+                constexpr uint64_t child_mask = (1ULL << child_bits) - 1;
+                
+                int inner_slot = 0;
+                for (int inner_bucket = 0; inner_bucket < 256; ++inner_bucket) {
+                    if (!bot_inner_bm.has_bit(inner_bucket)) continue;
+                    
+                    size_t child_count = bot_inner_counts[inner_bucket];
+                    
+                    // Collect entries for this inner bucket
+                    std::unique_ptr<uint64_t[]> child_suffixes(new uint64_t[child_count]);
+                    std::unique_ptr<uint64_t[]> child_vals(new uint64_t[child_count]);
+                    size_t ci = 0;
+                    
+                    for (size_t i = 0; i < count; ++i) {
+                        if ((suffixes[i] >> (CHILD_BITS - 8)) == static_cast<uint64_t>(bucket) &&
+                            ((suffixes[i] >> (suffix_bits - 8)) & 0xFF) == static_cast<uint64_t>(inner_bucket)) {
+                            child_suffixes[ci] = suffixes[i] & child_mask;
+                            child_vals[ci] = values[i];
+                            ci++;
+                        }
+                    }
+                    
+                    // Recursively create child
+                    uint64_t child_ptr = create_child_no_prefix<child_bits>(
+                        child_suffixes.get(), child_vals.get(), child_count);
+                    bot_children[inner_slot++] = child_ptr;
+                }
+                
+                top_ch[slot++] = reinterpret_cast<uint64_t>(bot_internal);
+                bot_is_leaf_bitmap(split_node).clear_bit(bucket);
+                } // end if constexpr
+            } else {
+                // Normal case: create bot_leaf
+                uint64_t* bot = alloc_node(bot_leaf_size_u64<CHILD_BITS>(bot_count));
+                set_bot_leaf_count<CHILD_BITS>(bot, static_cast<uint32_t>(bot_count));
+                
+                using S = typename suffix_traits<suffix_bits>::type;
+                S* bot_suffixes = bot_leaf_suffixes<CHILD_BITS>(bot);
+                uint64_t* bot_values = bot_leaf_values<CHILD_BITS>(bot, bot_count);
+                
+                // Collect and sort entries for this bucket
+                size_t bi = 0;
+                for (size_t i = 0; i < count; ++i) {
+                    if ((suffixes[i] >> (CHILD_BITS - 8)) == static_cast<uint64_t>(bucket)) {
+                        S suf = static_cast<S>(suffixes[i] & suffix_mask);
+                        uint64_t val = values[i];
+                        
+                        // Insert in sorted order
+                        size_t j = bi;
+                        while (j > 0 && bot_suffixes[j-1] > suf) {
+                            bot_suffixes[j] = bot_suffixes[j-1];
+                            bot_values[j] = bot_values[j-1];
+                            j--;
+                        }
+                        bot_suffixes[j] = suf;
+                        bot_values[j] = val;
+                        bi++;
+                    }
+                }
+                
+                top_ch[slot++] = reinterpret_cast<uint64_t>(bot);
+            }
+        }
+        
+        // Update leaf flag
+        if constexpr (CHILD_BITS > 16) {
+            const Bitmap256& is_leaf_bm = bot_is_leaf_bitmap(split_node);
+            bool any_leaf = false;
+            for (int idx = top_bm.find_next_set(0); idx >= 0; idx = top_bm.find_next_set(idx + 1)) {
+                if (is_leaf_bm.has_bit(idx)) { any_leaf = true; break; }
+            }
+            if (!any_leaf) split_h->set_leaf(false);
+        }
+        
+        return reinterpret_cast<uint64_t>(split_node);
     }
     
     template<int BITS>
@@ -1100,7 +1384,7 @@ private:
         dealloc_node(bot, bot_leaf_size_u64<BITS>(count));
         return {node, true};
     }
-    
+
     template<int BITS>
     InsertResult convert_bot_leaf_to_internal(uint64_t* node, NodeHeader* h, uint8_t top_idx, int top_slot,
                                                uint64_t* bot, uint32_t count, uint64_t ik, stored_value_type value)
@@ -1112,7 +1396,7 @@ private:
         S* old_suffixes = bot_leaf_suffixes<BITS>(bot);
         uint64_t* old_values = bot_leaf_values<BITS>(bot, count);
         
-        // Group by next 8 bits
+        // Group by high 8 bits (the "bot_idx" within this level)
         Bitmap256 bot_bm{};
         uint16_t bucket_counts[256] = {0};
         
@@ -1130,6 +1414,13 @@ private:
         
         int bot_child_count = bot_bm.popcount();
         
+        uint64_t new_value_u64;
+        if constexpr (value_inline) {
+            std::memcpy(&new_value_u64, &value, sizeof(stored_value_type));
+        } else {
+            new_value_u64 = static_cast<uint64_t>(value);
+        }
+        
         // Allocate new bottom INTERNAL
         uint64_t* new_bot = alloc_node(bot_internal_size_u64(bot_child_count));
         bot_bitmap(new_bot) = bot_bm;
@@ -1141,12 +1432,6 @@ private:
         constexpr uint64_t child_mask = (1ULL << child_bits) - 1;
         
         ChildK new_child_suffix = static_cast<ChildK>(new_suffix & child_mask);
-        uint64_t new_value_u64;
-        if constexpr (value_inline) {
-            std::memcpy(&new_value_u64, &value, sizeof(stored_value_type));
-        } else {
-            new_value_u64 = static_cast<uint64_t>(value);
-        }
         
         int slot = 0;
         for (int bot_idx = 0; bot_idx < 256; ++bot_idx) {
