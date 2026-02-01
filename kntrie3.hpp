@@ -109,7 +109,7 @@ private:
     static constexpr size_t key_bits = sizeof(KEY) * 8;
     static constexpr bool value_inline = sizeof(VALUE) <= 8 && std::is_trivially_copyable_v<VALUE>;
     
-    using stored_value_type = std::conditional_t<value_inline, VALUE, uint64_t>;
+    using value_slot_type = std::conditional_t<value_inline, VALUE, VALUE*>;
     using value_alloc_type = typename std::allocator_traits<ALLOC>::template rebind_alloc<VALUE>;
     
     // ==========================================================================
@@ -159,7 +159,7 @@ private:
     
     // Insert into sorted array, shifting elements
     template<typename K>
-    static void sorted_insert(K* keys, uint64_t* values, size_t count, size_t insert_pos, K key, uint64_t value) noexcept {
+    static void sorted_insert(K* keys, value_slot_type* values, size_t count, size_t insert_pos, K key, value_slot_type value) noexcept {
         // Shift elements right
         for (size_t i = count; i > insert_pos; --i) {
             keys[i] = keys[i - 1];
@@ -274,7 +274,8 @@ private:
         using K = typename suffix_traits<BITS>::type;
         size_t key_bytes = count * sizeof(K);
         key_bytes = (key_bytes + 7) & ~size_t{7};
-        size_t val_bytes = count * sizeof(uint64_t);
+        size_t val_bytes = count * sizeof(value_slot_type);
+        val_bytes = (val_bytes + 7) & ~size_t{7};
         return HEADER_U64 + (key_bytes + val_bytes) / 8;
     }
     
@@ -296,14 +297,18 @@ private:
     static constexpr size_t bot_leaf_size_u64(size_t count) noexcept {
         if constexpr (BITS == 16) {
             // Bitmap-based: [bm_256][values...]
-            return BITMAP256_U64 + count;
+            size_t val_bytes = count * sizeof(value_slot_type);
+            val_bytes = (val_bytes + 7) & ~size_t{7};
+            return BITMAP256_U64 + val_bytes / 8;
         } else {
             // List-based: [count:u32 padded][suffixes...][values...]
             constexpr int suffix_bits = BITS - 8;
             using S = typename suffix_traits<suffix_bits>::type;
             size_t suffix_bytes = count * sizeof(S);
             suffix_bytes = (suffix_bytes + 7) & ~size_t{7};
-            return 1 + suffix_bytes / 8 + count;
+            size_t val_bytes = count * sizeof(value_slot_type);
+            val_bytes = (val_bytes + 7) & ~size_t{7};
+            return 1 + suffix_bytes / 8 + val_bytes / 8;
         }
     }
     
@@ -330,19 +335,19 @@ private:
     }
     
     template<int BITS>
-    static uint64_t* leaf_values(uint64_t* node, size_t count) noexcept {
+    static value_slot_type* leaf_values(uint64_t* node, size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
         size_t key_bytes = count * sizeof(K);
         key_bytes = (key_bytes + 7) & ~size_t{7};
-        return reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(node + HEADER_U64) + key_bytes);
+        return reinterpret_cast<value_slot_type*>(reinterpret_cast<char*>(node + HEADER_U64) + key_bytes);
     }
     
     template<int BITS>
-    static const uint64_t* leaf_values(const uint64_t* node, size_t count) noexcept {
+    static const value_slot_type* leaf_values(const uint64_t* node, size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
         size_t key_bytes = count * sizeof(K);
         key_bytes = (key_bytes + 7) & ~size_t{7};
-        return reinterpret_cast<const uint64_t*>(reinterpret_cast<const char*>(node + HEADER_U64) + key_bytes);
+        return reinterpret_cast<const value_slot_type*>(reinterpret_cast<const char*>(node + HEADER_U64) + key_bytes);
     }
     
     // Split top accessors
@@ -431,28 +436,28 @@ private:
     }
     
     template<int BITS>
-    static uint64_t* bot_leaf_values(uint64_t* bot, [[maybe_unused]] size_t count) noexcept {
+    static value_slot_type* bot_leaf_values(uint64_t* bot, [[maybe_unused]] size_t count) noexcept {
         if constexpr (BITS == 16) {
-            return bot + BITMAP256_U64;
+            return reinterpret_cast<value_slot_type*>(bot + BITMAP256_U64);
         } else {
             constexpr int suffix_bits = BITS - 8;
             using S = typename suffix_traits<suffix_bits>::type;
             size_t suffix_bytes = count * sizeof(S);
             suffix_bytes = (suffix_bytes + 7) & ~size_t{7};
-            return reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(bot + 1) + suffix_bytes);
+            return reinterpret_cast<value_slot_type*>(reinterpret_cast<char*>(bot + 1) + suffix_bytes);
         }
     }
     
     template<int BITS>
-    static const uint64_t* bot_leaf_values(const uint64_t* bot, [[maybe_unused]] size_t count) noexcept {
+    static const value_slot_type* bot_leaf_values(const uint64_t* bot, [[maybe_unused]] size_t count) noexcept {
         if constexpr (BITS == 16) {
-            return bot + BITMAP256_U64;
+            return reinterpret_cast<const value_slot_type*>(bot + BITMAP256_U64);
         } else {
             constexpr int suffix_bits = BITS - 8;
             using S = typename suffix_traits<suffix_bits>::type;
             size_t suffix_bytes = count * sizeof(S);
             suffix_bytes = (suffix_bytes + 7) & ~size_t{7};
-            return reinterpret_cast<const uint64_t*>(reinterpret_cast<const char*>(bot + 1) + suffix_bytes);
+            return reinterpret_cast<const value_slot_type*>(reinterpret_cast<const char*>(bot + 1) + suffix_bytes);
         }
     }
     
@@ -491,7 +496,7 @@ private:
     // Value Storage
     // ==========================================================================
     
-    stored_value_type store_value(const VALUE& val) {
+    value_slot_type store_value(const VALUE& val) {
         if constexpr (value_inline) {
             return val;
         } else {
@@ -502,7 +507,7 @@ private:
         }
     }
     
-    VALUE load_value(stored_value_type stored) const noexcept {
+    VALUE load_value(value_slot_type stored) const noexcept {
         if constexpr (value_inline) {
             return stored;
         } else {
@@ -510,7 +515,7 @@ private:
         }
     }
     
-    void destroy_value(stored_value_type stored) noexcept {
+    void destroy_value(value_slot_type stored) noexcept {
         if constexpr (!value_inline) {
             value_alloc_type va(alloc_);
             VALUE* ptr = reinterpret_cast<VALUE*>(stored);
@@ -601,9 +606,9 @@ private:
             if (h->is_leaf() && !h->is_split()) {
                 // Compact leaf
                 if constexpr (!value_inline) {
-                    uint64_t* values = leaf_values<BITS>(node, h->count);
+                    value_slot_type* values = leaf_values<BITS>(node, h->count);
                     for (uint32_t i = 0; i < h->count; ++i) {
-                        destroy_value(static_cast<stored_value_type>(values[i]));
+                        destroy_value(static_cast<value_slot_type>(values[i]));
                     }
                 }
                 dealloc_node(node, leaf_compact_size_u64<BITS>(h->count));
@@ -635,9 +640,9 @@ private:
                 if (is_leaf) {
                     uint32_t bot_count = bot_leaf_count<BITS>(bot);
                     if constexpr (!value_inline) {
-                        uint64_t* values = bot_leaf_values<BITS>(bot, bot_count);
+                        value_slot_type* values = bot_leaf_values<BITS>(bot, bot_count);
                         for (uint32_t i = 0; i < bot_count; ++i) {
-                            destroy_value(static_cast<stored_value_type>(values[i]));
+                            destroy_value(static_cast<value_slot_type>(values[i]));
                         }
                     }
                     dealloc_node(bot, bot_leaf_size_u64<BITS>(bot_count));
@@ -729,7 +734,7 @@ private:
         K suffix = static_cast<K>(extract_suffix<BITS>(ik));
         
         const K* keys = leaf_keys<BITS>(node);
-        const uint64_t* values = leaf_values<BITS>(node, h->count);
+        const value_slot_type* values = leaf_values<BITS>(node, h->count);
         
         int idx = binary_search(keys, h->count, suffix);
         if (idx < 0) return nullptr;
@@ -783,7 +788,7 @@ private:
             if (!bm.has_bit(suffix)) return nullptr;
             
             int slot = bm.count_below(suffix);
-            const uint64_t* values = bot_leaf_values<16>(bot, 0);
+            const value_slot_type* values = bot_leaf_values<16>(bot, 0);
             
             if constexpr (value_inline) {
                 return reinterpret_cast<const VALUE*>(&values[slot]);
@@ -799,7 +804,7 @@ private:
             S suffix = static_cast<S>(extract_suffix<suffix_bits>(ik));
             
             const S* suffixes = bot_leaf_suffixes<BITS>(bot);
-            const uint64_t* values = bot_leaf_values<BITS>(bot, count);
+            const value_slot_type* values = bot_leaf_values<BITS>(bot, count);
             
             int idx = binary_search(suffixes, count, suffix);
             if (idx < 0) return nullptr;
@@ -819,7 +824,7 @@ public:
     
     std::pair<bool, bool> insert(const KEY& key, const VALUE& value) {
         uint64_t ik = key_to_internal(key);
-        stored_value_type sv = store_value(value);
+        value_slot_type sv = store_value(value);
         
         auto [new_root, inserted] = insert_impl<static_cast<int>(key_bits)>(root_, ik, sv);
         root_ = new_root;
@@ -840,14 +845,14 @@ private:
     };
     
     template<int BITS>
-    InsertResult insert_impl(uint64_t* node, uint64_t ik, stored_value_type value)
+    InsertResult insert_impl(uint64_t* node, uint64_t ik, value_slot_type value)
         requires (BITS <= 0)
     {
         return {node, false};
     }
     
     template<int BITS>
-    InsertResult insert_impl(uint64_t* node, uint64_t ik, stored_value_type value)
+    InsertResult insert_impl(uint64_t* node, uint64_t ik, value_slot_type value)
         requires (BITS > 0)
     {
         NodeHeader* h = get_header(node);
@@ -869,14 +874,14 @@ private:
     }
     
     template<int BITS>
-    InsertResult insert_at_bits(uint64_t* node, NodeHeader* h, uint64_t ik, stored_value_type value)
+    InsertResult insert_at_bits(uint64_t* node, NodeHeader* h, uint64_t ik, value_slot_type value)
         requires (BITS <= 0)
     {
         return {node, false};
     }
     
     template<int BITS>
-    InsertResult insert_at_bits(uint64_t* node, NodeHeader* h, uint64_t ik, stored_value_type value)
+    InsertResult insert_at_bits(uint64_t* node, NodeHeader* h, uint64_t ik, value_slot_type value)
         requires (BITS > 0)
     {
         if (h->is_leaf() && !h->is_split()) {
@@ -888,14 +893,14 @@ private:
     }
     
     template<int BITS>
-    InsertResult insert_into_compact_leaf(uint64_t* node, NodeHeader* h, uint64_t ik, stored_value_type value)
+    InsertResult insert_into_compact_leaf(uint64_t* node, NodeHeader* h, uint64_t ik, value_slot_type value)
         requires (BITS > 0)
     {
         using K = typename suffix_traits<BITS>::type;
         K suffix = static_cast<K>(extract_suffix<BITS>(ik));
         
         K* keys = leaf_keys<BITS>(node);
-        uint64_t* values = leaf_values<BITS>(node, h->count);
+        value_slot_type* values = leaf_values<BITS>(node, h->count);
         
         // Binary search for existing or insertion point
         int idx = binary_search(keys, h->count, suffix);
@@ -903,10 +908,10 @@ private:
         if (idx >= 0) {
             // Found existing - update value
             if constexpr (!value_inline) {
-                destroy_value(static_cast<stored_value_type>(values[idx]));
+                destroy_value(static_cast<value_slot_type>(values[idx]));
             }
             if constexpr (value_inline) {
-                std::memcpy(&values[idx], &value, sizeof(stored_value_type));
+                std::memcpy(&values[idx], &value, sizeof(value_slot_type));
             } else {
                 values[idx] = static_cast<uint64_t>(value);
             }
@@ -929,36 +934,36 @@ private:
         new_h->count = static_cast<uint32_t>(new_count);
         
         K* new_keys = leaf_keys<BITS>(new_node);
-        uint64_t* new_values = leaf_values<BITS>(new_node, new_count);
+        value_slot_type* new_values = leaf_values<BITS>(new_node, new_count);
         
         // Copy before insertion point
         std::memcpy(new_keys, keys, insert_pos * sizeof(K));
-        std::memcpy(new_values, values, insert_pos * sizeof(uint64_t));
+        std::memcpy(new_values, values, insert_pos * sizeof(value_slot_type));
         
         // Insert new entry
         new_keys[insert_pos] = suffix;
         if constexpr (value_inline) {
-            std::memcpy(&new_values[insert_pos], &value, sizeof(stored_value_type));
+            std::memcpy(&new_values[insert_pos], &value, sizeof(value_slot_type));
         } else {
             new_values[insert_pos] = static_cast<uint64_t>(value);
         }
         
         // Copy after insertion point
         std::memcpy(new_keys + insert_pos + 1, keys + insert_pos, (h->count - insert_pos) * sizeof(K));
-        std::memcpy(new_values + insert_pos + 1, values + insert_pos, (h->count - insert_pos) * sizeof(uint64_t));
+        std::memcpy(new_values + insert_pos + 1, values + insert_pos, (h->count - insert_pos) * sizeof(value_slot_type));
         
         dealloc_node(node, leaf_compact_size_u64<BITS>(h->count));
         return {new_node, true};
     }
     
     template<int BITS>
-    InsertResult convert_to_split(uint64_t* node, NodeHeader* h, uint64_t ik, stored_value_type value)
+    InsertResult convert_to_split(uint64_t* node, NodeHeader* h, uint64_t ik, value_slot_type value)
         requires (BITS > 0)
     {
         using K = typename suffix_traits<BITS>::type;
         
         K* old_keys = leaf_keys<BITS>(node);
-        uint64_t* old_values = leaf_values<BITS>(node, h->count);
+        value_slot_type* old_values = leaf_values<BITS>(node, h->count);
         
         K new_suffix = static_cast<K>(extract_suffix<BITS>(ik));
         
@@ -1007,21 +1012,14 @@ private:
                     // Collect entries with shifted keys
                     size_t total_count = h->count + 1;
                     std::unique_ptr<uint64_t[]> child_suffixes(new uint64_t[total_count]);
-                    std::unique_ptr<uint64_t[]> child_values(new uint64_t[total_count]);
-                    
-                    uint64_t new_value_u64;
-                    if constexpr (value_inline) {
-                        std::memcpy(&new_value_u64, &value, sizeof(stored_value_type));
-                    } else {
-                        new_value_u64 = static_cast<uint64_t>(value);
-                    }
+                    std::unique_ptr<value_slot_type[]> child_values(new value_slot_type[total_count]);
                     
                     for (uint32_t i = 0; i < h->count; ++i) {
                         child_suffixes[i] = static_cast<uint64_t>(old_keys[i]) & child_mask;
                         child_values[i] = old_values[i];
                     }
                     child_suffixes[h->count] = static_cast<uint64_t>(new_suffix) & child_mask;
-                    child_values[h->count] = new_value_u64;
+                    child_values[h->count] = value;
                     
                     // Create child node at lower BITS level
                     uint64_t child_ptr = create_child_no_prefix<child_bits>(
@@ -1069,12 +1067,6 @@ private:
         constexpr uint64_t suffix_mask = (1ULL << suffix_bits) - 1;
         
         S new_bot_suffix = static_cast<S>(new_suffix & suffix_mask);
-        uint64_t new_value_u64;
-        if constexpr (value_inline) {
-            std::memcpy(&new_value_u64, &value, sizeof(stored_value_type));
-        } else {
-            new_value_u64 = static_cast<uint64_t>(value);
-        }
         
         int top_slot = 0;
         for (int top_idx = 0; top_idx < 256; ++top_idx) {
@@ -1087,10 +1079,10 @@ private:
                 // Bitmap-based: [bm_256][values...]
                 Bitmap256& bot_bm = bot_leaf_bitmap<16>(bot);
                 bot_bm = Bitmap256{};  // Clear
-                uint64_t* values = bot_leaf_values<16>(bot, bot_count);
+                value_slot_type* values = bot_leaf_values<16>(bot, bot_count);
                 
                 // First pass: set bits and collect (suffix, value) pairs
-                struct Entry { uint8_t suffix; uint64_t value; };
+                struct Entry { uint8_t suffix; value_slot_type value; };
                 Entry entries[256];
                 size_t entry_count = 0;
                 
@@ -1106,7 +1098,7 @@ private:
                 
                 if (need_insert_new) {
                     uint8_t new_bot_suffix_8 = static_cast<uint8_t>(new_suffix & 0xFF);
-                    entries[entry_count++] = {new_bot_suffix_8, new_value_u64};
+                    entries[entry_count++] = {new_bot_suffix_8, value};
                     bot_bm.set_bit(new_bot_suffix_8);
                 }
                 
@@ -1120,7 +1112,7 @@ private:
                 set_bot_leaf_count<BITS>(bot, static_cast<uint32_t>(bot_count));
                 
                 S* suffixes = bot_leaf_suffixes<BITS>(bot);
-                uint64_t* values = bot_leaf_values<BITS>(bot, bot_count);
+                value_slot_type* values = bot_leaf_values<BITS>(bot, bot_count);
                 
                 bool need_insert_new = (new_top_idx == top_idx);
                 bool inserted_new = false;
@@ -1133,7 +1125,7 @@ private:
                         // Insert new entry before this one if it belongs here
                         if (need_insert_new && !inserted_new && new_bot_suffix < old_bot_suffix) {
                             suffixes[idx] = new_bot_suffix;
-                            values[idx] = new_value_u64;
+                            values[idx] = value;
                             idx++;
                             inserted_new = true;
                         }
@@ -1147,7 +1139,7 @@ private:
                 // Insert new entry at end if not yet inserted
                 if (need_insert_new && !inserted_new) {
                     suffixes[idx] = new_bot_suffix;
-                    values[idx] = new_value_u64;
+                    values[idx] = value;
                 }
             }
             
@@ -1160,7 +1152,7 @@ private:
     
     // Create a child node, with recursive prefix compression if needed
     template<int CHILD_BITS>
-    uint64_t create_child_no_prefix(uint64_t* suffixes, uint64_t* values, size_t count)
+    uint64_t create_child_no_prefix(uint64_t* suffixes, value_slot_type* values, size_t count)
         requires (CHILD_BITS > 0)
     {
         // If it fits in a compact leaf, create one
@@ -1174,12 +1166,12 @@ private:
             
             using ChildK = typename suffix_traits<CHILD_BITS>::type;
             ChildK* child_keys = leaf_keys<CHILD_BITS>(child);
-            uint64_t* child_values = leaf_values<CHILD_BITS>(child, count);
+            value_slot_type* child_values = leaf_values<CHILD_BITS>(child, count);
             
             // Sort and copy using insertion sort
             for (size_t i = 0; i < count; ++i) {
                 ChildK key = static_cast<ChildK>(suffixes[i]);
-                uint64_t val = values[i];
+                value_slot_type val = values[i];
                 size_t j = i;
                 while (j > 0 && child_keys[j-1] > key) {
                     child_keys[j] = child_keys[j-1];
@@ -1309,7 +1301,7 @@ private:
                     
                     // Collect entries for this inner bucket
                     std::unique_ptr<uint64_t[]> child_suffixes(new uint64_t[child_count]);
-                    std::unique_ptr<uint64_t[]> child_vals(new uint64_t[child_count]);
+                    std::unique_ptr<value_slot_type[]> child_vals(new value_slot_type[child_count]);
                     size_t ci = 0;
                     
                     for (size_t i = 0; i < count; ++i) {
@@ -1338,10 +1330,10 @@ private:
                     // Bitmap-based: [bm_256][values...]
                     Bitmap256& bot_bm = bot_leaf_bitmap<16>(bot);
                     bot_bm = Bitmap256{};
-                    uint64_t* bot_values = bot_leaf_values<16>(bot, bot_count);
+                    value_slot_type* bot_values = bot_leaf_values<16>(bot, bot_count);
                     
                     // Collect entries for this bucket, set bits, and populate values
-                    struct Entry { uint8_t suffix; uint64_t value; };
+                    struct Entry { uint8_t suffix; value_slot_type value; };
                     Entry entries[256];
                     size_t bi = 0;
                     
@@ -1364,14 +1356,14 @@ private:
                     
                     using S = typename suffix_traits<suffix_bits>::type;
                     S* bot_suffixes = bot_leaf_suffixes<CHILD_BITS>(bot);
-                    uint64_t* bot_values = bot_leaf_values<CHILD_BITS>(bot, bot_count);
+                    value_slot_type* bot_values = bot_leaf_values<CHILD_BITS>(bot, bot_count);
                     
                     // Collect and sort entries for this bucket
                     size_t bi = 0;
                     for (size_t i = 0; i < count; ++i) {
                         if ((suffixes[i] >> (CHILD_BITS - 8)) == static_cast<uint64_t>(bucket)) {
                             S suf = static_cast<S>(suffixes[i] & suffix_mask);
-                            uint64_t val = values[i];
+                            value_slot_type val = values[i];
                             
                             // Insert in sorted order
                             size_t j = bi;
@@ -1405,7 +1397,7 @@ private:
     }
     
     template<int BITS>
-    InsertResult insert_into_split(uint64_t* node, NodeHeader* h, uint64_t ik, stored_value_type value)
+    InsertResult insert_into_split(uint64_t* node, NodeHeader* h, uint64_t ik, value_slot_type value)
         requires (BITS > 0)
     {
         uint8_t top_idx = extract_top8<BITS>(ik);
@@ -1442,7 +1434,7 @@ private:
     }
     
     template<int BITS>
-    InsertResult add_new_bottom_leaf(uint64_t* node, NodeHeader* h, uint64_t ik, stored_value_type value, uint8_t top_idx)
+    InsertResult add_new_bottom_leaf(uint64_t* node, NodeHeader* h, uint64_t ik, value_slot_type value, uint8_t top_idx)
         requires (BITS > 0)
     {
         Bitmap256& top_bm = top_bitmap(node);
@@ -1483,9 +1475,9 @@ private:
             uint8_t suffix = static_cast<uint8_t>(extract_suffix<8>(ik));
             new_bm.set_bit(suffix);
             
-            uint64_t* values = bot_leaf_values<16>(new_bot, 1);
+            value_slot_type* values = bot_leaf_values<16>(new_bot, 1);
             if constexpr (value_inline) {
-                std::memcpy(&values[0], &value, sizeof(stored_value_type));
+                std::memcpy(&values[0], &value, sizeof(value_slot_type));
             } else {
                 values[0] = static_cast<uint64_t>(value);
             }
@@ -1497,11 +1489,11 @@ private:
             set_bot_leaf_count<BITS>(new_bot, 1);
             
             S* suffixes = bot_leaf_suffixes<BITS>(new_bot);
-            uint64_t* values = bot_leaf_values<BITS>(new_bot, 1);
+            value_slot_type* values = bot_leaf_values<BITS>(new_bot, 1);
             
             suffixes[0] = static_cast<S>(extract_suffix<suffix_bits>(ik));
             if constexpr (value_inline) {
-                std::memcpy(&values[0], &value, sizeof(stored_value_type));
+                std::memcpy(&values[0], &value, sizeof(value_slot_type));
             } else {
                 values[0] = static_cast<uint64_t>(value);
             }
@@ -1515,7 +1507,7 @@ private:
     
     template<int BITS>
     InsertResult insert_into_bot_leaf(uint64_t* node, NodeHeader* h, uint8_t top_idx, int top_slot,
-                                       uint64_t* bot, uint64_t ik, stored_value_type value)
+                                       uint64_t* bot, uint64_t ik, value_slot_type value)
         requires (BITS > 0)
     {
         if constexpr (BITS == 16) {
@@ -1523,16 +1515,16 @@ private:
             uint8_t suffix = static_cast<uint8_t>(extract_suffix<8>(ik));
             Bitmap256& bot_bm = bot_leaf_bitmap<16>(bot);
             uint32_t count = bot_bm.popcount();
-            uint64_t* values = bot_leaf_values<16>(bot, count);
+            value_slot_type* values = bot_leaf_values<16>(bot, count);
             
             if (bot_bm.has_bit(suffix)) {
                 // Found existing - update value
                 int slot = bot_bm.count_below(suffix);
                 if constexpr (!value_inline) {
-                    destroy_value(static_cast<stored_value_type>(values[slot]));
+                    destroy_value(static_cast<value_slot_type>(values[slot]));
                 }
                 if constexpr (value_inline) {
-                    std::memcpy(&values[slot], &value, sizeof(stored_value_type));
+                    std::memcpy(&values[slot], &value, sizeof(value_slot_type));
                 } else {
                     values[slot] = static_cast<uint64_t>(value);
                 }
@@ -1547,23 +1539,23 @@ private:
             new_bm = bot_bm;
             new_bm.set_bit(suffix);
             
-            uint64_t* new_values = bot_leaf_values<16>(new_bot, new_count);
+            value_slot_type* new_values = bot_leaf_values<16>(new_bot, new_count);
             
             // Copy values, inserting new one at correct slot
             int insert_slot = new_bm.count_below(suffix);
             
             // Copy before insertion point
-            std::memcpy(new_values, values, insert_slot * sizeof(uint64_t));
+            std::memcpy(new_values, values, insert_slot * sizeof(value_slot_type));
             
             // Insert new value
             if constexpr (value_inline) {
-                std::memcpy(&new_values[insert_slot], &value, sizeof(stored_value_type));
+                std::memcpy(&new_values[insert_slot], &value, sizeof(value_slot_type));
             } else {
                 new_values[insert_slot] = static_cast<uint64_t>(value);
             }
             
             // Copy after insertion point
-            std::memcpy(new_values + insert_slot + 1, values + insert_slot, (count - insert_slot) * sizeof(uint64_t));
+            std::memcpy(new_values + insert_slot + 1, values + insert_slot, (count - insert_slot) * sizeof(value_slot_type));
             
             top_children<16>(node)[top_slot] = reinterpret_cast<uint64_t>(new_bot);
             h->count++;
@@ -1579,7 +1571,7 @@ private:
             S suffix = static_cast<S>(extract_suffix<suffix_bits>(ik));
             
             S* suffixes = bot_leaf_suffixes<BITS>(bot);
-            uint64_t* values = bot_leaf_values<BITS>(bot, count);
+            value_slot_type* values = bot_leaf_values<BITS>(bot, count);
             
             // Binary search for existing or insertion point
             int idx = binary_search(suffixes, count, suffix);
@@ -1587,10 +1579,10 @@ private:
             if (idx >= 0) {
                 // Found existing - update value
                 if constexpr (!value_inline) {
-                    destroy_value(static_cast<stored_value_type>(values[idx]));
+                    destroy_value(static_cast<value_slot_type>(values[idx]));
                 }
                 if constexpr (value_inline) {
-                    std::memcpy(&values[idx], &value, sizeof(stored_value_type));
+                    std::memcpy(&values[idx], &value, sizeof(value_slot_type));
                 } else {
                     values[idx] = static_cast<uint64_t>(value);
                 }
@@ -1613,23 +1605,23 @@ private:
             set_bot_leaf_count<BITS>(new_bot, new_count);
             
             S* new_suffixes = bot_leaf_suffixes<BITS>(new_bot);
-            uint64_t* new_values = bot_leaf_values<BITS>(new_bot, new_count);
+            value_slot_type* new_values = bot_leaf_values<BITS>(new_bot, new_count);
             
             // Copy before insertion point
             std::memcpy(new_suffixes, suffixes, insert_pos * sizeof(S));
-            std::memcpy(new_values, values, insert_pos * sizeof(uint64_t));
+            std::memcpy(new_values, values, insert_pos * sizeof(value_slot_type));
             
             // Insert new entry
             new_suffixes[insert_pos] = suffix;
             if constexpr (value_inline) {
-                std::memcpy(&new_values[insert_pos], &value, sizeof(stored_value_type));
+                std::memcpy(&new_values[insert_pos], &value, sizeof(value_slot_type));
             } else {
                 new_values[insert_pos] = static_cast<uint64_t>(value);
             }
             
             // Copy after insertion point
             std::memcpy(new_suffixes + insert_pos + 1, suffixes + insert_pos, (count - insert_pos) * sizeof(S));
-            std::memcpy(new_values + insert_pos + 1, values + insert_pos, (count - insert_pos) * sizeof(uint64_t));
+            std::memcpy(new_values + insert_pos + 1, values + insert_pos, (count - insert_pos) * sizeof(value_slot_type));
             
             top_children<BITS>(node)[top_slot] = reinterpret_cast<uint64_t>(new_bot);
             h->count++;
@@ -1641,14 +1633,14 @@ private:
 
     template<int BITS>
     InsertResult convert_bot_leaf_to_internal(uint64_t* node, NodeHeader* h, uint8_t top_idx, int top_slot,
-                                               uint64_t* bot, uint32_t count, uint64_t ik, stored_value_type value)
+                                               uint64_t* bot, uint32_t count, uint64_t ik, value_slot_type value)
         requires (BITS > 16)
     {
         constexpr int suffix_bits = BITS - 8;
         using S = typename suffix_traits<suffix_bits>::type;
         
         S* old_suffixes = bot_leaf_suffixes<BITS>(bot);
-        uint64_t* old_values = bot_leaf_values<BITS>(bot, count);
+        value_slot_type* old_values = bot_leaf_values<BITS>(bot, count);
         
         // Group by high 8 bits (the "bot_idx" within this level)
         Bitmap256 bot_bm{};
@@ -1667,13 +1659,6 @@ private:
         bucket_counts[new_bot_idx]++;
         
         int bot_child_count = bot_bm.popcount();
-        
-        uint64_t new_value_u64;
-        if constexpr (value_inline) {
-            std::memcpy(&new_value_u64, &value, sizeof(stored_value_type));
-        } else {
-            new_value_u64 = static_cast<uint64_t>(value);
-        }
         
         // Allocate new bottom INTERNAL
         uint64_t* new_bot = alloc_node(bot_internal_size_u64(bot_child_count));
@@ -1698,7 +1683,7 @@ private:
             child_h->set_leaf(true);
             
             ChildK* child_keys = leaf_keys<child_bits>(child);
-            uint64_t* child_values = leaf_values<child_bits>(child, child_count);
+            value_slot_type* child_values = leaf_values<child_bits>(child, child_count);
             
             bool need_insert_new = (new_bot_idx == bot_idx);
             bool inserted_new = false;
@@ -1711,7 +1696,7 @@ private:
                     // Insert new entry before this one if it belongs here
                     if (need_insert_new && !inserted_new && new_child_suffix < old_child_suffix) {
                         child_keys[ci] = new_child_suffix;
-                        child_values[ci] = new_value_u64;
+                        child_values[ci] = value;
                         ci++;
                         inserted_new = true;
                     }
@@ -1725,7 +1710,7 @@ private:
             // Insert new entry at end if not yet inserted
             if (need_insert_new && !inserted_new) {
                 child_keys[ci] = new_child_suffix;
-                child_values[ci] = new_value_u64;
+                child_values[ci] = value;
             }
             
             children[slot++] = reinterpret_cast<uint64_t>(child);
@@ -1751,7 +1736,7 @@ private:
     
     template<int BITS>
     InsertResult insert_into_bot_internal(uint64_t* node, NodeHeader* h, uint8_t top_idx, int top_slot,
-                                           uint64_t* bot, uint64_t ik, stored_value_type value)
+                                           uint64_t* bot, uint64_t ik, value_slot_type value)
         requires (BITS > 16)
     {
         uint8_t bot_idx = extract_top8<BITS - 8>(ik);
@@ -1791,7 +1776,7 @@ private:
             using ChildK = typename suffix_traits<child_bits>::type;
             leaf_keys<child_bits>(child)[0] = static_cast<ChildK>(extract_suffix<child_bits>(ik));
             if constexpr (value_inline) {
-                std::memcpy(&leaf_values<child_bits>(child, 1)[0], &value, sizeof(stored_value_type));
+                std::memcpy(&leaf_values<child_bits>(child, 1)[0], &value, sizeof(value_slot_type));
             } else {
                 leaf_values<child_bits>(child, 1)[0] = static_cast<uint64_t>(value);
             }
@@ -1806,7 +1791,7 @@ private:
     }
     
     template<int BITS>
-    InsertResult split_on_prefix(uint64_t* node, NodeHeader* h, uint64_t ik, stored_value_type value, uint64_t expected)
+    InsertResult split_on_prefix(uint64_t* node, NodeHeader* h, uint64_t ik, value_slot_type value, uint64_t expected)
         requires (BITS > 0)
     {
         // Prefix mismatch - need to create a new structure
@@ -1897,7 +1882,7 @@ private:
             using ChildK = typename suffix_traits<child_bits>::type;
             leaf_keys<child_bits>(new_leaf)[0] = static_cast<ChildK>(extract_suffix<child_bits>(ik));
             if constexpr (value_inline) {
-                std::memcpy(&leaf_values<child_bits>(new_leaf, 1)[0], &value, sizeof(stored_value_type));
+                std::memcpy(&leaf_values<child_bits>(new_leaf, 1)[0], &value, sizeof(value_slot_type));
             } else {
                 leaf_values<child_bits>(new_leaf, 1)[0] = static_cast<uint64_t>(value);
             }
@@ -1974,7 +1959,7 @@ private:
             using ChildK = typename suffix_traits<child_bits>::type;
             leaf_keys<child_bits>(new_leaf)[0] = static_cast<ChildK>(extract_suffix<child_bits>(ik));
             if constexpr (value_inline) {
-                std::memcpy(&leaf_values<child_bits>(new_leaf, 1)[0], &value, sizeof(stored_value_type));
+                std::memcpy(&leaf_values<child_bits>(new_leaf, 1)[0], &value, sizeof(value_slot_type));
             } else {
                 leaf_values<child_bits>(new_leaf, 1)[0] = static_cast<uint64_t>(value);
             }
