@@ -7,6 +7,8 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <algorithm>
+#include <cassert>
 
 namespace kn3 {
 
@@ -142,14 +144,12 @@ private:
     // Returns index where key is found, or where it should be inserted (as negative - 1)
     template<typename K>
     static int binary_search(const K* keys, size_t count, K target) noexcept {
-        int lo = 0, hi = static_cast<int>(count) - 1;
-        while (lo <= hi) {
-            int mid = lo + (hi - lo) / 2;
-            if (keys[mid] == target) return mid;
-            if (keys[mid] < target) lo = mid + 1;
-            else hi = mid - 1;
+        assert(count <= 4096);
+        auto it = std::lower_bound(keys, keys + count, target);
+        if (it != keys + count && *it == target) {
+            return static_cast<int>(it - keys);
         }
-        return -(lo + 1);  // Not found, return insertion point encoded
+        return -(static_cast<int>(it - keys) + 1);  // Not found, return insertion point encoded
     }
     
     // Insert into sorted array, shifting elements
