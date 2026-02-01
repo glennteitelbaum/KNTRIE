@@ -9,6 +9,7 @@
 #include <utility>
 #include <algorithm>
 #include <cassert>
+#include <array>
 
 namespace kn3 {
 
@@ -665,13 +666,100 @@ private:
     }
     
 public:
+    // Debug functions
+    struct RootInfo {
+        uint32_t count;
+        uint16_t top_count;
+        uint8_t skip;
+        bool is_leaf;
+        bool is_split;
+        uint64_t prefix;
+    };
+    
+    RootInfo debug_root_info() const {
+        const NodeHeader* h = get_header(root_);
+        return {h->count, h->top_count, h->skip, h->is_leaf(), h->is_split(), h->prefix};
+    }
+    
+    uint64_t debug_key_to_internal(KEY k) const {
+        return key_to_internal(k);
+    }
+    
+    struct BitmapInfo {
+        int popcount;
+        int set_bits[256];
+    };
+    
+    BitmapInfo debug_top_bitmap() const {
+        BitmapInfo info{};
+        const Bitmap256& bm = top_bitmap(root_);
+        info.popcount = bm.popcount();
+        int idx = 0;
+        for (int i = 0; i < 256 && idx < info.popcount; ++i) {
+            if (bm.has_bit(i)) {
+                info.set_bits[idx++] = i;
+            }
+        }
+        return info;
+    }
+    
+    struct FindTrace {
+        uint8_t top_idx;
+        bool top_found;
+        int top_slot;
+        uint64_t bot_ptr;
+        uint64_t bot_word0;
+        uint64_t bot_word1;
+        uint32_t bot_count;
+        int search_result;
+    };
+    
+    FindTrace debug_find_trace(KEY k) const {
+        FindTrace t{};
+        uint64_t ik = key_to_internal(k);
+        
+        // Assuming SPLIT at 64 bits
+        t.top_idx = static_cast<uint8_t>(ik >> 56);
+        
+        const Bitmap256& top_bm = top_bitmap(root_);
+        t.top_found = top_bm.find_slot(t.top_idx, t.top_slot);
+        
+        if (t.top_found) {
+            const uint64_t* top_ch = top_children<64>(root_);
+            const uint64_t* bot = reinterpret_cast<const uint64_t*>(top_ch[t.top_slot]);
+            t.bot_ptr = reinterpret_cast<uint64_t>(bot);
+            t.bot_word0 = bot[0];
+            t.bot_word1 = bot[1];
+            t.bot_count = bot_leaf_count<64>(bot);
+            
+            constexpr int suffix_bits = 64 - 8;
+            using S = typename suffix_traits<suffix_bits>::type;
+            S suffix = static_cast<S>(ik & ((1ULL << suffix_bits) - 1));
+            
+            const S* suffixes = bot_leaf_suffixes<64>(bot);
+            t.search_result = binary_search(suffixes, t.bot_count, suffix);
+        }
+        
+        return t;
+    }
+    
+    // Debug: get first N words of root
+    std::array<uint64_t, 20> debug_dump_root() const {
+        std::array<uint64_t, 20> result{};
+        for (int i = 0; i < 20; ++i) {
+            result[i] = root_[i];
+        }
+        return result;
+    }
+    
     // ==========================================================================
     // Find
     // ==========================================================================
     
     const VALUE* find_value(const KEY& key) const noexcept {
         uint64_t ik = key_to_internal(key);
-        return find_impl<static_cast<int>(key_bits)>(root_, ik);
+        NodeHeader h = *get_header(root_);
+        return find_impl<static_cast<int>(key_bits)>(root_, ik, h, 0, 0);
     }
     
     bool contains(const KEY& key) const noexcept {
@@ -679,53 +767,106 @@ public:
     }
     
 private:
+    // Extract top 16 bits of remaining BITS portion
     template<int BITS>
-    const VALUE* find_impl(const uint64_t* node, uint64_t ik) const noexcept
-        requires (BITS <= 0)
-    {
-        return nullptr;
+    static constexpr uint16_t extract_top16(uint64_t ik) noexcept {
+        static_assert(BITS >= 16 && BITS <= 64);
+        constexpr int shift = 64 - static_cast<int>(key_bits) + BITS - 16;
+        return static_cast<uint16_t>((ik >> shift) & 0xFFFF);
     }
     
+    // Get 16-bit chunk from skip prefix
+    // skip_left is how many 16-bit chunks remain to check (1-based)
+    // Prefix stores skip*16 bits, MSB first
+    static constexpr uint16_t get_skip_chunk(uint64_t prefix, int skip, int skip_left) noexcept {
+        // skip_left=1 means we want the lowest 16 bits
+        // skip_left=skip means we want the highest 16 bits
+        int shift = (skip_left - 1) * 16;
+        return static_cast<uint16_t>((prefix >> shift) & 0xFFFF);
+    }
+    
+    // Base case: BITS == 16
     template<int BITS>
-    const VALUE* find_impl(const uint64_t* node, uint64_t ik) const noexcept
-        requires (BITS > 0)
+    const VALUE* find_impl(const uint64_t* node, uint64_t ik, NodeHeader h, 
+                           uint64_t skip, int skip_left) const noexcept
+        requires (BITS == 16)
     {
-        if (!node) return nullptr;
+        // At BITS=16, we're at terminal level
+        // COMPACT is always leaf, BOT_LEAF is bitmap-based
+        if (!h.is_split()) {
+            return find_in_compact_leaf<16>(node, &h, ik);
+        } else {
+            return find_in_split_leaf_16(node, ik);
+        }
+    }
+    
+    // Recursive case: BITS > 16
+    template<int BITS>
+    const VALUE* find_impl(const uint64_t* node, uint64_t ik, NodeHeader h,
+                           uint64_t skip, int skip_left) const noexcept
+        requires (BITS > 16)
+    {
+        uint16_t key_chunk = extract_top16<BITS>(ik);
         
-        const NodeHeader* h = get_header(node);
-        
-        // Handle skip
-        if (h->skip > 0) {
-            uint64_t expected = extract_prefix<BITS>(ik, h->skip);
-            if (expected != h->prefix) return nullptr;
+        if (skip_left > 0) {
+            // Consuming skip from earlier
+            uint16_t skip_chunk = get_skip_chunk(skip, h.skip, skip_left);
+            if (key_chunk != skip_chunk) return nullptr;
+            skip_left--;
+        } else if (h.skip >= 1) {
+            // New node has skip - check top 16 bits
+            uint16_t skip_chunk = get_skip_chunk(h.prefix, h.skip, h.skip);
+            if (key_chunk != skip_chunk) return nullptr;
             
-            int actual_bits = BITS - h->skip * 16;
-            if (actual_bits == 48) return find_at_bits<48>(node, h, ik);
-            if (actual_bits == 32) return find_at_bits<32>(node, h, ik);
-            if (actual_bits == 16) return find_at_bits<16>(node, h, ik);
-            return nullptr;
+            if (h.skip > 1) {
+                skip = h.prefix;
+                skip_left = h.skip - 1;
+            }
+            h.skip = 0;  // consumed - won't re-trigger
+        } else if (h.is_leaf()) {
+            // Terminal - find value
+            if (!h.is_split()) {
+                return find_in_compact_leaf<BITS>(node, &h, ik);
+            } else {
+                return find_in_split_leaf<BITS>(node, ik);
+            }
+        } else {
+            // Internal - descend
+            const uint64_t* child = get_child<BITS>(node, &h, ik);
+            if (!child) return nullptr;
+            node = child;
+            h = *get_header(child);
         }
         
-        return find_at_bits<BITS>(node, h, ik);
+        return find_impl<BITS - 16>(node, ik, h, skip, skip_left);
     }
     
+    // Find child pointer in SPLIT internal node
     template<int BITS>
-    const VALUE* find_at_bits(const uint64_t* node, const NodeHeader* h, uint64_t ik) const noexcept
-        requires (BITS <= 0)
-    {
-        return nullptr;
-    }
-    
-    template<int BITS>
-    const VALUE* find_at_bits(const uint64_t* node, const NodeHeader* h, uint64_t ik) const noexcept
-        requires (BITS > 0)
-    {
-        if (h->is_leaf() && !h->is_split()) {
-            return find_in_compact_leaf<BITS>(node, h, ik);
-        } else if (h->is_split()) {
-            return find_in_split<BITS>(node, h, ik);
+    const uint64_t* get_child(const uint64_t* node, const NodeHeader* h, uint64_t ik) const noexcept {
+        // SPLIT internal: [header][top_bm_256][bot_is_leaf_bm_256][bot_ptrs...]
+        uint8_t top_idx = extract_top8<BITS>(ik);
+        
+        const Bitmap256& top_bm = top_bitmap(node);
+        int top_slot;
+        if (!top_bm.find_slot(top_idx, top_slot)) return nullptr;
+        
+        const uint64_t* top_ch = top_children<BITS>(node);
+        const uint64_t* bot = reinterpret_cast<const uint64_t*>(top_ch[top_slot]);
+        
+        // Check if bot is leaf
+        if (bot_is_leaf_bitmap(node).has_bit(top_idx)) {
+            return nullptr;  // Can't descend into leaf
         }
-        return nullptr;
+        
+        // bot is internal - descend through it
+        uint8_t bot_idx = extract_top8<BITS - 8>(ik);
+        const Bitmap256& bot_bm = bot_bitmap(bot);
+        int bot_slot;
+        if (!bot_bm.find_slot(bot_idx, bot_slot)) return nullptr;
+        
+        const uint64_t* children = bot_internal_children(bot);
+        return reinterpret_cast<const uint64_t*>(children[bot_slot]);
     }
     
     template<int BITS>
@@ -742,12 +883,80 @@ private:
         if constexpr (value_inline) {
             return reinterpret_cast<const VALUE*>(&values[idx]);
         } else {
-            return reinterpret_cast<const VALUE*>(values[idx]);
+            return values[idx];
         }
     }
     
+    // SPLIT node at BITS > 16: check bot_is_leaf_bitmap to determine if bot is leaf or internal
     template<int BITS>
-    const VALUE* find_in_split(const uint64_t* node, const NodeHeader* h, uint64_t ik) const noexcept {
+    const VALUE* find_in_split(const uint64_t* node, uint64_t ik) const noexcept 
+        requires (BITS > 16)
+    {
+        uint8_t top_idx = extract_top8<BITS>(ik);
+        
+        const Bitmap256& top_bm = top_bitmap(node);
+        int top_slot;
+        if (!top_bm.find_slot(top_idx, top_slot)) {
+            return nullptr;
+        }
+        
+        const uint64_t* top_ch = top_children<BITS>(node);
+        const uint64_t* bot = reinterpret_cast<const uint64_t*>(top_ch[top_slot]);
+        
+        // Check if this bottom is a leaf or internal
+        bool is_bot_leaf = bot_is_leaf_bitmap(node).has_bit(top_idx);
+        
+        if (is_bot_leaf) {
+            return find_in_bot_leaf<BITS>(bot, ik);
+        } else {
+            // bot_internal: [bitmap256][child_ptrs...]
+            // Lookup in bot bitmap and recurse to child node
+            uint8_t bot_idx = extract_top8<BITS - 8>(ik);
+            const Bitmap256& bot_bm = bot_bitmap(bot);
+            int bot_slot;
+            if (!bot_bm.find_slot(bot_idx, bot_slot)) return nullptr;
+            
+            const uint64_t* children = bot_internal_children(bot);
+            const uint64_t* child = reinterpret_cast<const uint64_t*>(children[bot_slot]);
+            
+            // Recurse with child's header
+            NodeHeader child_h = *get_header(child);
+            return find_impl<BITS - 16>(child, ik, child_h, 0, 0);
+        }
+    }
+    
+    // SPLIT leaf at BITS == 16: simpler structure
+    const VALUE* find_in_split_leaf_16(const uint64_t* node, uint64_t ik) const noexcept {
+        uint8_t top_idx = extract_top8<16>(ik);
+        
+        const Bitmap256& top_bm = top_bitmap(node);
+        int top_slot;
+        if (!top_bm.find_slot(top_idx, top_slot)) return nullptr;
+        
+        const uint64_t* top_ch = top_children<16>(node);
+        const uint64_t* bot = reinterpret_cast<const uint64_t*>(top_ch[top_slot]);
+        
+        // At 16-bit, bot leaf is bitmap-based
+        uint8_t suffix = static_cast<uint8_t>(extract_suffix<8>(ik));
+        const Bitmap256& bm = bot_leaf_bitmap<16>(bot);
+        
+        if (!bm.has_bit(suffix)) return nullptr;
+        
+        int slot = bm.count_below(suffix);
+        const value_slot_type* values = bot_leaf_values<16>(bot, 0);
+        
+        if constexpr (value_inline) {
+            return reinterpret_cast<const VALUE*>(&values[slot]);
+        } else {
+            return values[slot];
+        }
+    }
+    
+    // SPLIT leaf at BITS > 16: top bitmap -> bot_leaf (list-based)
+    template<int BITS>
+    const VALUE* find_in_split_leaf(const uint64_t* node, uint64_t ik) const noexcept
+        requires (BITS > 16)
+    {
         uint8_t top_idx = extract_top8<BITS>(ik);
         
         const Bitmap256& top_bm = top_bitmap(node);
@@ -757,63 +966,28 @@ private:
         const uint64_t* top_ch = top_children<BITS>(node);
         const uint64_t* bot = reinterpret_cast<const uint64_t*>(top_ch[top_slot]);
         
-        bool is_leaf;
-        if constexpr (BITS == 16) {
-            is_leaf = true;
-        } else {
-            is_leaf = bot_is_leaf_bitmap(node).has_bit(top_idx);
-        }
-        
-        if (is_leaf) {
-            return find_in_bot_leaf<BITS>(bot, ik);
-        } else {
-            // Bottom INTERNAL - lookup in bitmap, recurse
-            uint8_t bot_idx = extract_top8<BITS - 8>(ik);
-            const Bitmap256& bot_bm = bot_bitmap(bot);
-            int bot_slot;
-            if (!bot_bm.find_slot(bot_idx, bot_slot)) return nullptr;
-            
-            const uint64_t* children = bot_internal_children(bot);
-            return find_impl<BITS - 16>(reinterpret_cast<const uint64_t*>(children[bot_slot]), ik);
-        }
+        return find_in_bot_leaf<BITS>(bot, ik);
     }
     
     template<int BITS>
     const VALUE* find_in_bot_leaf(const uint64_t* bot, uint64_t ik) const noexcept {
-        if constexpr (BITS == 16) {
-            // Bitmap-based: [bm_256][values...]
-            uint8_t suffix = static_cast<uint8_t>(extract_suffix<8>(ik));
-            const Bitmap256& bm = bot_leaf_bitmap<16>(bot);
-            
-            if (!bm.has_bit(suffix)) return nullptr;
-            
-            int slot = bm.count_below(suffix);
-            const value_slot_type* values = bot_leaf_values<16>(bot, 0);
-            
-            if constexpr (value_inline) {
-                return reinterpret_cast<const VALUE*>(&values[slot]);
-            } else {
-                return reinterpret_cast<const VALUE*>(values[slot]);
-            }
+        // List-based: [count][(BITS-8)-bit suffixes...][values...]
+        uint32_t count = bot_leaf_count<BITS>(bot);
+        
+        constexpr int suffix_bits = BITS - 8;
+        using S = typename suffix_traits<suffix_bits>::type;
+        S suffix = static_cast<S>(extract_suffix<suffix_bits>(ik));
+        
+        const S* suffixes = bot_leaf_suffixes<BITS>(bot);
+        const value_slot_type* values = bot_leaf_values<BITS>(bot, count);
+        
+        int idx = binary_search(suffixes, count, suffix);
+        if (idx < 0) return nullptr;
+        
+        if constexpr (value_inline) {
+            return reinterpret_cast<const VALUE*>(&values[idx]);
         } else {
-            // List-based: [count][(BITS-8)-bit suffixes...][values...]
-            uint32_t count = bot_leaf_count<BITS>(bot);
-            
-            constexpr int suffix_bits = BITS - 8;
-            using S = typename suffix_traits<suffix_bits>::type;
-            S suffix = static_cast<S>(extract_suffix<suffix_bits>(ik));
-            
-            const S* suffixes = bot_leaf_suffixes<BITS>(bot);
-            const value_slot_type* values = bot_leaf_values<BITS>(bot, count);
-            
-            int idx = binary_search(suffixes, count, suffix);
-            if (idx < 0) return nullptr;
-            
-            if constexpr (value_inline) {
-                return reinterpret_cast<const VALUE*>(&values[idx]);
-            } else {
-                return reinterpret_cast<const VALUE*>(values[idx]);
-            }
+            return values[idx];
         }
     }
     
@@ -1911,7 +2085,7 @@ private:
                 split_h->prefix = 0;
             }
             split_h->set_split(true);
-            split_h->set_leaf(true);  // Both children are bot_leafs
+            split_h->set_leaf(false);  // Children are bot_internal, not bot_leaf
             
             Bitmap256 top_bm{};
             top_bm.set_bit(new_top);
