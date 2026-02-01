@@ -812,7 +812,7 @@ private:
         
         // Build top bitmap from high 8 bits
         Bitmap256 new_top_bm{};
-        uint8_t bucket_counts[256] = {0};
+        uint16_t bucket_counts[256] = {0};
         
         for (uint32_t i = 0; i < h->count; ++i) {
             uint8_t top_idx = static_cast<uint8_t>(old_keys[i] >> (BITS - 8));
@@ -1048,7 +1048,7 @@ private:
         
         // Group by next 8 bits
         Bitmap256 bot_bm{};
-        uint8_t bucket_counts[256] = {0};
+        uint16_t bucket_counts[256] = {0};
         
         for (uint32_t i = 0; i < count; ++i) {
             uint8_t bot_idx = static_cast<uint8_t>(old_suffixes[i] >> (suffix_bits - 8));
