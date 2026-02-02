@@ -1,353 +1,318 @@
-# kntrie — Concepts & Design
+# kntrie — Design & Internals
 
-## 1. What Is a Trie?
+## 1. Trie Fundamentals
 
-A trie (from "re**trie**val") is a tree where keys are decomposed into a sequence of
-smaller pieces and each piece selects a branch at the corresponding level. For integer
-keys, the natural decomposition is by bit groups.
+A trie decomposes keys into a sequence of fixed-width chunks and uses each chunk to
+select a branch at the corresponding tree level. For integer keys the natural
+decomposition is by bit groups — an *n*-bit radix trie uses *n* bits per level.
 
-### Simple radix trie (background)
+A naive 8-bit radix trie over 64-bit keys has 8 levels of 256-entry pointer arrays.
+This yields O(1) lookup (bounded by key width) but catastrophic memory waste: a
+single root-to-leaf path with no branching allocates 8 × 2048 = 16 KB of pointer
+arrays to store one entry.
 
-Consider a 16-bit key `0xAB34`. A 4-bit radix trie would break it into four nibbles:
-
-```
-Level 0:  0xA  ──►  branch A
-Level 1:  0xB  ──►  branch B
-Level 2:  0x3  ──►  branch 3
-Level 3:  0x4  ──►  leaf → value
-```
-
-Each internal node is a 16-element array (one slot per nibble value). This is simple
-but wastes enormous space: most slots are NULL. For 64-bit keys you'd need up to 16
-levels of 16-slot arrays.
-
-### What kntrie does differently
-
-kntrie uses an **adaptive, width-varying trie** that processes keys 16 bits at a time
-(split into two 8-bit halves), with three key innovations:
-
-1. **Compact leaves** — small populations are stored as sorted arrays, not tree nodes
-2. **Bitmap-compressed split nodes** — sparse 256-way fanout uses bitmaps instead of
-   pointer arrays, storing only the occupied slots
-3. **Skip (prefix) compression** — when all entries in a subtree share a common
-   prefix, levels are skipped entirely and the shared prefix is stored once
+kntrie eliminates this waste through three cooperating mechanisms: adaptive node
+representations that match structure to population density, bitmap-compressed sparse
+dispatch that stores only occupied slots, and prefix compression that collapses
+uniform trie levels into metadata.
 
 ---
 
 ## 2. Key Encoding
 
-Before any trie operations, user keys are converted to a 64-bit **internal key**:
+User keys are converted to a 64-bit **internal key** by left-aligning into a uint64_t:
 
 ```
-internal = user_key << (64 - key_bits)
+internal = static_cast<uint64_t>(key) << (64 - key_bits)
 ```
 
-This left-aligns the key so the most-significant bits are always at bit 63. For a
-32-bit key, the internal representation has the key in bits [63:32] and zeros in
-[31:0].
+This places the MSB at bit 63 regardless of key width, so 8/16/32/64-bit keys share
+identical extraction logic parameterized only by bit count.
 
-### Signed key support
+### Signed key ordering
 
-Signed keys are transformed so that their natural numeric order matches unsigned
-comparison order. This is done by flipping the sign bit:
+Signed keys undergo a sign-bit XOR before alignment:
 
 ```
-result ^= (1 << (key_bits - 1))
+result ^= (1ULL << (key_bits - 1))
 ```
 
-After this XOR, INT_MIN maps to 0x0000... and INT_MAX maps to 0xFFFF..., preserving
-sort order for unsigned comparison.
+This maps the signed range monotonically onto unsigned order: `INT64_MIN → 0`,
+`0 → 0x8000000000000000`, `INT64_MAX → 0xFFFFFFFFFFFFFFFF`. All subsequent trie
+operations use unsigned comparison, and iterator traversal produces correct signed
+ordering.
 
-### Suffix storage types
+### Suffix type narrowing
 
-Remaining key bits at any level are stored in the **narrowest type** that fits:
+At each trie level, the remaining key bits are stored in the narrowest integer type
+that fits:
 
-| Remaining bits | Storage type |
-|---------------|-------------|
-| 1–8           | `uint8_t`   |
-| 9–16          | `uint16_t`  |
-| 17–32         | `uint32_t`  |
-| 33–64         | `uint64_t`  |
+| Remaining bits | Storage type | Sizeof |
+|---------------|-------------|--------|
+| 1–8           | `uint8_t`   | 1      |
+| 9–16          | `uint16_t`  | 2      |
+| 17–32         | `uint32_t`  | 4      |
+| 33–64         | `uint64_t`  | 8      |
 
-This is critical for memory compression — at a leaf holding entries with only 8 bits
-remaining, each suffix costs 1 byte instead of 8.
+This is selected at compile time via `suffix_traits<BITS>::type`. At a leaf storing
+entries with 8 remaining bits, each key costs 1 byte. Combined with inline value
+storage (see §9), this is the primary driver of kntrie's memory density.
 
 ---
 
-## 3. The 16-Bit Level Architecture
+## 3. Level Architecture
 
-kntrie processes keys **16 bits per level**. For a 64-bit key, that gives a maximum
-of 4 levels (64/16 = 4). Each 16-bit chunk is further split into two 8-bit halves:
-a **top byte** and a **bottom byte**.
+kntrie processes keys **16 bits per level**. For a 64-bit key this gives a maximum
+depth of 4. Each 16-bit chunk is split into two 8-bit halves for dispatch:
 
 ```
-64-bit key:
-┌──────────┬──────────┬──────────┬──────────┐
-│ Level 0  │ Level 1  │ Level 2  │ Level 3  │
-│ bits     │ bits     │ bits     │ bits     │
-│ [63:48]  │ [47:32]  │ [31:16]  │ [15:0]   │
-└──────────┴──────────┴──────────┴──────────┘
+64-bit internal key:
+┌────────────┬────────────┬────────────┬────────────┐
+│  Level 0   │  Level 1   │  Level 2   │  Level 3   │
+│ bits[63:48]│ bits[47:32]│ bits[31:16]│ bits[15:0] │
+└────────────┴────────────┴────────────┴────────────┘
 
 Each 16-bit level:
-┌────────┬────────┐
-│ Top 8  │ Bot 8  │
-│ (0xHH) │ (0xLL) │
-└────────┴────────┘
+┌──────────┬──────────┐
+│  Top 8   │  Bot 8   │
+│  (0xHH)  │  (0xLL)  │
+└──────────┴──────────┘
 ```
 
-At each level, a node is in one of two states:
+The top 8 bits index into a bitmap-compressed 256-way fanout at the split node level.
+The bottom 8 bits either resolve directly (via a second bitmap at the terminal level)
+or select a child within a bottom-internal node.
 
-- **Compact leaf** — a flat sorted array of (suffix, value) pairs
-- **Split node** — a bitmap-indexed two-tier structure: top-8 bitmap → bottom nodes
+At each level a node is either a **compact leaf** (flat sorted array) or a **split
+node** (bitmap-indexed two-tier structure). The transition between them is governed
+by the COMPACT_MAX threshold.
 
 ---
 
-## 4. Node Types
+## 4. The 4096 Threshold
 
-### 4.1 Node Header
+Both COMPACT_MAX and BOT_LEAF_MAX are set to 4096. This value is the product of
+two complementary constraints:
+
+**Optimal split fanout.** When a compact leaf of 4096 entries splits on its top
+8 bits (256 possible values), the expected bucket size under uniform distribution
+is 4096 / 256 = **16 entries per bucket**. This places each bucket squarely in the
+range where a single-pass linear scan is optimal — no index layers needed, fitting
+entirely in one or two cache lines.
+
+**Three-level indexed search.** The idx_search structure (§7) uses two index layers
+sampling every 256th and every 16th key. The maximum array size for exactly three
+scan passes of 16 elements each is 16 × 16 × 16 = **4096**. Beyond this, a fourth
+index layer would be needed, adding complexity for diminishing returns. At 4096,
+every lookup requires at most 3 sequential scans of ≤16 elements.
+
+The convergence of these two constraints at the same value is not coincidental — it
+reflects the 8-bit (256-way) fanout interacting with the 16-element scan width.
+
+---
+
+## 5. Node Types
+
+### 5.1 Node Header
 
 Every node begins with an 8-byte header:
 
 ```
-struct NodeHeader {        // 8 bytes total
-    uint32_t count;        // Total entry count
-    uint16_t top_count;    // Number of occupied top-8 buckets (split nodes)
-    uint8_t  skip;         // Number of 16-bit levels to skip (prefix compression)
-    uint8_t  flags;        // Bit 0: is_leaf, Bit 1: is_split
+struct NodeHeader {        // 8 bytes, naturally aligned
+    uint32_t count;        // total entry count in this subtree
+    uint16_t top_count;    // occupied top-8 buckets (split nodes only)
+    uint8_t  skip;         // prefix-compressed levels (each = 16 bits)
+    uint8_t  flags;        // bit 0: is_leaf, bit 1: is_split
 };
 ```
 
-When `skip > 0`, a second 8-byte word follows immediately, storing the compressed
-prefix. So the header occupies either 8 or 16 bytes.
+When `skip > 0`, the header extends to 16 bytes with a second uint64_t storing the
+compressed prefix. All subsequent offsets are computed from `header_u64(skip)`:
+1 for skip=0, 2 for skip>0.
 
-### 4.2 Compact Leaf
+### 5.2 Compact Leaf
 
-The simplest node type. Used when a subtree has ≤ 4096 entries.
-
-```
-┌─────────────────┐
-│ Header (8–16B)  │
-├─────────────────┤
-│ idx1 samples    │  (only if count > 256)
-│ idx2 samples    │  (only if count > 16)
-│ sorted keys     │  (suffix_type × count)
-├─────────────────┤
-│ values          │  (value_slot × count)
-└─────────────────┘
-```
-
-Keys are the **full remaining suffix** at this level — not just one 8-bit chunk but
-all remaining bits. This is a critical design choice: a compact leaf at level 0 of a
-64-bit key stores full 64-bit suffixes; a compact leaf at level 2 stores 32-bit
-suffixes. This means a compact leaf can represent entries without any child pointers
-at all.
-
-**Flags:** `is_leaf = 1, is_split = 0`
-
-### 4.3 Split Node (Top Level)
-
-When a compact leaf exceeds COMPACT_MAX (4096) entries, it converts to a split node.
-The split node uses the top 8 bits of the current 16-bit chunk to index into buckets:
+A flat sorted array of (suffix, value) pairs. Used when entry count ≤ 4096.
 
 ```
-┌─────────────────┐
-│ Header (8–16B)  │
-├─────────────────┤
-│ top_bitmap      │  256-bit bitmap (32 bytes) — which top-8 values exist
-├─────────────────┤
-│ bot_is_leaf_bm  │  256-bit bitmap (32 bytes) — which bottoms are leaves
-│                 │  (omitted at BITS=16, where all bottoms are leaves)
-├─────────────────┤
-│ child pointers  │  one uint64_t per set bit in top_bitmap
-│ (packed dense)  │  points to bottom nodes
-└─────────────────┘
+┌───────────────────┐
+│ Header (8–16 B)   │
+├───────────────────┤
+│ idx1[ ] samples   │  ⌈count/256⌉ entries, only if count > 256
+│ idx2[ ] samples   │  ⌈count/16⌉ entries, only if count > 16
+│ keys[ ] sorted    │  suffix_type × count
+├───────────────────┤  (8-byte aligned boundary)
+│ values[ ]         │  value_slot_type × count
+└───────────────────┘
 ```
 
-The top_bitmap tells us which of the 256 possible top-8 values have entries.
-The child pointer array is **dense** — only occupied slots are stored. To find
-the pointer for top-8 value `T`, you check `top_bitmap.has_bit(T)` then compute
-the array index via `popcount` of bits below `T`.
+Keys store the **full remaining suffix** — all bits below the current level. A
+compact leaf at level 0 of a 64-bit key holds 64-bit suffixes; at level 2, 32-bit
+suffixes. This means a compact leaf can represent an arbitrarily deep subtree with
+no child pointers.
 
-**Flags:** `is_split = 1`; `is_leaf` indicates whether any bottoms are leaf-type.
+All byte regions are 8-byte aligned via padding, ensuring uint64_t-aligned access
+for all accesses through the `uint64_t*` node pointer.
 
-### 4.4 Bottom Leaf (bot_leaf)
+**Flags:** `is_leaf=1, is_split=0`
 
-Each child of a split node handles entries sharing the same top-8 bits. A bottom
-leaf stores those entries with their remaining suffixes.
+### 5.3 Split Node (Top Level)
 
-**At BITS = 16** (terminal level), only 8 bits remain after the top-8 split.
-The bottom leaf uses a bitmap for O(1) lookup:
-
-```
-┌──────────────────┐
-│ bitmap (32B)     │  256-bit: which bottom-8 values exist
-├──────────────────┤
-│ values (dense)   │  one value per set bit, in bitmap order
-└──────────────────┘
-```
-
-**At BITS > 16**, more than 8 bits remain. The bottom leaf is list-based:
+Created when a compact leaf exceeds 4096 entries. Uses the top 8 bits to dispatch
+into bitmap-compressed buckets:
 
 ```
-┌──────────────────┐
-│ count (8B pad)   │
-├──────────────────┤
-│ idx1 samples     │
-│ idx2 samples     │
-│ sorted suffixes  │  (BITS-8)-bit suffixes
-├──────────────────┤
-│ values           │
-└──────────────────┘
+┌─────────────────────┐
+│ Header (8–16 B)     │
+├─────────────────────┤
+│ top_bitmap (32 B)   │  Bitmap256: which top-8 values are occupied
+├─────────────────────┤
+│ bot_is_leaf (32 B)  │  Bitmap256: which bottoms are leaves vs internal
+│                     │  (elided at BITS=16 — all bottoms are leaves)
+├─────────────────────┤
+│ child_ptrs[ ]       │  uint64_t × popcount(top_bitmap)
+│ (dense, packed)     │  each points to a bot_leaf or bot_internal
+└─────────────────────┘
 ```
 
-These suffixes are the remaining key bits **after** the top 8 have been consumed by
-the split node's bitmap.
+The child pointer array is **dense**: only occupied slots are stored. Mapping a
+top-8 value to an array index requires a bitmap presence check plus popcount
+(see §6).
 
-### 4.5 Bottom Internal (bot_internal)
+**Flags:** `is_split=1`; `is_leaf` tracks whether any bottom children are leaf-type.
 
-When a bottom leaf exceeds BOT_LEAF_MAX (4096) entries, it converts to a bottom
-internal node. This adds a second 8-bit bitmap level:
+### 5.4 Bottom Leaf (bot_leaf)
+
+Stores entries sharing the same top-8 prefix within a split node.
+
+**Terminal case (BITS = 16):** Only 8 bits remain after the top-8 split. Uses a
+bitmap for direct O(1) membership test:
 
 ```
-┌──────────────────┐
-│ bitmap (32B)     │  256-bit: which bottom-8 values have children
-├──────────────────┤
-│ child pointers   │  one uint64_t per set bit → child nodes at next level
-└──────────────────┘
+┌────────────────────┐
+│ bitmap (32 B)      │  Bitmap256: which bottom-8 values are present
+├────────────────────┤
+│ values[ ] (dense)  │  value_slot_type × popcount(bitmap)
+└────────────────────┘
 ```
 
-Each child pointer leads to a node at (BITS - 16), completing the full 16-bit
-level of trie descent.
+Lookup: `bitmap.has_bit(suffix)` → `bitmap.count_below(suffix)` → `values[slot]`.
+No key storage at all — the bitmap *is* the key.
 
----
+**Non-terminal case (BITS > 16):** (BITS−8) suffix bits remain. Uses a sorted
+list with indexed search:
 
-## 5. Skip (Prefix) Compression
+```
+┌────────────────────┐
+│ count (8 B padded) │
+├────────────────────┤
+│ idx1[ ] samples    │
+│ idx2[ ] samples    │
+│ suffixes[ ] sorted │  (BITS−8)-bit suffix type × count
+├────────────────────┤
+│ values[ ]          │
+└────────────────────┘
+```
 
-When all entries in a subtree share the same 16-bit chunk at some level, there's no
-branching to be done — the level is redundant. kntrie detects this and **skips** the
-level entirely.
+### 5.5 Bottom Internal (bot_internal)
 
-### How it works
+Replaces a bot_leaf when it exceeds 4096 entries. Adds a second 8-bit bitmap
+dispatch, completing the full 16-bit level:
 
-Instead of creating a split node with exactly one bucket, kntrie:
+```
+┌────────────────────┐
+│ bitmap (32 B)      │  Bitmap256: occupied bottom-8 values
+├────────────────────┤
+│ child_ptrs[ ]      │  uint64_t × popcount(bitmap)
+│                    │  each → node at (BITS − 16)
+└────────────────────┘
+```
 
-1. Records the shared 16-bit prefix in the node's prefix field
-2. Increments the `skip` counter
-3. Stores the data as if the level didn't exist
-
-Multiple consecutive uniform levels can be combined: `skip = 2` means 32 bits of
-shared prefix are stored in a single 64-bit prefix word, and lookup jumps forward
-by 2 levels.
-
-### Example: sequential keys 0..99999
-
-All these keys share the same upper 48 bits (they all fit in ~17 bits). kntrie
-detects three uniform 16-bit levels and stores `skip = 3` with the shared prefix.
-The actual data is stored as a compact leaf with 16-bit suffixes. Result: **1.2
-bytes/entry** instead of the 64+ bytes/entry that std::map uses.
-
-### Prefix mismatch on insert
-
-If a new key doesn't match the stored prefix, the skip structure must be split.
-The algorithm finds the first differing 16-bit chunk, creates a new split node at
-that point, and divides the old node and new key into separate branches. The
-remaining common prefix (if any) is preserved as a shorter skip on both children.
+Each child is a node at the next level down — a compact leaf, split node, or
+prefix-compressed descendant.
 
 ---
 
 ## 6. Bitmap256 — Compressed 256-Way Dispatch
 
-The `Bitmap256` struct is the core primitive for sparse 256-way branching. It's a
-256-bit bitmap stored as four `uint64_t` words (32 bytes total).
+`Bitmap256` is 4 × `uint64_t` = 32 bytes. It replaces the 2048-byte pointer array
+a full 256-way node would require, storing only presence information.
 
-### Operations
+### find_slot: combined presence + position
 
-**`has_bit(index)`** — test if a value is present: single word load + bit test.
-
-**`find_slot(index, &slot)`** — combined presence check + position calculation.
-Given a value `index` (0–255), determine both (a) whether it's present and (b)
-its position in the dense child array. This uses `popcount` to count set bits below
-the target:
+The critical operation is `find_slot(index, &slot)` — simultaneously testing
+membership and computing the dense array index:
 
 ```cpp
-// Which 64-bit word contains the target bit?
-int word = index >> 6;      // 0..3
-int bit  = index & 63;      // position within word
+int word = index >> 6;           // which uint64_t (0–3)
+int bit  = index & 63;          // position within word
 
-// Shift so target bit is at MSB; check it
 uint64_t before = words[word] << (63 - bit);
-if (!(before & (1ULL << 63))) return false;  // bit not set
+if (!(before & (1ULL << 63)))   // target bit not set?
+    return false;
 
-// Count bits before target = array index
-slot = popcount(before) - 1;              // bits in same word
-slot += popcount(words[0]) if word > 0;   // full words before
-slot += popcount(words[1]) if word > 1;
-slot += popcount(words[2]) if word > 2;
+slot = popcount(before) - 1;    // bits set in same word, at or below target
+slot += popcount(words[0]) & -int(word > 0);  // add full words before
+slot += popcount(words[1]) & -int(word > 1);
+slot += popcount(words[2]) & -int(word > 2);
 ```
 
-The branchless accumulation (`slot += pc & -int(word > N)`) avoids conditional
-branches — the expression `-int(true)` is all-ones (acts as no-op mask) and
-`-int(false)` is zero (zeroes out the addition).
+The accumulation uses branchless masking: `-int(true)` is `0xFFFFFFFF` (identity
+under bitwise AND), `-int(false)` is `0x00000000` (zeroes the term). On x86-64-v3
+targets, `popcount` compiles to a single `POPCNT` instruction.
 
-**`slot_for_insert(index)`** — like find_slot but counts bits strictly *below* the
-target, for determining where to insert a new element.
+### Memory savings
 
-**`find_next_set(start)`** — iterate set bits from a starting position, used for
-traversal and cleanup. Masks out bits below `start` then uses `countr_zero` to find
-the next set bit.
+A sparse node with *k* occupied slots costs 32 (bitmap) + 8*k* (pointers) bytes.
+A full pointer array costs 2048 bytes. Break-even is at *k* = 252; below that,
+bitmaps save space. In practice, typical top-8 distributions have 10–100 occupied
+values, yielding 5–20× compression versus full arrays.
 
-### Why bitmaps instead of arrays?
-
-A naive 256-way node would use a 2048-byte pointer array (256 × 8 bytes). With
-bitmaps, if only 10 of 256 values are present, we store 32 bytes (bitmap) +
-80 bytes (10 pointers) = 112 bytes. That's 18× smaller.
-
-At the terminal level (BITS = 16), the bottom bitmap stores presence of 8-bit
-suffixes directly, enabling O(1) lookup with no child pointers at all — just a
-bitmap + dense value array.
+At the terminal level (BITS = 16), the bottom bitmap stores key presence directly
+with no pointer array at all — 32 bytes for up to 256 entries.
 
 ---
 
 ## 7. Indexed Linear Search (idx_search)
 
-kntrie replaces classical binary search with a **two-level indexed linear scan**.
-This is designed for sorted arrays up to 4096 elements and optimizes for CPU cache
-behavior.
+### Design rationale
 
-### The problem with binary search
+Binary search is O(log *n*) in comparisons but each comparison accesses a
+non-sequential memory location. For an array of 4096 32-bit keys (16 KB), a
+binary search touches 12 cache lines across the full array. On modern hardware,
+each L1 miss costs ~4ns and each L2 miss ~12ns, dominating comparison costs.
 
-Binary search on a sorted array is O(log n) in comparisons but has poor cache
-behavior: each comparison jumps to a distant memory location. For arrays of
-1000+ elements, this means several cache misses per lookup.
+kntrie replaces binary search with a **three-tier sequential scan** optimized for
+hardware prefetch.
 
-### Layout: `[idx1][idx2][keys]`
+### Memory layout
 
-The sorted keys are stored with two layers of sampled indices prepended:
+Sorted keys are stored with two prepended index layers:
 
 ```
-idx1:  samples every 256th key    (present only if count > 256)
-idx2:  samples every 16th key     (present only if count > 16)
-keys:  full sorted key array
+┌───────────────────────────────────────────────────────────────┐
+│ idx1[⌈n/256⌉]  │  idx2[⌈n/16⌉]  │  keys[n]                 │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-For example, with 1000 entries:
-- `idx1` is empty (1000 ≤ 256? No, so idx1 has ⌈1000/256⌉ = 4 entries)
-- Actually: idx1 has 4 entries: `keys[0], keys[256], keys[512], keys[768]`
-- `idx2` has ⌈1000/16⌉ = 63 entries: `keys[0], keys[16], keys[32], ...`
-- `keys` has all 1000 entries
+`idx1[i]` = `keys[i × 256]` — samples every 256th key.
+`idx2[i]` = `keys[i × 16]` — samples every 16th key.
+
+For 4096 entries: idx1 has 16 entries, idx2 has 256 entries, keys has 4096 entries.
 
 ### Search procedure
 
 ```
-1. Linear scan idx1 (≤16 entries) → narrows to a 256-element block
-2. Linear scan idx2 (≤16 entries within that block) → narrows to a 16-element block
-3. Linear scan keys (≤16 entries) → exact match check
+1. Linear scan idx1 (≤16 entries) → identifies 256-element block
+2. Linear scan idx2 (≤16 entries within block) → identifies 16-element block
+3. Linear scan keys (≤16 entries) → exact match test
 ```
 
-Each step scans at most 16 elements with a tight forward loop:
+Each scan uses `idx_subsearch`, a tight forward loop over at most 16 elements:
 
 ```cpp
-static int idx_subsearch(const K* start, int count, K key) {
+template<typename K>
+static int idx_subsearch(const K* start, int count, K key) noexcept {
     [[assume(count <= 16)]];
     const K* run = start;
     const K* end = start + count;
@@ -355,188 +320,233 @@ static int idx_subsearch(const K* start, int count, K key) {
         if (*run > key) break;
         run++;
     } while (run < end);
-    return (run - start) - 1;
+    return static_cast<int>(run - start) - 1;
 }
 ```
 
-### Why this is fast
+`[[assume(count <= 16)]]` enables the compiler to emit tight unrolled code. Each
+scan touches at most 2 cache lines (16 × 8 bytes = 128 bytes for uint64_t keys),
+and the sequential access pattern triggers hardware prefetch.
 
-- **Linear scans up to 16 elements** are extremely cache-friendly — the CPU
-  prefetcher handles sequential access perfectly
-- **The `[[assume(count <= 16)]]` hint** lets the compiler generate tight,
-  potentially unrolled code with no loop overhead
-- **Only 3 scans** are ever needed: worst case is 16 + 16 + 16 = 48 comparisons,
-  but all sequential and within a few cache lines
-- **idx1 and idx2 are small** and likely stay in L1/L2 cache across repeated lookups
+### Complexity
 
-For smaller arrays (≤ 16 elements), the index layers don't exist and it's a single
-direct linear scan — zero overhead.
+Worst case: 16 + 16 + 16 = 48 comparisons, all sequential. For arrays ≤ 16 entries,
+both index layers are absent and a single direct scan suffices — zero structural
+overhead. The idx layers themselves consume `(⌈n/256⌉ + ⌈n/16⌉) × sizeof(K)` bytes
+of overhead, which at 4096 entries is 272 × sizeof(K) — 6.6% for uint64_t keys.
 
 ---
 
-## 8. Value Storage
+## 8. Skip (Prefix) Compression
 
-Values are stored in one of two modes, selected at compile time:
+When all entries in a subtree share the same 16-bit chunk at some level, there is no
+branching — the level is structurally redundant. kntrie collapses it.
 
-**Inline** (`sizeof(VALUE) ≤ 8` and trivially copyable): the value is stored
-directly in the value slot alongside the keys. No heap allocation per value.
+### Mechanism
 
-**Pointer** (larger or non-trivial values): a pointer to a heap-allocated copy
-is stored. Each value requires a separate allocation.
+Instead of creating a split node with one bucket:
 
-The `value_slot_type` is either `VALUE` or `VALUE*`, determined by:
+1. Store the shared 16-bit chunk in the node's prefix field
+2. Increment the `skip` counter
+3. Store data as if the level didn't exist
+
+Multiple consecutive uniform levels combine: `skip = 3` means 48 bits of shared
+prefix occupy a single uint64_t, and lookup jumps 3 levels forward after a
+constant-time prefix comparison.
+
+### Detection
+
+During compact-to-split conversion, if all entries bucket to the same top-8 value
+AND the same bottom-8 value, the conversion is replaced by skip accumulation.
+The entries' suffixes are shifted down by 16 bits and the process recurses at
+(BITS − 16). This repeats until a non-uniform level is found.
+
+The same logic applies in `create_child_no_prefix` during bulk node construction —
+skip compression is applied recursively bottom-up.
+
+### Prefix mismatch on insert
+
+When a new key diverges from the stored prefix, the skip structure splits:
+
+1. Find the first differing 16-bit chunk (scanning high to low)
+2. Create a new split node at the divergence point
+3. The common prefix (chunks above the divergence) becomes the new node's skip
+4. The old subtree and new key become children, each carrying their own remaining
+   prefix (chunks below the divergence)
+
+This preserves all existing entries without copying their data — only the routing
+metadata changes.
+
+### Impact
+
+Sequential keys 0..99999 share 48 upper bits. kntrie stores `skip = 3` with one
+compact leaf of 16-bit suffixes: **1.2 bytes/entry** for `kntrie<uint64_t, char>`.
+
+---
+
+## 9. Value Storage
+
+Compile-time selection between two modes:
+
+**Inline** (`sizeof(VALUE) ≤ 8 && is_trivially_copyable_v<VALUE>`): values are
+stored directly in the value slot array. No per-value heap allocation. A
+`kntrie<uint64_t, char>` stores 1-byte values inline; a `kntrie<uint64_t, uint64_t>`
+stores 8-byte values inline.
+
+**Indirect** (larger or non-trivially-copyable values): each value is heap-allocated
+via the rebound allocator, and a pointer is stored in the slot. Construction and
+destruction are properly managed through allocator traits.
 
 ```cpp
-static constexpr bool value_inline =
-    sizeof(VALUE) <= 8 && std::is_trivially_copyable_v<VALUE>;
 using value_slot_type = std::conditional_t<value_inline, VALUE, VALUE*>;
 ```
 
-This means `kntrie<uint64_t, char>` stores char values inline using just 1 byte per
-value slot (plus alignment padding at the array level), while
-`kntrie<uint64_t, std::string>` would heap-allocate each string.
+---
+
+## 10. Node Lifecycle
+
+```
+                   count > 4096
+Compact Leaf  ─────────────────►  Split Node
+   (sorted                          │
+    array)                          │ per top-8 bucket:
+                                    ▼
+                                 Bot Leaf
+                                    │
+                                    │ count > 4096
+                                    ▼
+                               Bot Internal
+                                    │
+                                    │ each child →
+                                    ▼
+                              Node at (BITS−16)
+                            (compact leaf or split)
+```
+
+**Compact → Split:** Entries are bucketed by top 8 bits. With 4096 entries and
+256 possible buckets, the average bucket holds 16 entries — the optimal scan width.
+If all entries share a common 16-bit prefix (single-bucket case), skip compression
+is applied instead (see §8).
+
+**Bot Leaf → Bot Internal:** Analogous second-stage split. Each sub-bucket becomes a
+full node at the next trie level, enabling recursive descent.
 
 ---
 
-## 9. Node Transitions
-
-Nodes evolve through a lifecycle as entries are added:
+## 11. Lookup Path
 
 ```
-                   count > COMPACT_MAX (4096)
-Compact Leaf  ─────────────────────────────────►  Split Node
-                                                    │
-                                                    │ per bucket:
-                                                    ▼
-                                                 Bot Leaf
-                                                    │
-                                   count > BOT_LEAF_MAX (4096)
-                                                    │
-                                                    ▼
-                                               Bot Internal
-                                                    │
-                                                    │ children are nodes
-                                                    │ at (BITS - 16)
-                                                    ▼
-                                              Next-level node
-                                             (Compact Leaf or Split)
+find(key):
+  ik = key_to_internal(key)
+  node = root, h = header(root)
+
+  for each 16-bit level (BITS = key_bits, key_bits−16, ...):
+    if h.skip > 0:
+      compare 16-bit chunk against stored prefix
+      mismatch → return not_found
+      match    → consume chunk, decrement skip_left, continue
+
+    if compact_leaf:
+      idx_search(suffix) → found/not_found
+
+    if split:
+      top_8 = extract_top8(ik)
+      top_bitmap.find_slot(top_8) → slot or not_found
+
+      if bot_leaf:
+        BITS=16: bot_bitmap.has_bit(bot_8) → value
+        BITS>16: idx_search(suffix) → value
+
+      if bot_internal:
+        bot_8 = extract_top8(ik)  (next 8 bits)
+        bot_bitmap.find_slot(bot_8) → child
+        node = child, continue at BITS−16
 ```
 
-### Compact → Split conversion
-
-When a compact leaf reaches 4096 entries:
-
-1. All entries are bucketed by their top 8 bits
-2. A split node is allocated with a bitmap and dense pointer array
-3. Each bucket becomes a bottom leaf
-
-**Special case:** if all entries share the same top 8 bits AND the same next 8 bits,
-the conversion is replaced by **skip compression** — a single level is skipped and
-the process recurses at (BITS - 16).
-
-### Bot Leaf → Bot Internal conversion
-
-When a bottom leaf reaches 4096 entries:
-
-1. Entries are sub-bucketed by their next 8 bits
-2. The bottom leaf is replaced with a bottom internal node
-3. Each sub-bucket becomes a compact leaf at the next trie level
+This is implemented as a tail-recursive template chain: `find_impl<BITS>` calls
+`find_impl<BITS−16>`. The compiler unrolls the recursion into a flat sequence of
+specialized code — for 64-bit keys, four static code paths for BITS ∈ {64, 48, 32, 16}.
 
 ---
 
-## 10. Lookup Path (find)
+## 12. Template Specialization Strategy
 
-Finding a key follows this path:
+All node operations are parameterized by `template<int BITS>`. This enables:
 
-```
-1. Convert key to internal representation
-2. Read root node header
-3. At each level:
-   a. If skip > 0: compare 16-bit chunk against stored prefix
-      - Mismatch → not found
-      - Match → advance to next 16-bit chunk (no node traversal)
-   b. If compact leaf: idx_search on suffix array → found/not found
-   c. If split node:
-      - Extract top 8 bits → bitmap lookup → child pointer
-      - If bottom is leaf:
-        · BITS=16: bitmap lookup on bottom 8 bits → value
-        · BITS>16: idx_search on bottom suffixes → value
-      - If bottom is internal:
-        · Extract next 8 bits → bitmap lookup → child pointer
-        · Recurse into child at (BITS - 16)
-```
+- **`suffix_traits<BITS>::type`** — compile-time selection of the narrowest integer
+  type for key storage at each level.
+- **`if constexpr (BITS == 16)`** — terminal-level specializations (bitmap-based
+  bottom leaves, no bot_is_leaf_bitmap) are eliminated from non-terminal code paths.
+- **`requires (BITS > 16)` / `requires (BITS > 0)`** — prevent invalid template
+  instantiation at boundary conditions. Without these guards, the compiler would
+  attempt to instantiate `suffix_traits<-16>` or `insert_impl<0>`.
 
-The find path is implemented via tail-recursive template functions that unwind at
-compile time. For a 64-bit key, the compiler generates specialized code for
-BITS ∈ {64, 48, 32, 16}, with each level knowing exactly what types and shifts to
-use.
+The result: for `kntrie<uint64_t, VALUE>` the compiler generates four specialized
+insert paths and four specialized find paths, each with correct types, shifts,
+bitmap logic, and layout offsets resolved at compile time.
 
 ---
 
-## 11. Template Architecture
+## 13. Interface & Iteration
 
-kntrie makes heavy use of C++ templates to specialize at compile time:
+kntrie provides the same interface as `std::map<KEY, VALUE>` for integer key types:
+`insert`, `find`, `erase`, `operator[]`, `lower_bound`, `upper_bound`, iterators
+(`begin`/`end`), `size`, `empty`, `clear`.
 
-- **`template<int BITS>`** — all node operations are parameterized by remaining bit
-  width. This eliminates runtime branching on level depth.
-- **`suffix_traits<BITS>`** — selects the narrowest integer type for key storage at
-  each level. At 48 remaining bits, suffixes are `uint64_t`; at 16 bits, `uint16_t`;
-  at 8 bits, `uint8_t`.
-- **`if constexpr`** — used extensively to eliminate dead code paths. For example,
-  bot_is_leaf_bitmap doesn't exist when BITS = 16, and the compiler knows this.
-- **`requires` clauses** — separate base cases (BITS ≤ 0, BITS = 16) from recursive
-  cases (BITS > 16) to prevent invalid template instantiation.
+Iteration traverses the trie in internal-key order, which corresponds to:
+- Unsigned natural order for unsigned keys
+- Correct signed order for signed keys (due to the sign-bit XOR in §2)
 
-The result is that for `kntrie<uint64_t, char>`, the compiler generates exactly four
-specialized code paths (one per 16-bit level), each with the correct types, sizes,
-and control flow baked in.
+Iterators maintain a stack of (node, position) pairs to track the current path
+through the trie. Advancing to the next entry is amortized O(1): most advances
+are within a leaf's sorted array, with occasional stack pops/pushes at node
+boundaries.
 
 ---
 
-## 12. Memory Characteristics
+## 14. Performance Characteristics
 
-### Bytes per entry (benchmarked, uint64_t key, char value)
+### Memory (bytes/entry, `kntrie<uint64_t, char>`, benchmarked)
 
-| Pattern        | kntrie | std::map | std::unordered_map |
-|----------------|--------|----------|--------------------|
-| Random 100K    | 9.6    | 59.5     | 64.6               |
-| Sequential 100K| 1.2    | 62.2     | 64.6               |
-| Dense16 79K    | 1.5    | 61.9     | 64.0               |
-| Random 1M      | 9.5    | 63.7     | 64.5               |
+| Pattern         | kntrie | std::map | std::unordered_map | Ratio (map) |
+|-----------------|--------|----------|--------------------|-------------|
+| Random 100K     | 9.6    | 59.5     | 64.6               | 6.2×        |
+| Sequential 100K | 1.2    | 62.2     | 64.6               | 51.8×       |
+| Dense16 79K     | 1.5    | 61.9     | 64.0               | 41.3×       |
+| Random 1M       | 9.5    | 63.7     | 64.5               | 6.7×        |
 
-### Where the savings come from
+### Read latency (ns/lookup, `kntrie<uint64_t, uint64_t>`, 100K random keys)
 
-1. **No per-node pointers** — compact leaves store keys and values in flat arrays
-   with zero pointer overhead
-2. **Narrow suffix types** — at lower levels, keys are stored in 1–4 byte types
-   instead of always 8 bytes
-3. **Bitmap compression** — sparse 256-way nodes cost 32 bytes + 8 bytes per
-   occupied slot, not 2048 bytes for a full array
-4. **Skip compression** — common prefixes are stored once (8 bytes) instead of
-   repeated across thousands of entries
-5. **Inline values** — small values are stored directly, no heap pointer per entry
+| Container          | ns/read |
+|--------------------|---------|
+| kntrie             | 63      |
+| std::map           | 282     |
+| std::unordered_map | 23      |
+
+kntrie is 4.5× faster than std::map (no pointer chasing) and 2.7× slower than
+unordered_map (hash + single probe vs. multi-level trie descent). On sequential
+data, kntrie matches or beats unordered_map due to skip compression reducing
+effective depth to 1.
+
+### Where the density comes from
+
+1. **Flat sorted arrays** — compact leaves have zero per-node pointer overhead
+2. **Suffix narrowing** — keys stored in 1/2/4/8-byte types matched to remaining
+   bit width
+3. **Bitmap compression** — 32-byte bitmap + dense pointers vs. 2048-byte full arrays
+4. **Skip compression** — shared prefixes stored once (8 bytes) instead of replicated
+5. **Inline values** — trivially-copyable values ≤ 8 bytes stored directly, no
+   indirection
 
 ### Trade-offs
 
-- Insert is slower than hash maps (involves reallocation and copying of sorted arrays)
-- No iteration support currently (no iterator)
-- Delete is not implemented
-- Keys must be integral types
-
----
-
-## 13. Comparison with Other Structures
-
-| Property | kntrie | std::map (RB-tree) | std::unordered_map |
-|----------|--------|--------------------|--------------------|
-| Lookup complexity | O(1)* | O(log n) | O(1) amortized |
-| Lookup ns (100K random) | ~61 | ~274 | ~25 |
-| Memory/entry | 1–17B | 54–64B | 64–72B |
-| Cache behavior | Good (sequential scans) | Poor (pointer chasing) | Variable (hash chains) |
-| Ordered iteration | Possible† | Yes | No |
-| Key types | Integers | Any comparable | Any hashable |
-
-\* O(key_bits / 16) which is bounded by 4 for 64-bit keys — effectively constant.
-
-† The trie structure inherently stores keys in order, but an iterator is not yet
-implemented.
+- **Insert throughput** is lower than hash maps: each insert into a compact leaf
+  requires binary search, sorted-array shift, index rebuild, and potentially
+  reallocation. This is dominated by allocator cost at scale.
+- **Constant factors** on lookup are higher than hash maps for uniformly random keys,
+  where the trie's multi-level descent cannot be shortcut.
+- **Key type restriction** — keys must be integral. Extending to fixed-width byte
+  strings is architecturally possible but not implemented.
+- **Memory fragmentation** — node reallocation on every insert (to maintain sorted
+  flat arrays) creates allocator pressure. Custom arena/pool allocators via the ALLOC
+  parameter mitigate this.
