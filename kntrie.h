@@ -1,5 +1,5 @@
-#ifndef KNTRIE3_HPP
-#define KNTRIE3_HPP
+#ifndef KNTRIE_H
+#define KNTRIE_H
 
 #include <cstdint>
 #include <cstring>
@@ -11,7 +11,7 @@
 #include <cassert>
 #include <array>
 
-namespace kn3 {
+namespace gteitelbaum {
 
 // 256-bit bitmap operations
 struct Bitmap256 {
@@ -96,7 +96,7 @@ struct Bitmap256 {
 };
 
 template<typename KEY, typename VALUE, typename ALLOC = std::allocator<uint64_t>>
-class kntrie3 {
+class kntrie {
     static_assert(std::is_integral_v<KEY>, "KEY must be an integral type");
     
 public:
@@ -706,7 +706,7 @@ public:
     // Constructor / Destructor
     // ==========================================================================
     
-    kntrie3() : size_(0), alloc_() {
+    kntrie() : size_(0), alloc_() {
         root_ = alloc_node(leaf_compact_size_u64<static_cast<int>(key_bits)>(0, 0));
         NodeHeader* h = get_header(root_);
         h->count = 0;
@@ -714,12 +714,12 @@ public:
         h->set_leaf(true);
     }
     
-    ~kntrie3() {
+    ~kntrie() {
         remove_all();
     }
     
-    kntrie3(const kntrie3&) = delete;
-    kntrie3& operator=(const kntrie3&) = delete;
+    kntrie(const kntrie&) = delete;
+    kntrie& operator=(const kntrie&) = delete;
     
     [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
     [[nodiscard]] size_type size() const noexcept { return size_; }
@@ -2540,6 +2540,6 @@ private:
     }
 };
 
-} // namespace kn3
+} // namespace gteitelbaum
 
-#endif // KNTRIE3_HPP
+#endif // KNTRIE_H
