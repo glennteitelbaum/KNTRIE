@@ -1,4 +1,4 @@
-#include "kntrie_impl.hpp"
+#include "kntrie.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -59,18 +59,18 @@ static void print_row(const Result& r, const Result& base, size_t n) {
                 ins_rel, read_rel, mem_rel, ns_read);
 }
 
-static Result bench_kntrie3(const std::vector<uint64_t>& keys,
+static Result bench_kntrie(const std::vector<uint64_t>& keys,
                             const std::vector<uint64_t>& lookup_keys,
                             int read_iters) {
-    Result res{"kntrie3", 0, 0, 0};
-    kn3::kntrie3<uint64_t, uint64_t> trie;
+    Result res{"kntrie", 0, 0, 0};
+    gteitelbaum::kntrie<uint64_t, uint64_t> trie;
 
     double t0 = now_ms();
     for (auto k : keys) trie.insert(k, k);
     res.insert_ms = now_ms() - t0;
 
     if (trie.size() != keys.size())
-        std::fprintf(stderr, "kntrie3: size mismatch %zu vs %zu\n", trie.size(), keys.size());
+        std::fprintf(stderr, "kntrie: size mismatch %zu vs %zu\n", trie.size(), keys.size());
 
     res.memory_bytes = trie.memory_usage();
 
@@ -184,10 +184,10 @@ int main(int argc, char** argv) {
     std::vector<uint64_t> lookup_keys = keys;
     std::shuffle(lookup_keys.begin(), lookup_keys.end(), rng);
 
-    std::printf("=== kntrie3 benchmark ===\nN = %zu unique keys, pattern = %s, read_iters = %d\n\n",
+    std::printf("=== kntrie benchmark ===\nN = %zu unique keys, pattern = %s, read_iters = %d\n\n",
                 n, pattern.c_str(), read_iters);
 
-    Result r_trie = bench_kntrie3(keys, lookup_keys, read_iters);
+    Result r_trie = bench_kntrie(keys, lookup_keys, read_iters);
     Result r_map  = bench_stdmap(keys, lookup_keys, read_iters);
     Result r_umap = bench_unorderedmap(keys, lookup_keys, read_iters);
 
@@ -197,7 +197,7 @@ int main(int argc, char** argv) {
     print_row(r_umap, r_trie, n);
 
     std::printf("\nBytes/entry:\n");
-    std::printf("  kntrie3:            %6.1f\n", double(r_trie.memory_bytes) / n);
+    std::printf("  kntrie:            %6.1f\n", double(r_trie.memory_bytes) / n);
     std::printf("  std::map:           %6.1f\n", double(r_map.memory_bytes) / n);
     std::printf("  std::unordered_map: %6.1f\n", double(r_umap.memory_bytes) / n);
     return 0;
