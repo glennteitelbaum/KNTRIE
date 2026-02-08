@@ -151,7 +151,7 @@ private:
                            uint64_t skip_prefix, int skip_left) const noexcept
         requires (BITS == 16)
     {
-        if (h.is_leaf()) /* unpredictable */
+        if (h.is_leaf()) [[unlikely]]
             return CO::template find<16>(node, &h, ik);
         return find_in_split<16>(node, ik);
     }
@@ -173,7 +173,7 @@ private:
             if (key_chunk != sc) [[unlikely]] return nullptr;
             if (h.skip > 1) [[unlikely]] { skip_prefix = np; skip_left = h.skip - 1; }
             h.skip = 0;
-        } else if (h.is_leaf()) /* unpredictable */ {
+        } else if (h.is_leaf()) [[unlikely]] {
             return CO::template find<BITS>(node, &h, ik);
         } else {
             return find_in_split<BITS>(node, ik);
@@ -200,7 +200,7 @@ private:
             const uint64_t* bot = BO::template branchless_top_child<BITS>(node, ti);
 
             // One branch: leaf vs internal
-            if (BO::template is_top_entry_leaf<BITS>(node, ti)) /* unpredictable */ {
+            if (BO::template is_top_entry_leaf<BITS>(node, ti)) [[unlikely]] {
                 return BO::template find_in_bot_leaf<BITS>(bot, ik);
             }
 

@@ -27,7 +27,7 @@ struct IdxSearch {
     }
     static int subsearch(const K* s, int c, K key) noexcept {
         const K* p = s, *e = s + c;
-        while (p < e) { if (*p > key) break; p++; } /* unpredictable */
+        while (p < e) { if (*p > key) [[unlikely]] break; p++; }
         return static_cast<int>(p - s) - 1;
     }
     static int search(const K* start, int count, K key) noexcept {
