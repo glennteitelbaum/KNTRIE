@@ -5,117 +5,12 @@
 
 #include <cstdint>
 #include <cstring>
-#include <bit>
-#include <limits>
-#include <array>
 #include <algorithm>
 
 namespace kn3 {
 
 // ==========================================================================
-// Static Eytzinger Block Tables (compiled into .rodata)
-// ==========================================================================
-
-template<int H>
-struct EytzBlockTable {
-    static constexpr std::array<uint16_t, H> build() {
-        std::array<uint16_t, H> t{};
-        int si = 0;
-        auto f = [&](auto& self, int i) -> void {
-            if (i > H) return;
-            self(self, 2 * i);
-            t[i - 1] = static_cast<uint16_t>(si++);
-            self(self, 2 * i + 1);
-        };
-        f(f, 1);
-        return t;
-    }
-    static constexpr auto table = build();
-};
-
-inline const uint16_t* get_block_table(int H) noexcept {
-    static constexpr const uint16_t* tables[] = {
-        EytzBlockTable<1>::table.data(),
-        EytzBlockTable<2>::table.data(),
-        EytzBlockTable<4>::table.data(),
-        EytzBlockTable<8>::table.data(),
-        EytzBlockTable<16>::table.data(),
-        EytzBlockTable<32>::table.data(),
-        EytzBlockTable<64>::table.data(),
-        EytzBlockTable<128>::table.data(),
-        EytzBlockTable<256>::table.data(),
-        EytzBlockTable<512>::table.data(),
-    };
-    return tables[std::countr_zero(static_cast<unsigned>(H))];
-}
-
-// ==========================================================================
-// Search Strategy: Static Eytzinger (for u64 and u32 keys, BMAX=8)
-// ==========================================================================
-
-template<typename K>
-struct EytzSearch {
-    static constexpr int BMAX = 8;
-
-    static int compute_n(int count) noexcept {
-        if (count <= BMAX) return 0;
-        return static_cast<int>(std::bit_ceil(
-            static_cast<unsigned>((count + BMAX - 1) / BMAX)));
-    }
-    static int compute_bact(int count, int n) noexcept { return (count + n - 1) / n; }
-    static int extra(int count) noexcept {
-        int n = compute_n(count); return n == 0 ? 0 : 1 + n;
-    }
-    static void build(K* dest, const K* src, int count) noexcept {
-        int n = compute_n(count);
-        if (n == 0) { std::memcpy(dest, src, count * sizeof(K)); return; }
-        int Bact = compute_bact(count, n);
-        K* ek = dest + 1;
-        int si = 0;
-        auto f = [&](auto& self, int i) -> void {
-            if (i > n) return;
-            self(self, 2 * i);
-            int idx = si * Bact;
-            ek[i - 1] = (idx < count) ? src[idx] : std::numeric_limits<K>::max();
-            si++;
-            self(self, 2 * i + 1);
-        };
-        f(f, 1);
-        std::memcpy(dest + 1 + n, src, count * sizeof(K));
-    }
-    static int search(const K* start, int count, K key) noexcept {
-        if (count == 0) return -1;
-        int n = compute_n(count);
-        if (n == 0) {
-            for (int i = 0; i < count; ++i) {
-                if (start[i] == key) return i;
-                if (start[i] > key) return -1;
-            }
-            return -1;
-        }
-        int Bact = compute_bact(count, n);
-        const K* ek = start + 1;
-        const uint16_t* blk = get_block_table(n);
-        const K* keys = start + 1 + n;
-        unsigned i = 1; int block = 0;
-        while (i <= static_cast<unsigned>(n)) {
-            __builtin_prefetch(&ek[4 * i - 1], 0, 0);
-            bool r = (key >= ek[i - 1]);
-            block = r ? static_cast<int>(blk[i - 1]) : block;
-            i = 2 * i + (r ? 1 : 0);
-        }
-        int ks = block * Bact;
-        int kl = std::min(Bact, count - ks);
-        for (int j = 0; j < kl; ++j) {
-            if (keys[ks + j] == key) return ks + j;
-            if (keys[ks + j] > key) return -1;
-        }
-        return -1;
-    }
-};
-
-// ==========================================================================
-// Search Strategy: Old Idx (for u16 keys)
+// Search Strategy: IdxSearch  (idx1 → idx2 → key)
 // ==========================================================================
 
 template<typename K>
@@ -149,19 +44,6 @@ struct IdxSearch {
         if (idx >= 0 && keys[ks + idx] == key) return ks + idx;
         return -1;
     }
-};
-
-// ==========================================================================
-// Unified Search Dispatch
-// ==========================================================================
-
-template<typename K>
-struct KnSearch {
-    static constexpr bool use_eytz = sizeof(K) >= 4;
-    using impl = std::conditional_t<use_eytz, EytzSearch<K>, IdxSearch<K>>;
-    static int  extra(int c)                    noexcept { return impl::extra(c); }
-    static void build(K* d, const K* s, int c)  noexcept { impl::build(d, s, c); }
-    static int  search(const K* s, int c, K k)  noexcept { return impl::search(s, c, k); }
     static K*       keys_ptr(K* s, int c)       noexcept { return s + extra(c); }
     static const K* keys_ptr(const K* s, int c) noexcept { return s + extra(c); }
 };
@@ -184,7 +66,7 @@ struct CompactOps {
     template<int BITS>
     static constexpr size_t size_u64(size_t count, uint8_t skip) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        int ex = KnSearch<K>::extra(static_cast<int>(count));
+        int ex = IdxSearch<K>::extra(static_cast<int>(count));
         size_t sb = (static_cast<size_t>(ex) + count) * sizeof(K);
         sb = (sb + 7) & ~size_t{7};
         size_t vb = count * sizeof(VST);
@@ -213,7 +95,7 @@ struct CompactOps {
         if (count > 0) {
             std::memcpy(kd, sorted_keys, count * sizeof(K));
             std::memcpy(vd, values, count * sizeof(VST));
-            KnSearch<K>::build(search_start_<BITS>(node), kd, static_cast<int>(count));
+            IdxSearch<K>::build(search_start_<BITS>(node), kd, static_cast<int>(count));
         }
         return node;
     }
@@ -253,7 +135,7 @@ struct CompactOps {
                              uint64_t ik) noexcept {
         using K = typename suffix_traits<BITS>::type;
         K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
-        int idx = KnSearch<K>::search(search_start_<BITS>(node),
+        int idx = IdxSearch<K>::search(search_start_<BITS>(node),
                                        static_cast<int>(h->count), suffix);
         if (idx < 0) return nullptr;
         return VT::as_ptr(vals_<BITS>(node, h->count)[idx]);
@@ -296,7 +178,7 @@ struct CompactOps {
         VT::write_slot(&nv[ins], value);
         std::memcpy(nk + ins + 1, kd + ins, (h->count - ins) * sizeof(K));
         std::memcpy(nv + ins + 1, vd + ins, (h->count - ins) * sizeof(VST));
-        KnSearch<K>::build(search_start_<BITS>(nn), nk, static_cast<int>(nc));
+        IdxSearch<K>::build(search_start_<BITS>(nn), nk, static_cast<int>(nc));
 
         dealloc_node(alloc, node, size_u64<BITS>(h->count, h->skip));
         return {nn, true, false};
@@ -334,7 +216,7 @@ struct CompactOps {
         std::memcpy(nv, vd, idx * sizeof(VST));
         std::memcpy(nk + idx, kd + idx + 1, (nc - idx) * sizeof(K));
         std::memcpy(nv + idx, vd + idx + 1, (nc - idx) * sizeof(VST));
-        KnSearch<K>::build(search_start_<BITS>(nn), nk, static_cast<int>(nc));
+        IdxSearch<K>::build(search_start_<BITS>(nn), nk, static_cast<int>(nc));
 
         dealloc_node(alloc, node, size_u64<BITS>(count, h->skip));
         return {nn, true};
@@ -357,18 +239,18 @@ private:
     template<int BITS>
     static auto keys_data_(uint64_t* node, size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        return KnSearch<K>::keys_ptr(search_start_<BITS>(node), static_cast<int>(count));
+        return IdxSearch<K>::keys_ptr(search_start_<BITS>(node), static_cast<int>(count));
     }
     template<int BITS>
     static auto keys_data_(const uint64_t* node, size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        return KnSearch<K>::keys_ptr(search_start_<BITS>(node), static_cast<int>(count));
+        return IdxSearch<K>::keys_ptr(search_start_<BITS>(node), static_cast<int>(count));
     }
 
     template<int BITS>
     static VST* vals_(uint64_t* node, size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        int ex = KnSearch<K>::extra(static_cast<int>(count));
+        int ex = IdxSearch<K>::extra(static_cast<int>(count));
         size_t sb = (static_cast<size_t>(ex) + count) * sizeof(K);
         sb = (sb + 7) & ~size_t{7};
         return reinterpret_cast<VST*>(
@@ -377,7 +259,7 @@ private:
     template<int BITS>
     static const VST* vals_(const uint64_t* node, size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        int ex = KnSearch<K>::extra(static_cast<int>(count));
+        int ex = IdxSearch<K>::extra(static_cast<int>(count));
         size_t sb = (static_cast<size_t>(ex) + count) * sizeof(K);
         sb = (sb + 7) & ~size_t{7};
         return reinterpret_cast<const VST*>(

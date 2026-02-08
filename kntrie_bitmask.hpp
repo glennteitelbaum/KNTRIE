@@ -118,13 +118,7 @@ struct BitmaskOps {
             size_t vb = count * sizeof(VST); vb = (vb + 7) & ~size_t{7};
             return BITMAP256_U64 + vb / 8;
         } else {
-            constexpr int sb = BITS - 8;
-            using S = typename suffix_traits<sb>::type;
-            int ex = KnSearch<S>::extra(static_cast<int>(count));
-            size_t skb = (static_cast<size_t>(ex) + count) * sizeof(S);
-            skb = (skb + 7) & ~size_t{7};
-            size_t vb = count * sizeof(VST); vb = (vb + 7) & ~size_t{7};
-            return 1 + (skb + vb) / 8;  // 1 u64 for count
+            return CO::template size_u64<BITS - 8>(count, 0);
         }
     }
 
@@ -378,7 +372,7 @@ struct BitmaskOps {
     template<int BITS>
     static uint32_t bot_leaf_count(const uint64_t* bot) noexcept {
         if constexpr (BITS == 16) return bot_leaf_bm_(bot).popcount();
-        else return *reinterpret_cast<const uint32_t*>(bot);
+        else return get_header(bot)->count;
     }
 
     // ==================================================================
@@ -392,17 +386,9 @@ struct BitmaskOps {
             const Bitmap256& bm = bot_leaf_bm_(bot);
             if (!bm.has_bit(suffix)) return nullptr;
             int slot = bm.count_below(suffix);
-            return VT::as_ptr(bot_leaf_vals_<16>(bot, 0)[slot]);
+            return VT::as_ptr(bot_leaf_vals_16_(bot)[slot]);
         } else {
-            constexpr int sb = BITS - 8;
-            using S = typename suffix_traits<sb>::type;
-            S suffix = static_cast<S>(KOps::template extract_suffix<sb>(ik));
-            uint32_t count = bot_leaf_count<BITS>(bot);
-            int idx = KnSearch<S>::search(
-                bot_leaf_search_start_<BITS>(bot),
-                static_cast<int>(count), suffix);
-            if (idx < 0) return nullptr;
-            return VT::as_ptr(bot_leaf_vals_<BITS>(bot, count)[idx]);
+            return CO::template find<BITS - 8>(bot, get_header(bot), ik);
         }
     }
 
@@ -421,8 +407,10 @@ struct BitmaskOps {
             uint64_t* bot, uint64_t ik, VST value, ALLOC& alloc) {
         if constexpr (BITS == 16)
             return insert_bl_16_(bot, ik, value, alloc);
-        else
-            return insert_bl_list_<BITS>(bot, ik, value, alloc);
+        else {
+            auto r = CO::template insert<BITS - 8>(bot, get_header(bot), ik, value, alloc);
+            return {r.node, r.inserted, r.needs_split};
+        }
     }
 
     // ==================================================================
@@ -434,7 +422,7 @@ struct BitmaskOps {
         if constexpr (BITS == 16)
             return erase_bl_16_(bot, ik, alloc);
         else
-            return erase_bl_list_<BITS>(bot, ik, alloc);
+            return CO::template erase<BITS - 8>(bot, get_header(bot), ik, alloc);
     }
 
     // ==================================================================
@@ -443,22 +431,18 @@ struct BitmaskOps {
 
     template<int BITS>
     static uint64_t* make_single_bot_leaf(uint64_t ik, VST value, ALLOC& alloc) {
-        uint64_t* bot = alloc_node(alloc, bot_leaf_size_u64<BITS>(1));
         if constexpr (BITS == 16) {
+            uint64_t* bot = alloc_node(alloc, bot_leaf_size_u64<BITS>(1));
             uint8_t suffix = static_cast<uint8_t>(KOps::template extract_suffix<8>(ik));
             bot_leaf_bm_(bot).set_bit(suffix);
-            VT::write_slot(&bot_leaf_vals_<16>(bot, 1)[0], value);
+            VT::write_slot(&bot_leaf_vals_16_(bot)[0], value);
+            return bot;
         } else {
             constexpr int sb = BITS - 8;
             using S = typename suffix_traits<sb>::type;
             S suffix = static_cast<S>(KOps::template extract_suffix<sb>(ik));
-            set_bl_count_<BITS>(bot, 1);
-            auto* kd = bot_leaf_keys_data_<BITS>(bot, 1);
-            kd[0] = suffix;
-            VT::write_slot(&bot_leaf_vals_<BITS>(bot, 1)[0], value);
-            KnSearch<S>::build(bot_leaf_search_start_<BITS>(bot), kd, 1);
+            return CO::template make_leaf<sb>(&suffix, &value, 1, 0, 0, alloc);
         }
-        return bot;
     }
 
     // ==================================================================
@@ -469,25 +453,19 @@ struct BitmaskOps {
     static uint64_t* make_bot_leaf(
             const typename suffix_traits<(BITS > 16 ? BITS - 8 : 8)>::type* sorted_suffixes,
             const VST* values, uint32_t count, ALLOC& alloc) {
-        uint64_t* bot = alloc_node(alloc, bot_leaf_size_u64<BITS>(count));
         if constexpr (BITS == 16) {
+            uint64_t* bot = alloc_node(alloc, bot_leaf_size_u64<BITS>(count));
             auto& bm = bot_leaf_bm_(bot);
             bm = Bitmap256{};
             for (uint32_t i = 0; i < count; ++i) bm.set_bit(sorted_suffixes[i]);
-            auto* vd = bot_leaf_vals_<16>(bot, count);
+            auto* vd = bot_leaf_vals_16_(bot);
             for (uint32_t i = 0; i < count; ++i)
                 vd[bm.count_below(sorted_suffixes[i])] = values[i];
+            return bot;
         } else {
-            constexpr int sb = BITS - 8;
-            using S = typename suffix_traits<sb>::type;
-            set_bl_count_<BITS>(bot, count);
-            auto* kd = bot_leaf_keys_data_<BITS>(bot, count);
-            auto* vd = bot_leaf_vals_<BITS>(bot, count);
-            std::memcpy(kd, sorted_suffixes, count * sizeof(S));
-            std::memcpy(vd, values, count * sizeof(VST));
-            KnSearch<S>::build(bot_leaf_search_start_<BITS>(bot), kd, static_cast<int>(count));
+            return CO::template make_leaf<BITS - 8>(
+                sorted_suffixes, values, count, 0, 0, alloc);
         }
-        return bot;
     }
 
     // ==================================================================
@@ -499,17 +477,12 @@ struct BitmaskOps {
         if constexpr (BITS == 16) {
             const Bitmap256& bm = bot_leaf_bm_(bot);
             uint32_t count = bm.popcount();
-            const VST* vd = bot_leaf_vals_<16>(bot, count);
+            const VST* vd = bot_leaf_vals_16_(bot);
             int slot = 0;
             for (int i = bm.find_next_set(0); i >= 0; i = bm.find_next_set(i + 1))
                 cb(static_cast<uint8_t>(i), vd[slot++]);
         } else {
-            constexpr int sb = BITS - 8;
-            using S = typename suffix_traits<sb>::type;
-            uint32_t count = bot_leaf_count<BITS>(bot);
-            const S*   kd = bot_leaf_keys_data_<BITS>(bot, count);
-            const VST* vd = bot_leaf_vals_<BITS>(bot, count);
-            for (uint32_t i = 0; i < count; ++i) cb(kd[i], vd[i]);
+            CO::template for_each<BITS - 8>(bot, get_header(bot), std::forward<Fn>(cb));
         }
     }
 
@@ -519,18 +492,25 @@ struct BitmaskOps {
 
     template<int BITS>
     static void destroy_bot_leaf_and_dealloc(uint64_t* bot, ALLOC& alloc) {
-        uint32_t count = bot_leaf_count<BITS>(bot);
-        if constexpr (!VT::is_inline) {
-            auto* vd = bot_leaf_vals_<BITS>(bot, count);
-            for (uint32_t i = 0; i < count; ++i) VT::destroy(vd[i], alloc);
+        if constexpr (BITS == 16) {
+            uint32_t count = bot_leaf_count<BITS>(bot);
+            if constexpr (!VT::is_inline) {
+                auto* vd = bot_leaf_vals_16_(bot);
+                for (uint32_t i = 0; i < count; ++i) VT::destroy(vd[i], alloc);
+            }
+            dealloc_node(alloc, bot, bot_leaf_size_u64<16>(count));
+        } else {
+            CO::template destroy_and_dealloc<BITS - 8>(bot, alloc);
         }
-        dealloc_node(alloc, bot, bot_leaf_size_u64<BITS>(count));
     }
 
     // Deallocate without destroying values (ownership transferred)
     template<int BITS>
     static void dealloc_bot_leaf(uint64_t* bot, uint32_t count, ALLOC& alloc) noexcept {
-        dealloc_node(alloc, bot, bot_leaf_size_u64<BITS>(count));
+        if constexpr (BITS == 16)
+            dealloc_node(alloc, bot, bot_leaf_size_u64<16>(count));
+        else
+            dealloc_node(alloc, bot, CO::template size_u64<BITS - 8>(count, 0));
     }
 
     // ==================================================================
@@ -741,65 +721,12 @@ private:
         return *reinterpret_cast<const Bitmap256*>(b);
     }
 
-    template<int BITS>
-    static void set_bl_count_(uint64_t* b, uint32_t c) noexcept {
-        static_assert(BITS != 16);
-        *reinterpret_cast<uint32_t*>(b) = c;
+    // bot-leaf-16 values (after bitmap)
+    static VST* bot_leaf_vals_16_(uint64_t* b) noexcept {
+        return reinterpret_cast<VST*>(b + BITMAP256_U64);
     }
-    template<int BITS>
-    static auto bot_leaf_search_start_(uint64_t* b) noexcept {
-        static_assert(BITS > 16);
-        constexpr int sb = BITS - 8;
-        using S = typename suffix_traits<sb>::type;
-        return reinterpret_cast<S*>(b + 1);
-    }
-    template<int BITS>
-    static auto bot_leaf_search_start_(const uint64_t* b) noexcept {
-        static_assert(BITS > 16);
-        constexpr int sb = BITS - 8;
-        using S = typename suffix_traits<sb>::type;
-        return reinterpret_cast<const S*>(b + 1);
-    }
-    template<int BITS>
-    static auto bot_leaf_keys_data_(uint64_t* b, size_t count) noexcept {
-        static_assert(BITS > 16);
-        constexpr int sb = BITS - 8;
-        using S = typename suffix_traits<sb>::type;
-        return KnSearch<S>::keys_ptr(bot_leaf_search_start_<BITS>(b), static_cast<int>(count));
-    }
-    template<int BITS>
-    static auto bot_leaf_keys_data_(const uint64_t* b, size_t count) noexcept {
-        static_assert(BITS > 16);
-        constexpr int sb = BITS - 8;
-        using S = typename suffix_traits<sb>::type;
-        return KnSearch<S>::keys_ptr(bot_leaf_search_start_<BITS>(b), static_cast<int>(count));
-    }
-
-    template<int BITS>
-    static VST* bot_leaf_vals_(uint64_t* b, [[maybe_unused]] size_t count) noexcept {
-        if constexpr (BITS == 16) {
-            return reinterpret_cast<VST*>(b + BITMAP256_U64);
-        } else {
-            constexpr int sb = BITS - 8;
-            using S = typename suffix_traits<sb>::type;
-            int ex = KnSearch<S>::extra(static_cast<int>(count));
-            size_t skb = (static_cast<size_t>(ex) + count) * sizeof(S);
-            skb = (skb + 7) & ~size_t{7};
-            return reinterpret_cast<VST*>(reinterpret_cast<char*>(b + 1) + skb);
-        }
-    }
-    template<int BITS>
-    static const VST* bot_leaf_vals_(const uint64_t* b, [[maybe_unused]] size_t count) noexcept {
-        if constexpr (BITS == 16) {
-            return reinterpret_cast<const VST*>(b + BITMAP256_U64);
-        } else {
-            constexpr int sb = BITS - 8;
-            using S = typename suffix_traits<sb>::type;
-            int ex = KnSearch<S>::extra(static_cast<int>(count));
-            size_t skb = (static_cast<size_t>(ex) + count) * sizeof(S);
-            skb = (skb + 7) & ~size_t{7};
-            return reinterpret_cast<const VST*>(reinterpret_cast<const char*>(b + 1) + skb);
-        }
+    static const VST* bot_leaf_vals_16_(const uint64_t* b) noexcept {
+        return reinterpret_cast<const VST*>(b + BITMAP256_U64);
     }
 
     // --- bot-internal layout ---
@@ -834,7 +761,7 @@ private:
         uint8_t suffix = static_cast<uint8_t>(KOps::template extract_suffix<8>(ik));
         Bitmap256& bm = bot_leaf_bm_(bot);
         uint32_t count = bm.popcount();
-        VST* vd = bot_leaf_vals_<16>(bot, count);
+        VST* vd = bot_leaf_vals_16_(bot);
 
         if (bm.has_bit(suffix)) {
             int slot = bm.count_below(suffix);
@@ -847,50 +774,13 @@ private:
         uint64_t* nb = alloc_node(alloc, bot_leaf_size_u64<16>(nc));
         Bitmap256& nbm = bot_leaf_bm_(nb);
         nbm = bm; nbm.set_bit(suffix);
-        VST* nvd = bot_leaf_vals_<16>(nb, nc);
+        VST* nvd = bot_leaf_vals_16_(nb);
         int isl = nbm.count_below(suffix);
         std::memcpy(nvd, vd, isl * sizeof(VST));
         VT::write_slot(&nvd[isl], value);
         std::memcpy(nvd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
 
         dealloc_node(alloc, bot, bot_leaf_size_u64<16>(count));
-        return {nb, true, false};
-    }
-
-    template<int BITS>
-    static BotLeafInsertResult insert_bl_list_(
-            uint64_t* bot, uint64_t ik, VST value, ALLOC& alloc) {
-        static_assert(BITS > 16);
-        constexpr int sb = BITS - 8;
-        using S = typename suffix_traits<sb>::type;
-        S suffix = static_cast<S>(KOps::template extract_suffix<sb>(ik));
-        uint32_t count = bot_leaf_count<BITS>(bot);
-        S*   kd = bot_leaf_keys_data_<BITS>(bot, count);
-        VST* vd = bot_leaf_vals_<BITS>(bot, count);
-
-        int idx = binary_search_for_insert(kd, static_cast<size_t>(count), suffix);
-        if (idx >= 0) {
-            VT::destroy(vd[idx], alloc);
-            VT::write_slot(&vd[idx], value);
-            return {bot, false, false};
-        }
-        size_t ins = static_cast<size_t>(-(idx + 1));
-        if (count >= BOT_LEAF_MAX) return {bot, false, true};
-
-        uint32_t nc = count + 1;
-        uint64_t* nb = alloc_node(alloc, bot_leaf_size_u64<BITS>(nc));
-        set_bl_count_<BITS>(nb, nc);
-        S*   nk = bot_leaf_keys_data_<BITS>(nb, nc);
-        VST* nv = bot_leaf_vals_<BITS>(nb, nc);
-        std::memcpy(nk, kd, ins * sizeof(S));
-        std::memcpy(nv, vd, ins * sizeof(VST));
-        nk[ins] = suffix;
-        VT::write_slot(&nv[ins], value);
-        std::memcpy(nk + ins + 1, kd + ins, (count - ins) * sizeof(S));
-        std::memcpy(nv + ins + 1, vd + ins, (count - ins) * sizeof(VST));
-        KnSearch<S>::build(bot_leaf_search_start_<BITS>(nb), nk, static_cast<int>(nc));
-
-        dealloc_node(alloc, bot, bot_leaf_size_u64<BITS>(count));
         return {nb, true, false};
     }
 
@@ -904,7 +794,7 @@ private:
         if (!bm.has_bit(suffix)) return {bot, false};
         uint32_t count = bm.popcount();
         int slot = bm.count_below(suffix);
-        VT::destroy(bot_leaf_vals_<16>(bot, count)[slot], alloc);
+        VT::destroy(bot_leaf_vals_16_(bot)[slot], alloc);
 
         uint32_t nc = count - 1;
         if (nc == 0) {
@@ -914,8 +804,8 @@ private:
         uint64_t* nb = alloc_node(alloc, bot_leaf_size_u64<16>(nc));
         Bitmap256& nbm = bot_leaf_bm_(nb);
         nbm = bm; nbm.clear_bit(suffix);
-        const VST* ov = bot_leaf_vals_<16>(bot, count);
-        VST*       nv = bot_leaf_vals_<16>(nb, nc);
+        const VST* ov = bot_leaf_vals_16_(bot);
+        VST*       nv = bot_leaf_vals_16_(nb);
         std::memcpy(nv, ov, slot * sizeof(VST));
         std::memcpy(nv + slot, ov + slot + 1, (nc - slot) * sizeof(VST));
 
@@ -923,38 +813,6 @@ private:
         return {nb, true};
     }
 
-    template<int BITS>
-    static EraseResult erase_bl_list_(uint64_t* bot, uint64_t ik, ALLOC& alloc) {
-        static_assert(BITS > 16);
-        constexpr int sb = BITS - 8;
-        using S = typename suffix_traits<sb>::type;
-        S suffix = static_cast<S>(KOps::template extract_suffix<sb>(ik));
-        uint32_t count = bot_leaf_count<BITS>(bot);
-        S*   kd = bot_leaf_keys_data_<BITS>(bot, count);
-        VST* vd = bot_leaf_vals_<BITS>(bot, count);
-
-        int idx = binary_search_for_insert(kd, static_cast<size_t>(count), suffix);
-        if (idx < 0) return {bot, false};
-        VT::destroy(vd[idx], alloc);
-
-        uint32_t nc = count - 1;
-        if (nc == 0) {
-            dealloc_node(alloc, bot, bot_leaf_size_u64<BITS>(count));
-            return {nullptr, true};
-        }
-        uint64_t* nb = alloc_node(alloc, bot_leaf_size_u64<BITS>(nc));
-        set_bl_count_<BITS>(nb, nc);
-        S*   nk = bot_leaf_keys_data_<BITS>(nb, nc);
-        VST* nv = bot_leaf_vals_<BITS>(nb, nc);
-        std::memcpy(nk, kd, idx * sizeof(S));
-        std::memcpy(nv, vd, idx * sizeof(VST));
-        std::memcpy(nk + idx, kd + idx + 1, (nc - idx) * sizeof(S));
-        std::memcpy(nv + idx, vd + idx + 1, (nc - idx) * sizeof(VST));
-        KnSearch<S>::build(bot_leaf_search_start_<BITS>(nb), nk, static_cast<int>(nc));
-
-        dealloc_node(alloc, bot, bot_leaf_size_u64<BITS>(count));
-        return {nb, true};
-    }
 };
 
 } // namespace kn3
