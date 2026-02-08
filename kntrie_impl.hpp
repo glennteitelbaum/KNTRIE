@@ -173,38 +173,57 @@ private:
             if (key_chunk != sc) return nullptr;
             if (h.skip > 1) { skip_prefix = np; skip_left = h.skip - 1; }
             h.skip = 0;
-        } else if (h.is_leaf()) {
-            if (!h.is_split())
-                return CO::template find<BITS>(node, &h, ik);
-            return find_in_split<BITS>(node, ik);
+        } else if (!h.is_split()) {
+            // Compact leaf (is_leaf implied by !is_split at leaf level)
+            return CO::template find<BITS>(node, &h, ik);
         } else {
-            // Internal split — descend through top + bot_internal
+            // Split node (leaf or internal — branchless handles both)
             return find_in_split<BITS>(node, ik);
         }
 
         return find_impl<BITS - 16>(node, ik, h, skip_prefix, skip_left);
     }
 
-    // Find within a split node (leaf or internal)
+    // ==================================================================
+    // Find within a split node
+    //
+    // BITS > 16: branchless descent using sentinel children.
+    //   - branchless_top_child returns real bot or sentinel on miss.
+    //   - One unavoidable branch: leaf vs internal.
+    //   - Leaf path: find_in_bot_leaf (sentinel → count=0 → nullptr).
+    //   - Internal path: branchless_bot_child → recurse (sentinel → count=0 → nullptr).
+    //
+    // BITS == 16: no sentinel layout, uses branching lookup_top.
+    // ==================================================================
+
     template<int BITS>
     const VALUE* find_in_split(const uint64_t* node, uint64_t ik) const noexcept
         requires (BITS > 0)
     {
         uint8_t ti = KO::template extract_top8<BITS>(ik);
-        auto lk = BO::template lookup_top<BITS>(node, ti);
-        if (!lk.found) return nullptr;
-
-        if (lk.is_leaf)
-            return BO::template find_in_bot_leaf<BITS>(lk.bot, ik);
 
         if constexpr (BITS > 16) {
+            // Branchless top descent — sentinel on miss
+            const uint64_t* bot = BO::template branchless_top_child<BITS>(node, ti);
+
+            // One branch: leaf vs internal
+            // On miss, ti not in bot_is_internal_bm → is_top_entry_leaf returns true
+            // → find_in_bot_leaf on sentinel → count=0 → nullptr
+            if (BO::template is_top_entry_leaf<BITS>(node, ti)) {
+                return BO::template find_in_bot_leaf<BITS>(bot, ik);
+            }
+
+            // Internal: branchless bot descent — sentinel on miss
             uint8_t bi = KO::template extract_top8<BITS - 8>(ik);
-            auto blk = BO::lookup_bot_child(lk.bot, bi);
-            if (!blk.found) return nullptr;
-            NodeHeader ch = *get_header(blk.child);
-            return find_impl<BITS - 16>(blk.child, ik, ch, 0, 0);
+            const uint64_t* child = BO::branchless_bot_child(bot, bi);
+            NodeHeader ch = *get_header(child);
+            return find_impl<BITS - 16>(child, ik, ch, 0, 0);
+        } else {
+            // BITS == 16: terminal level, no sentinel slot — branching lookup
+            auto lk = BO::template lookup_top<BITS>(node, ti);
+            if (!lk.found) return nullptr;
+            return BO::template find_in_bot_leaf<BITS>(lk.bot, ik);
         }
-        return nullptr;
     }
 
     // ==================================================================
@@ -442,10 +461,10 @@ private:
 
         auto* new_bot = BO::make_bot_internal(indices, child_ptrs, n_children, alloc_);
 
-        // Update split-top
+        // Update split-top: set child and mark as internal
         BO::template set_top_child<BITS>(node, ts, new_bot);
-        BO::template mark_bot_not_leaf<BITS>(node, ti);
-        BO::template update_any_leaf_flag<BITS>(node);
+        BO::template mark_bot_internal<BITS>(node, ti);
+        BO::template update_internal_flag<BITS>(node);
         h->count++;
 
         // Deallocate old bot_leaf (values transferred, not destroyed)

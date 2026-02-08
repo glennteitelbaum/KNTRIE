@@ -38,6 +38,7 @@ struct NodeHeader {
 
     bool is_internal() const noexcept { return flags & 1; }
     bool is_split()    const noexcept { return flags & 2; }
+    bool is_leaf()     const noexcept { return !is_internal(); }
     void set_internal(bool v) noexcept { flags = (flags & ~1) | (v ? 1 : 0); }
     void set_split(bool v)    noexcept { flags = (flags & ~2) | (v ? 2 : 0); }
 };
@@ -59,7 +60,7 @@ inline constexpr size_t header_u64(uint8_t skip) noexcept { return skip > 0 ? 2 
 // No allocation on construction; never deallocated.
 // ==========================================================================
 
-inline constinit alignas(64) uint64_t SENTINEL_NODE[4] = {};
+alignas(64) inline constinit uint64_t SENTINEL_NODE[4] = {};
 
 // ==========================================================================
 // Suffix traits

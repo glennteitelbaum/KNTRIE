@@ -21,17 +21,12 @@ public:
     using reference       = value_type&;
     using const_reference = const value_type&;
 
-    // ======================================================================
-    // Iterator stubs  (not yet implemented)
-    // ======================================================================
-
     struct iterator {
         using iterator_category = std::bidirectional_iterator_tag;
         using value_type        = std::pair<const KEY, VALUE>;
         using difference_type   = std::ptrdiff_t;
         using pointer           = value_type*;
         using reference         = value_type&;
-
         iterator() = default;
         reference operator*()  const { throw std::logic_error("iterator not implemented"); }
         pointer   operator->() const { throw std::logic_error("iterator not implemented"); }
@@ -49,7 +44,6 @@ public:
         using difference_type   = std::ptrdiff_t;
         using pointer           = const value_type*;
         using reference         = const value_type&;
-
         const_iterator() = default;
         const_iterator(const iterator&) {}
         reference operator*()  const { throw std::logic_error("const_iterator not implemented"); }
@@ -62,64 +56,33 @@ public:
         bool operator!=(const const_iterator&) const noexcept { return false; }
     };
 
-    // ======================================================================
-    // Construction
-    // ======================================================================
-
     kntrie() = default;
     ~kntrie() = default;
     kntrie(const kntrie&) = delete;
     kntrie& operator=(const kntrie&) = delete;
 
-    // ======================================================================
-    // Capacity
-    // ======================================================================
-
     [[nodiscard]] bool      empty() const noexcept { return impl_.empty(); }
     [[nodiscard]] size_type size()  const noexcept { return impl_.size(); }
-
-    // ======================================================================
-    // Modifiers
-    // ======================================================================
 
     std::pair<iterator, bool> insert(const value_type& kv) {
         auto [ok, ins] = impl_.insert(kv.first, kv.second);
         return {iterator{}, ins};
     }
-
-    // Convenience: insert(key, value)
     std::pair<bool, bool> insert(const KEY& key, const VALUE& value) {
         return impl_.insert(key, value);
     }
-
     template<typename... Args>
     std::pair<iterator, bool> emplace(Args&&... args) {
-        // Minimal: construct a pair, forward to insert
         value_type kv(std::forward<Args>(args)...);
         return insert(kv);
     }
 
     void clear() noexcept { impl_.clear(); }
+    size_type erase(const KEY& key) { return impl_.erase(key) ? 1 : 0; }
 
-    size_type erase(const KEY& key) {
-        return impl_.erase(key) ? 1 : 0;
-    }
-
-    // ======================================================================
-    // Lookup
-    // ======================================================================
-
-    const VALUE* find_value(const KEY& key) const noexcept {
-        return impl_.find_value(key);
-    }
-
-    bool contains(const KEY& key) const noexcept {
-        return impl_.contains(key);
-    }
-
-    size_type count(const KEY& key) const noexcept {
-        return contains(key) ? 1 : 0;
-    }
+    const VALUE* find_value(const KEY& key) const noexcept { return impl_.find_value(key); }
+    bool contains(const KEY& key) const noexcept { return impl_.contains(key); }
+    size_type count(const KEY& key) const noexcept { return contains(key) ? 1 : 0; }
 
     VALUE& operator[](const KEY& key) {
         const VALUE* v = impl_.find_value(key);
@@ -127,24 +90,20 @@ public:
         impl_.insert(key, VALUE{});
         return const_cast<VALUE&>(*impl_.find_value(key));
     }
-
     const VALUE& at(const KEY& key) const {
         const VALUE* v = impl_.find_value(key);
         if (!v) throw std::out_of_range("kntrie::at: key not found");
         return *v;
     }
-
     VALUE& at(const KEY& key) {
         const VALUE* v = impl_.find_value(key);
         if (!v) throw std::out_of_range("kntrie::at: key not found");
         return const_cast<VALUE&>(*v);
     }
 
-    // Iterator-returning find (stub)
-    iterator       find(const KEY& /*key*/)       { return iterator{}; }
-    const_iterator find(const KEY& /*key*/) const { return const_iterator{}; }
+    iterator       find(const KEY&)       { return iterator{}; }
+    const_iterator find(const KEY&) const { return const_iterator{}; }
 
-    // Range stubs
     iterator       begin()        noexcept { return iterator{}; }
     iterator       end()          noexcept { return iterator{}; }
     const_iterator begin()  const noexcept { return const_iterator{}; }
@@ -152,24 +111,20 @@ public:
     const_iterator cbegin() const noexcept { return const_iterator{}; }
     const_iterator cend()   const noexcept { return const_iterator{}; }
 
-    iterator       lower_bound(const KEY& /*key*/)       { return iterator{}; }
-    const_iterator lower_bound(const KEY& /*key*/) const { return const_iterator{}; }
-    iterator       upper_bound(const KEY& /*key*/)       { return iterator{}; }
-    const_iterator upper_bound(const KEY& /*key*/) const { return const_iterator{}; }
+    iterator       lower_bound(const KEY&)       { return iterator{}; }
+    const_iterator lower_bound(const KEY&) const { return const_iterator{}; }
+    iterator       upper_bound(const KEY&)       { return iterator{}; }
+    const_iterator upper_bound(const KEY&) const { return const_iterator{}; }
 
     std::pair<iterator, iterator>             equal_range(const KEY& k)       { return {lower_bound(k), upper_bound(k)}; }
     std::pair<const_iterator, const_iterator> equal_range(const KEY& k) const { return {lower_bound(k), upper_bound(k)}; }
-
-    // ======================================================================
-    // Memory / debug
-    // ======================================================================
 
     size_t memory_usage() const noexcept { return impl_.memory_usage(); }
     auto   debug_stats() const noexcept  { return impl_.debug_stats(); }
     auto   debug_root_info() const       { return impl_.debug_root_info(); }
 
 private:
-    kn3::kntrie_impl<KEY, VALUE, ALLOC> impl_;
+    kn3::kntrie3<KEY, VALUE, ALLOC> impl_;
 };
 
 } // namespace gteitelbaum

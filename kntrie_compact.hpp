@@ -1,5 +1,7 @@
-#ifndef KNSEARCH_HPP
-#define KNSEARCH_HPP
+#ifndef KNTRIE_COMPACT_HPP
+#define KNTRIE_COMPACT_HPP
+
+#include "kntrie_support.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -385,4 +387,4 @@ private:
 
 } // namespace kn3
 
-#endif // KNSEARCH_HPP
+#endif // KNTRIE_COMPACT_HPP
