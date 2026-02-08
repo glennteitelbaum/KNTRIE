@@ -1,21 +1,14 @@
-#ifndef KNSEARCH_HPP
-#define KNSEARCH_HPP
+#ifndef KNTRIE_COMPACT_HPP
+#define KNTRIE_COMPACT_HPP
 
-#include <cstdint>
-#include <cstring>
-#include <bit>
+#include "kntrie_support.hpp"
 #include <limits>
-#include <array>
-#include <algorithm>
 
 namespace kn3 {
 
 // ==========================================================================
-// Static Eytzinger Block Tables (compiled into .rodata)
+// Static Eytzinger Block Tables  (compiled into .rodata)
 // ==========================================================================
-// For a complete binary tree of size H (power of 2), maps each Eytzinger
-// position to its in-order rank. Used to determine which sorted block
-// a key falls into during the tree walk.
 
 template<int H>
 struct EytzBlockTable {
@@ -34,101 +27,70 @@ struct EytzBlockTable {
     static constexpr auto table = build();
 };
 
-// Pre-instantiated tables for all power-of-2 sizes up to 512
-// (sufficient for BMAX=8 with count up to 4096)
 inline const uint16_t* get_block_table(int H) noexcept {
     static constexpr const uint16_t* tables[] = {
-        EytzBlockTable<1>::table.data(),
-        EytzBlockTable<2>::table.data(),
-        EytzBlockTable<4>::table.data(),
-        EytzBlockTable<8>::table.data(),
-        EytzBlockTable<16>::table.data(),
-        EytzBlockTable<32>::table.data(),
-        EytzBlockTable<64>::table.data(),
-        EytzBlockTable<128>::table.data(),
-        EytzBlockTable<256>::table.data(),
-        EytzBlockTable<512>::table.data(),
+        EytzBlockTable<1>::table.data(),   EytzBlockTable<2>::table.data(),
+        EytzBlockTable<4>::table.data(),   EytzBlockTable<8>::table.data(),
+        EytzBlockTable<16>::table.data(),  EytzBlockTable<32>::table.data(),
+        EytzBlockTable<64>::table.data(),  EytzBlockTable<128>::table.data(),
+        EytzBlockTable<256>::table.data(), EytzBlockTable<512>::table.data(),
     };
     return tables[std::countr_zero(static_cast<unsigned>(H))];
 }
 
 // ==========================================================================
-// Search Strategy: Static Eytzinger (for u64 and u32 keys, BMAX=8)
+// EytzSearch  (for u32 / u64 keys, BMAX = 8)
 // ==========================================================================
-// Layout: [pad:1 K-slot][ek:n K-slots][sorted_keys:count K-slots]
-//   - pad ensures ek[] starts at index 1 (1-indexed Eytzinger tree)
-//   - ek[] holds Eytzinger-ordered samples (every Bact-th key)
-//   - n = bit_ceil(ceil(count / BMAX)), always power of 2
-//   - Bact = ceil(count / n), varies in [BMAX/2+1, BMAX]
-//   - Block indices come from static .rodata table (no per-node eb[])
-//
-// Search: Eytzinger tree walk O(log n), then linear scan O(BMAX)
 
 template<typename K>
 struct EytzSearch {
-    static constexpr int BMAX = 8;  // One cache line of u64 or u32
+    static constexpr int BMAX = 8;
 
     static int compute_n(int count) noexcept {
         if (count <= BMAX) return 0;
-        int n_raw = (count + BMAX - 1) / BMAX;
-        return static_cast<int>(std::bit_ceil(static_cast<unsigned>(n_raw)));
+        return static_cast<int>(std::bit_ceil(
+            static_cast<unsigned>((count + BMAX - 1) / BMAX)));
     }
-
     static int compute_bact(int count, int n) noexcept {
         return (count + n - 1) / n;
     }
-
-    // Extra K-slots before the sorted keys
     static int extra(int count) noexcept {
         int n = compute_n(count);
-        return n == 0 ? 0 : 1 + n;  // [pad][ek:n]
+        return n == 0 ? 0 : 1 + n;
     }
 
-    // Build search overlay. dest has room for extra(count) + count K-slots.
-    // src_keys are count sorted keys.
-    static void build(K* dest, const K* src_keys, int count) noexcept {
+    static void build(K* dest, const K* src, int count) noexcept {
         int n = compute_n(count);
-        if (n == 0) {
-            std::memcpy(dest, src_keys, count * sizeof(K));
-            return;
-        }
+        if (n == 0) { std::memcpy(dest, src, count * sizeof(K)); return; }
         int Bact = compute_bact(count, n);
-
-        // Build Eytzinger tree of samples in dest[1..n]
         K* ek = dest + 1;
         int si = 0;
         auto f = [&](auto& self, int i) -> void {
             if (i > n) return;
             self(self, 2 * i);
             int idx = si * Bact;
-            ek[i - 1] = (idx < count) ? src_keys[idx] : std::numeric_limits<K>::max();
+            ek[i - 1] = (idx < count) ? src[idx] : std::numeric_limits<K>::max();
             si++;
             self(self, 2 * i + 1);
         };
         f(f, 1);
-
-        // Copy sorted keys after the Eytzinger tree
-        std::memcpy(dest + 1 + n, src_keys, count * sizeof(K));
+        std::memcpy(dest + 1 + n, src, count * sizeof(K));
     }
 
-    // Search for key. Returns index into sorted keys, or -1.
     static int search(const K* start, int count, K key) noexcept {
         int n = compute_n(count);
         if (n == 0) {
-            // Small count: linear scan
             for (int i = 0; i < count; ++i) {
                 if (start[i] == key) return i;
                 if (start[i] > key) return -1;
             }
             return -1;
         }
-
         int Bact = compute_bact(count, n);
         const K* ek = start + 1;
         const uint16_t* blk = get_block_table(n);
         const K* keys = start + 1 + n;
 
-        // Eytzinger tree walk
         unsigned i = 1;
         int block = 0;
         while (i <= static_cast<unsigned>(n)) {
@@ -137,8 +99,6 @@ struct EytzSearch {
             block = r ? static_cast<int>(blk[i - 1]) : block;
             i = 2 * i + (r ? 1 : 0);
         }
-
-        // Linear scan within block
         int ks = block * Bact;
         int kl = std::min(Bact, count - ks);
         for (int j = 0; j < kl; ++j) {
@@ -150,71 +110,35 @@ struct EytzSearch {
 };
 
 // ==========================================================================
-// Search Strategy: Old Idx (for u16 keys)
+// IdxSearch  (for u8 / u16 keys)
 // ==========================================================================
-// Layout: [idx1:i1 K-slots][idx2:i2 K-slots][sorted_keys:count K-slots]
-//   - idx1 samples every 256th key (only when count > 256)
-//   - idx2 samples every 16th key (only when count > 16)
-//   - Each level does a linear scan of ≤16 elements
-//
-// Search: 3-level linear scan, each ≤16 elements
 
 template<typename K>
 struct IdxSearch {
-    static int idx1_count(int count) noexcept {
-        return count > 256 ? (count + 255) / 256 : 0;
-    }
+    static int idx1_count(int c) noexcept { return c > 256 ? (c + 255) / 256 : 0; }
+    static int idx2_count(int c) noexcept { return c > 16  ? (c + 15)  / 16  : 0; }
+    static int extra(int c) noexcept { return idx1_count(c) + idx2_count(c); }
 
-    static int idx2_count(int count) noexcept {
-        return count > 16 ? (count + 15) / 16 : 0;
-    }
-
-    // Extra K-slots before the sorted keys
-    static int extra(int count) noexcept {
-        return idx1_count(count) + idx2_count(count);
-    }
-
-    // Build search indices. dest has room for extra(count) + count K-slots.
-    // src_keys are count sorted keys.
-    static void build(K* dest, const K* src_keys, int count) noexcept {
-        int i1 = idx1_count(count);
-        int i2 = idx2_count(count);
-
-        // Write idx1: every 256th key
-        for (int i = 0; i < i1; ++i) {
-            dest[i] = src_keys[i * 256];
-        }
-
-        // Write idx2: every 16th key
+    static void build(K* dest, const K* src, int count) noexcept {
+        int i1 = idx1_count(count), i2 = idx2_count(count);
+        for (int i = 0; i < i1; ++i) dest[i] = src[i * 256];
         K* d2 = dest + i1;
-        for (int i = 0; i < i2; ++i) {
-            d2[i] = src_keys[i * 16];
-        }
-
-        // Copy sorted keys
-        std::memcpy(d2 + i2, src_keys, count * sizeof(K));
+        for (int i = 0; i < i2; ++i) d2[i] = src[i * 16];
+        std::memcpy(d2 + i2, src, count * sizeof(K));
     }
 
-    // Linear scan of up to 16 elements, returns last index where *p <= key
-    static int subsearch(const K* start, int count, K key) noexcept {
-        const K* run = start;
-        const K* end = start + count;
-        do {
-            if (*run > key) break;
-            run++;
-        } while (run < end);
-        return static_cast<int>(run - start) - 1;
+    static int subsearch(const K* s, int c, K key) noexcept {
+        const K* p = s;
+        const K* e = s + c;
+        do { if (*p > key) break; p++; } while (p < e);
+        return static_cast<int>(p - s) - 1;
     }
 
-    // Search for key. Returns index into sorted keys, or -1.
     static int search(const K* start, int count, K key) noexcept {
-        int i1 = idx1_count(count);
-        int i2 = idx2_count(count);
+        int i1 = idx1_count(count), i2 = idx2_count(count);
         const K* d2 = start + i1;
         const K* keys = d2 + i2;
-
         int ks = 0;
-
         if (i1 > 0) {
             int b = subsearch(start, i1, key);
             if (b < 0) return -1;
@@ -222,63 +146,227 @@ struct IdxSearch {
             i2 = std::min(16, i2 - b * 16);
             ks = b * 256;
         }
-
         if (i2 > 0) {
             int b = subsearch(d2, i2, key);
             if (b < 0) return -1;
             ks += b * 16;
         }
-
         int kl = std::min(16, count - ks);
         int idx = subsearch(keys + ks, kl, key);
-        if (idx >= 0 && keys[ks + idx] == key) {
-            return ks + idx;
-        }
+        if (idx >= 0 && keys[ks + idx] == key) return ks + idx;
         return -1;
     }
 };
 
 // ==========================================================================
-// Unified Search Dispatch
+// KnSearch  – unified dispatch by key size
 // ==========================================================================
-// Selects strategy by key type:
-//   sizeof(K) >= 4 → EytzSearch (Static Eytzinger, BMAX=8)
-//   sizeof(K) <  4 → IdxSearch  (Old 2-level index)
 
 template<typename K>
 struct KnSearch {
-    static constexpr bool use_eytzinger = sizeof(K) >= 4;
+    static constexpr bool use_eytz = sizeof(K) >= 4;
+    using impl = std::conditional_t<use_eytz, EytzSearch<K>, IdxSearch<K>>;
 
-    using impl = std::conditional_t<use_eytzinger, EytzSearch<K>, IdxSearch<K>>;
+    static int  extra(int c)                           noexcept { return impl::extra(c); }
+    static void build(K* d, const K* s, int c)         noexcept { impl::build(d, s, c); }
+    static int  search(const K* s, int c, K k)         noexcept { return impl::search(s, c, k); }
+    static K*       keys_ptr(K* s, int c)              noexcept { return s + extra(c); }
+    static const K* keys_ptr(const K* s, int c)        noexcept { return s + extra(c); }
+};
 
-    // Number of extra K-sized slots before the sorted keys
-    static int extra(int count) noexcept {
-        return impl::extra(count);
+// ==========================================================================
+// CompactOps  – compact leaf node layout + operations
+//
+//   Layout: [header (1-2 u64)][search overlay: (extra+count) K-slots][values]
+//   search overlay = KnSearch format (Eytzinger or Idx depending on K size)
+// ==========================================================================
+
+template<typename KEY, typename VALUE, typename ALLOC>
+struct CompactOps {
+    using KOps = KeyOps<KEY>;
+    using VT   = ValueTraits<VALUE, ALLOC>;
+    using VST  = typename VT::slot_type;
+
+    // --- size in u64 ---
+
+    template<int BITS>
+    static constexpr size_t size_u64(size_t count, uint8_t skip) noexcept {
+        using K = typename suffix_traits<BITS>::type;
+        int ex = KnSearch<K>::extra(static_cast<int>(count));
+        size_t search_bytes = (static_cast<size_t>(ex) + count) * sizeof(K);
+        search_bytes = (search_bytes + 7) & ~size_t{7};
+        size_t val_bytes = count * sizeof(VST);
+        val_bytes = (val_bytes + 7) & ~size_t{7};
+        return header_u64(skip) + (search_bytes + val_bytes) / 8;
     }
 
-    // Build search overlay + copy sorted keys.
-    // dest must have room for extra(count) + count K-slots.
-    // src_keys: count sorted keys.
-    static void build(K* dest, const K* src_keys, int count) noexcept {
-        impl::build(dest, src_keys, count);
+    // --- accessors ---
+
+    // Start of search overlay (passed to KnSearch::search / ::build)
+    template<int BITS>
+    static auto search_start(uint64_t* node) noexcept {
+        using K = typename suffix_traits<BITS>::type;
+        return reinterpret_cast<K*>(node + header_u64(get_header(node)->skip));
+    }
+    template<int BITS>
+    static auto search_start(const uint64_t* node) noexcept {
+        using K = typename suffix_traits<BITS>::type;
+        return reinterpret_cast<const K*>(node + header_u64(get_header(node)->skip));
     }
 
-    // Search for key. start points to beginning of search region.
-    // Returns index into sorted keys (relative to keys_ptr), or -1.
-    static int search(const K* start, int count, K key) noexcept {
-        return impl::search(start, count, key);
+    // Pointer to the sorted keys within the search overlay
+    template<int BITS>
+    static auto keys_data(uint64_t* node, size_t count) noexcept {
+        using K = typename suffix_traits<BITS>::type;
+        return KnSearch<K>::keys_ptr(search_start<BITS>(node), static_cast<int>(count));
+    }
+    template<int BITS>
+    static auto keys_data(const uint64_t* node, size_t count) noexcept {
+        using K = typename suffix_traits<BITS>::type;
+        return KnSearch<K>::keys_ptr(search_start<BITS>(node), static_cast<int>(count));
     }
 
-    // Pointer to the start of sorted keys within the region
-    static K* keys_ptr(K* start, int count) noexcept {
-        return start + extra(count);
+    // Pointer to value slots
+    template<int BITS>
+    static VST* values(uint64_t* node, size_t count) noexcept {
+        using K = typename suffix_traits<BITS>::type;
+        int ex = KnSearch<K>::extra(static_cast<int>(count));
+        size_t search_bytes = (static_cast<size_t>(ex) + count) * sizeof(K);
+        search_bytes = (search_bytes + 7) & ~size_t{7};
+        return reinterpret_cast<VST*>(
+            reinterpret_cast<char*>(node + header_u64(get_header(node)->skip))
+            + search_bytes);
+    }
+    template<int BITS>
+    static const VST* values(const uint64_t* node, size_t count) noexcept {
+        using K = typename suffix_traits<BITS>::type;
+        int ex = KnSearch<K>::extra(static_cast<int>(count));
+        size_t search_bytes = (static_cast<size_t>(ex) + count) * sizeof(K);
+        search_bytes = (search_bytes + 7) & ~size_t{7};
+        return reinterpret_cast<const VST*>(
+            reinterpret_cast<const char*>(node + header_u64(get_header(node)->skip))
+            + search_bytes);
     }
 
-    static const K* keys_ptr(const K* start, int count) noexcept {
-        return start + extra(count);
+    // --- find ---
+
+    template<int BITS>
+    static const VALUE* find(const uint64_t* node, const NodeHeader* h, uint64_t ik) noexcept {
+        using K = typename suffix_traits<BITS>::type;
+        K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
+        const K*   ss  = search_start<BITS>(node);
+        const VST* val = values<BITS>(node, h->count);
+        int idx = KnSearch<K>::search(ss, static_cast<int>(h->count), suffix);
+        if (idx < 0) return nullptr;
+        return VT::as_ptr(val[idx]);
+    }
+
+    // --- insert ---
+
+    struct CompactInsertResult {
+        uint64_t* node;
+        bool inserted;
+        bool needs_split;   // compact node overflowed → caller must convert_to_split
+    };
+
+    template<int BITS>
+    static CompactInsertResult insert(uint64_t* node, NodeHeader* h,
+                                      uint64_t ik, VST value, ALLOC& alloc) {
+        using K = typename suffix_traits<BITS>::type;
+        K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
+
+        K*   kd = keys_data<BITS>(node, h->count);
+        VST* vd = values<BITS>(node, h->count);
+
+        int idx = binary_search_for_insert(kd, static_cast<size_t>(h->count), suffix);
+
+        if (idx >= 0) {
+            // key exists → update
+            VT::destroy(vd[idx], alloc);
+            VT::write_slot(&vd[idx], value);
+            return {node, false, false};
+        }
+
+        size_t ins = static_cast<size_t>(-(idx + 1));
+
+        if (h->count >= COMPACT_MAX)
+            return {node, false, true};   // needs split
+
+        // grow: allocate new node with one more entry
+        size_t nc = h->count + 1;
+        uint64_t* nn = alloc_node(alloc, size_u64<BITS>(nc, h->skip));
+        NodeHeader* nh = get_header(nn);
+        *nh = *h;
+        nh->count = static_cast<uint32_t>(nc);
+        if (h->skip > 0) set_prefix(nn, get_prefix(node));
+
+        K*   nk = keys_data<BITS>(nn, nc);
+        VST* nv = values<BITS>(nn, nc);
+
+        std::memcpy(nk,       kd,       ins * sizeof(K));
+        std::memcpy(nv,       vd,       ins * sizeof(VST));
+        nk[ins] = suffix;
+        VT::write_slot(&nv[ins], value);
+        std::memcpy(nk + ins + 1, kd + ins, (h->count - ins) * sizeof(K));
+        std::memcpy(nv + ins + 1, vd + ins, (h->count - ins) * sizeof(VST));
+
+        // build search overlay
+        KnSearch<K>::build(search_start<BITS>(nn), nk, static_cast<int>(nc));
+
+        dealloc_node(alloc, node, size_u64<BITS>(h->count, h->skip));
+        return {nn, true, false};
+    }
+
+    // --- erase ---
+    //
+    // Reallocates with count-1, copying all entries except the erased one.
+    // Returns {nullptr, true} when last entry removed (caller frees/replaces).
+    // Returns {node, false} when key not found.
+
+    template<int BITS>
+    static EraseResult erase(uint64_t* node, NodeHeader* h,
+                             uint64_t ik, ALLOC& alloc) {
+        using K = typename suffix_traits<BITS>::type;
+        K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
+
+        uint32_t count = h->count;
+        K*   kd = keys_data<BITS>(node, count);
+        VST* vd = values<BITS>(node, count);
+
+        int idx = binary_search_for_insert(kd, static_cast<size_t>(count), suffix);
+        if (idx < 0) return {node, false};
+
+        VT::destroy(vd[idx], alloc);
+
+        uint32_t nc = count - 1;
+        if (nc == 0) {
+            dealloc_node(alloc, node, size_u64<BITS>(count, h->skip));
+            return {nullptr, true};
+        }
+
+        // Allocate smaller node, copy everything except erased entry
+        uint64_t* nn = alloc_node(alloc, size_u64<BITS>(nc, h->skip));
+        auto* nh = get_header(nn);
+        *nh = *h;
+        nh->count = nc;
+        if (h->skip > 0) set_prefix(nn, get_prefix(node));
+
+        K*   nk = keys_data<BITS>(nn, nc);
+        VST* nv = values<BITS>(nn, nc);
+
+        size_t pos = static_cast<size_t>(idx);
+        std::memcpy(nk,       kd,         pos * sizeof(K));
+        std::memcpy(nv,       vd,         pos * sizeof(VST));
+        std::memcpy(nk + pos, kd + pos + 1, (nc - pos) * sizeof(K));
+        std::memcpy(nv + pos, vd + pos + 1, (nc - pos) * sizeof(VST));
+
+        KnSearch<K>::build(search_start<BITS>(nn), nk, static_cast<int>(nc));
+
+        dealloc_node(alloc, node, size_u64<BITS>(count, h->skip));
+        return {nn, true};
     }
 };
 
 } // namespace kn3
 
-#endif // KNSEARCH_HPP
+#endif // KNTRIE_COMPACT_HPP

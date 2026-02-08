@@ -22,13 +22,11 @@ static double now_ms() {
     return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
 }
 
-// Prevent the compiler from optimising away a value
 template<typename T>
 static void do_not_optimize(T const& val) {
     asm volatile("" : : "r,m"(val) : "memory");
 }
 
-// Estimate RSS via /proc/self/statm (Linux-specific, bytes)
 static size_t rss_bytes() {
     FILE* f = std::fopen("/proc/self/statm", "r");
     if (!f) return 0;
@@ -46,7 +44,7 @@ struct Result {
     const char* name;
     double insert_ms;
     double read_ms;
-    size_t memory_bytes;   // self-reported or RSS delta
+    size_t memory_bytes;
 };
 
 static void print_header() {
@@ -80,22 +78,18 @@ static Result bench_kntrie3(const std::vector<uint64_t>& keys,
 
     kn3::kntrie3<uint64_t, uint64_t> trie;
 
-    // Insert
     double t0 = now_ms();
     for (auto k : keys)
         trie.insert(k, k);
     res.insert_ms = now_ms() - t0;
 
-    // Verify size
     if (trie.size() != keys.size()) {
         std::fprintf(stderr, "kntrie3: size mismatch %zu vs %zu\n",
                      trie.size(), keys.size());
     }
 
-    // Memory (self-reported)
     res.memory_bytes = trie.memory_usage();
 
-    // Read
     uint64_t checksum = 0;
     double t1 = now_ms();
     for (int iter = 0; iter < read_iters; ++iter) {
@@ -124,7 +118,6 @@ static Result bench_stdmap(const std::vector<uint64_t>& keys,
     res.insert_ms = now_ms() - t0;
 
     size_t rss1 = rss_bytes();
-    // Rough estimate: RSS delta or node-based estimate
     res.memory_bytes = (rss1 > rss0) ? (rss1 - rss0) : (m.size() * 72);
 
     uint64_t checksum = 0;
@@ -196,7 +189,6 @@ int main(int argc, char** argv) {
     int read_iters = 0;
     if (argc >= 4) read_iters = std::atoi(argv[3]);
 
-    // Auto-tune read iterations so we get ~500ms of read time
     if (read_iters <= 0) {
         if      (n <= 1000)    read_iters = 5000;
         else if (n <= 10000)   read_iters = 500;
@@ -205,35 +197,28 @@ int main(int argc, char** argv) {
         else                   read_iters = 1;
     }
 
-    // Generate keys
     std::vector<uint64_t> keys(n);
     std::mt19937_64 rng(42);
 
     if (pattern == "sequential") {
         std::iota(keys.begin(), keys.end(), 0ULL);
     } else if (pattern == "dense16") {
-        // Keys clustered in 16-bit range (exercises skip compression)
         for (size_t i = 0; i < n; ++i)
             keys[i] = 0x123400000000ULL + (rng() % (n * 2));
     } else if (pattern == "sparse") {
-        // Very sparse across 64-bit space
         for (size_t i = 0; i < n; ++i)
             keys[i] = rng();
     } else {
-        // random (default): uniform random but deduplicated
         for (size_t i = 0; i < n; ++i)
             keys[i] = rng();
     }
 
-    // Deduplicate
     std::sort(keys.begin(), keys.end());
     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
     n = keys.size();
 
-    // Shuffle for insertion order
     std::shuffle(keys.begin(), keys.end(), rng);
 
-    // Lookup keys: same keys but in a different random order
     std::vector<uint64_t> lookup_keys = keys;
     std::shuffle(lookup_keys.begin(), lookup_keys.end(), rng);
 
@@ -241,12 +226,10 @@ int main(int argc, char** argv) {
     std::printf("N = %zu unique keys, pattern = %s, read_iters = %d\n\n",
                 n, pattern.c_str(), read_iters);
 
-    // Run benchmarks (kntrie3 first so its RSS isn't polluted)
     Result r_trie   = bench_kntrie3(keys, lookup_keys, read_iters);
     Result r_map    = bench_stdmap(keys, lookup_keys, read_iters);
     Result r_umap   = bench_unorderedmap(keys, lookup_keys, read_iters);
 
-    // Print results with kntrie3 as baseline (ratio column)
     print_header();
     print_row(r_trie, r_trie, n);
     print_row(r_map,  r_trie, n);
