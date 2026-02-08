@@ -59,9 +59,10 @@ static void print_row(const Result& r, const Result& base, size_t n) {
                 ins_rel, read_rel, mem_rel, ns_read);
 }
 
+using LookupRounds = std::vector<std::vector<uint64_t>>;
+
 static Result bench_kntrie(const std::vector<uint64_t>& keys,
-                            const std::vector<uint64_t>& lookup_keys,
-                            int read_iters) {
+                            const LookupRounds& rounds) {
     Result res{"kntrie", 0, 0, 0};
     gteitelbaum::kntrie<uint64_t, uint64_t> trie;
 
@@ -76,20 +77,19 @@ static Result bench_kntrie(const std::vector<uint64_t>& keys,
 
     uint64_t checksum = 0;
     double t1 = now_ms();
-    for (int iter = 0; iter < read_iters; ++iter) {
-        for (auto k : lookup_keys) {
+    for (auto& lk : rounds) {
+        for (auto k : lk) {
             auto* v = trie.find_value(k);
             checksum += v ? *v : 0;
         }
     }
-    res.read_ms = (now_ms() - t1) / read_iters;
+    res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
     do_not_optimize(checksum);
     return res;
 }
 
 static Result bench_stdmap(const std::vector<uint64_t>& keys,
-                           const std::vector<uint64_t>& lookup_keys,
-                           int read_iters) {
+                           const LookupRounds& rounds) {
     Result res{"std::map", 0, 0, 0};
     size_t rss0 = rss_bytes();
     std::map<uint64_t, uint64_t> m;
@@ -103,20 +103,19 @@ static Result bench_stdmap(const std::vector<uint64_t>& keys,
 
     uint64_t checksum = 0;
     double t1 = now_ms();
-    for (int iter = 0; iter < read_iters; ++iter) {
-        for (auto k : lookup_keys) {
+    for (auto& lk : rounds) {
+        for (auto k : lk) {
             auto it = m.find(k);
             checksum += (it != m.end()) ? it->second : 0;
         }
     }
-    res.read_ms = (now_ms() - t1) / read_iters;
+    res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
     do_not_optimize(checksum);
     return res;
 }
 
 static Result bench_unorderedmap(const std::vector<uint64_t>& keys,
-                                 const std::vector<uint64_t>& lookup_keys,
-                                 int read_iters) {
+                                 const LookupRounds& rounds) {
     Result res{"std::unordered_map", 0, 0, 0};
     size_t rss0 = rss_bytes();
     std::unordered_map<uint64_t, uint64_t> m;
@@ -131,13 +130,13 @@ static Result bench_unorderedmap(const std::vector<uint64_t>& keys,
 
     uint64_t checksum = 0;
     double t1 = now_ms();
-    for (int iter = 0; iter < read_iters; ++iter) {
-        for (auto k : lookup_keys) {
+    for (auto& lk : rounds) {
+        for (auto k : lk) {
             auto it = m.find(k);
             checksum += (it != m.end()) ? it->second : 0;
         }
     }
-    res.read_ms = (now_ms() - t1) / read_iters;
+    res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
     do_not_optimize(checksum);
     return res;
 }
@@ -170,8 +169,6 @@ int main(int argc, char** argv) {
     } else if (pattern == "dense16") {
         for (size_t i = 0; i < n; ++i)
             keys[i] = 0x123400000000ULL + (rng() % (n * 2));
-    } else if (pattern == "sparse") {
-        for (size_t i = 0; i < n; ++i) keys[i] = rng();
     } else {
         for (size_t i = 0; i < n; ++i) keys[i] = rng();
     }
@@ -181,15 +178,19 @@ int main(int argc, char** argv) {
     n = keys.size();
     std::shuffle(keys.begin(), keys.end(), rng);
 
-    std::vector<uint64_t> lookup_keys = keys;
-    std::shuffle(lookup_keys.begin(), lookup_keys.end(), rng);
+    // Pre-generate all lookup rounds — each independently shuffled
+    LookupRounds rounds(read_iters);
+    for (int i = 0; i < read_iters; ++i) {
+        rounds[i] = keys;
+        std::shuffle(rounds[i].begin(), rounds[i].end(), rng);
+    }
 
     std::printf("=== kntrie benchmark ===\nN = %zu unique keys, pattern = %s, read_iters = %d\n\n",
                 n, pattern.c_str(), read_iters);
 
-    Result r_trie = bench_kntrie(keys, lookup_keys, read_iters);
-    Result r_map  = bench_stdmap(keys, lookup_keys, read_iters);
-    Result r_umap = bench_unorderedmap(keys, lookup_keys, read_iters);
+    Result r_trie = bench_kntrie(keys, rounds);
+    Result r_map  = bench_stdmap(keys, rounds);
+    Result r_umap = bench_unorderedmap(keys, rounds);
 
     print_header();
     print_row(r_trie, r_trie, n);

@@ -26,7 +26,7 @@ struct Bitmap256 {
     bool find_slot(uint8_t index, int& slot) const noexcept {
         const int w = index >> 6, b = index & 63;
         uint64_t before = words[w] << (63 - b);
-        if (!(before & (1ULL << 63))) return false;
+        if (!(before & (1ULL << 63))) [[unlikely]] return false;
         int pc0 = std::popcount(words[0]);
         int pc1 = std::popcount(words[1]);
         int pc2 = std::popcount(words[2]);
@@ -142,7 +142,7 @@ struct BitmaskOps {
         const Bitmap256& tbm = top_bitmap_(node);
         int slot;
         bool found = tbm.find_slot(ti, slot);
-        if (!found) return {nullptr, -1, false, false};
+        if (!found) [[unlikely]] return {nullptr, -1, false, false};
 
         auto* bot = reinterpret_cast<uint64_t*>(top_real_children_<BITS>(node)[slot]);
         bool is_leaf;
@@ -368,7 +368,7 @@ struct BitmaskOps {
         if constexpr (BITS == 16) {
             uint8_t suffix = static_cast<uint8_t>(KOps::template extract_suffix<8>(ik));
             const Bitmap256& bm = bot_leaf_bm_(bot);
-            if (!bm.has_bit(suffix)) return nullptr;
+            if (!bm.has_bit(suffix)) [[unlikely]] return nullptr;
             int slot = bm.count_below(suffix);
             return VT::as_ptr(bot_leaf_vals_16_(bot)[slot]);
         } else {

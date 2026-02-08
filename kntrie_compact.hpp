@@ -27,21 +27,22 @@ struct IdxSearch {
     }
     static int subsearch(const K* s, int c, K key) noexcept {
         const K* p = s, *e = s + c;
-        do { if (*p > key) break; p++; } while (p < e);
+        while (p < e) { if (*p > key) break; p++; } /* unpredictable */
         return static_cast<int>(p - s) - 1;
     }
     static int search(const K* start, int count, K key) noexcept {
-        if (count == 0) return -1;
         int i1 = idx1_count(count), i2 = idx2_count(count);
         const K* d2 = start + i1; const K* keys = d2 + i2;
         int ks = 0;
-        if (i1 > 0) { int b = subsearch(start, i1, key); if (b < 0) return -1;
+        if (i1 > 0) [[unlikely]] { int b = subsearch(start, i1, key);
+            if (b < 0) [[unlikely]] return -1;
             d2 += b * 16; i2 = std::min(16, i2 - b * 16); ks = b * 256; }
-        if (i2 > 0) { int b = subsearch(d2, i2, key); if (b < 0) return -1;
+        if (i2 > 0) [[unlikely]] { int b = subsearch(d2, i2, key);
+            if (b < 0) [[unlikely]] return -1;
             ks += b * 16; }
         int kl = std::min(16, count - ks);
         int idx = subsearch(keys + ks, kl, key);
-        if (idx >= 0 && keys[ks + idx] == key) return ks + idx;
+        if (idx >= 0 && keys[ks + idx] == key) [[likely]] return ks + idx;
         return -1;
     }
     static K*       keys_ptr(K* s, int c)       noexcept { return s + extra(c); }
@@ -140,7 +141,7 @@ struct CompactOps {
         K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
         int idx = IdxSearch<K>::search(search_start_<BITS>(node),
                                        static_cast<int>(h->entries), suffix);
-        if (idx < 0) return nullptr;
+        if (idx < 0) [[unlikely]] return nullptr;
         return VT::as_ptr(vals_<BITS>(node, h->entries)[idx]);
     }
 

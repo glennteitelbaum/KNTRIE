@@ -151,7 +151,7 @@ private:
                            uint64_t skip_prefix, int skip_left) const noexcept
         requires (BITS == 16)
     {
-        if (h.is_leaf())
+        if (h.is_leaf()) /* unpredictable */
             return CO::template find<16>(node, &h, ik);
         return find_in_split<16>(node, ik);
     }
@@ -163,17 +163,17 @@ private:
     {
         uint16_t key_chunk = KO::template extract_top16<BITS>(ik);
 
-        if (skip_left > 0) {
+        if (skip_left > 0) [[unlikely]] {
             uint16_t sc = KO::get_skip_chunk(skip_prefix, h.skip, skip_left);
-            if (key_chunk != sc) return nullptr;
+            if (key_chunk != sc) [[unlikely]] return nullptr;
             skip_left--;
-        } else if (h.skip >= 1) {
+        } else if (h.skip >= 1) [[unlikely]] {
             uint64_t np = get_prefix(node);
             uint16_t sc = KO::get_skip_chunk(np, h.skip, h.skip);
-            if (key_chunk != sc) return nullptr;
-            if (h.skip > 1) { skip_prefix = np; skip_left = h.skip - 1; }
+            if (key_chunk != sc) [[unlikely]] return nullptr;
+            if (h.skip > 1) [[unlikely]] { skip_prefix = np; skip_left = h.skip - 1; }
             h.skip = 0;
-        } else if (h.is_leaf()) {
+        } else if (h.is_leaf()) /* unpredictable */ {
             return CO::template find<BITS>(node, &h, ik);
         } else {
             return find_in_split<BITS>(node, ik);
@@ -200,7 +200,7 @@ private:
             const uint64_t* bot = BO::template branchless_top_child<BITS>(node, ti);
 
             // One branch: leaf vs internal
-            if (BO::template is_top_entry_leaf<BITS>(node, ti)) {
+            if (BO::template is_top_entry_leaf<BITS>(node, ti)) /* unpredictable */ {
                 return BO::template find_in_bot_leaf<BITS>(bot, ik);
             }
 
@@ -212,7 +212,7 @@ private:
         } else {
             // BITS == 16: terminal level, no sentinel slot — branching lookup
             auto lk = BO::template lookup_top<BITS>(node, ti);
-            if (!lk.found) return nullptr;
+            if (!lk.found) [[unlikely]] return nullptr;
             return BO::template find_in_bot_leaf<BITS>(lk.bot, ik);
         }
     }
