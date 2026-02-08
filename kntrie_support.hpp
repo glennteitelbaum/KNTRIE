@@ -23,18 +23,23 @@ inline constexpr size_t BOT_LEAF_MAX  = 4096;
 
 // ==========================================================================
 // Node Header  (8 bytes; prefix in node[1] when skip > 0)
+//
+// flags bit 0: is_internal  (0 = leaf/compact, 1 = internal)
+// flags bit 1: is_split     (0 = compact,      1 = split/bitmask)
+//
+// Zeroed header → leaf compact with count=0 (sentinel-compatible)
 // ==========================================================================
 
 struct NodeHeader {
     uint32_t count;
     uint16_t top_count;
     uint8_t  skip;
-    uint8_t  flags;       // bit 0: is_leaf, bit 1: is_split
+    uint8_t  flags;
 
-    bool is_leaf()  const noexcept { return flags & 1; }
-    bool is_split() const noexcept { return flags & 2; }
-    void set_leaf(bool v)  noexcept { flags = (flags & ~1) | (v ? 1 : 0); }
-    void set_split(bool v) noexcept { flags = (flags & ~2) | (v ? 2 : 0); }
+    bool is_internal() const noexcept { return flags & 1; }
+    bool is_split()    const noexcept { return flags & 2; }
+    void set_internal(bool v) noexcept { flags = (flags & ~1) | (v ? 1 : 0); }
+    void set_split(bool v)    noexcept { flags = (flags & ~2) | (v ? 2 : 0); }
 };
 static_assert(sizeof(NodeHeader) == 8);
 
@@ -47,7 +52,17 @@ inline void      set_prefix(uint64_t* n, uint64_t p)   noexcept { n[1] = p; }
 inline constexpr size_t header_u64(uint8_t skip) noexcept { return skip > 0 ? 2 : 1; }
 
 // ==========================================================================
-// Suffix traits  – storage type for a given bit-width
+// Global sentinel — zeroed block, valid as:
+//   - Compact leaf (count=0, flags=0 → not internal, not split)
+//   - Bot-leaf BITS==16 (bitmap all zeros → no entries)
+//   - Bot-leaf BITS>16  (count u32 = 0 → no entries)
+// No allocation on construction; never deallocated.
+// ==========================================================================
+
+inline constinit alignas(64) uint64_t SENTINEL_NODE[4] = {};
+
+// ==========================================================================
+// Suffix traits
 // ==========================================================================
 
 template<int BITS>
@@ -59,7 +74,7 @@ struct suffix_traits {
 };
 
 // ==========================================================================
-// Key operations  – conversion + bit extraction
+// Key operations
 // ==========================================================================
 
 template<typename KEY>
@@ -68,8 +83,6 @@ struct KeyOps {
 
     static constexpr bool   is_signed = std::is_signed_v<KEY>;
     static constexpr size_t key_bits  = sizeof(KEY) * 8;
-
-    // --- key ↔ internal (left-aligned 64-bit) ---
 
     static constexpr uint64_t to_internal(KEY k) noexcept {
         uint64_t r;
@@ -88,8 +101,6 @@ struct KeyOps {
         return static_cast<KEY>(ik);
     }
 
-    // --- extract top 8 bits of the BITS-wide portion ---
-
     template<int BITS>
     static constexpr uint8_t extract_top8(uint64_t ik) noexcept {
         static_assert(BITS >= 8 && BITS <= 64);
@@ -100,16 +111,12 @@ struct KeyOps {
         }
     }
 
-    // --- extract top 16 bits of the BITS-wide portion ---
-
     template<int BITS>
     static constexpr uint16_t extract_top16(uint64_t ik) noexcept {
         static_assert(BITS >= 16 && BITS <= 64);
         constexpr int shift = 64 - static_cast<int>(key_bits) + BITS - 16;
         return static_cast<uint16_t>((ik >> shift) & 0xFFFF);
     }
-
-    // --- full suffix (all BITS) ---
 
     template<int BITS>
     static constexpr uint64_t extract_suffix(uint64_t ik) noexcept {
@@ -122,8 +129,6 @@ struct KeyOps {
         }
     }
 
-    // --- prefix (top skip*16 bits of the BITS-wide portion) ---
-
     template<int BITS>
     static constexpr uint64_t extract_prefix(uint64_t ik, int skip) noexcept {
         if constexpr (BITS > static_cast<int>(key_bits)) return 0;
@@ -135,15 +140,13 @@ struct KeyOps {
         }
     }
 
-    // --- skip-chunk accessor ---
-
     static constexpr uint16_t get_skip_chunk(uint64_t prefix, int /*skip*/, int skip_left) noexcept {
         return static_cast<uint16_t>((prefix >> ((skip_left - 1) * 16)) & 0xFFFF);
     }
 };
 
 // ==========================================================================
-// Value traits  – inline vs heap-allocated storage
+// Value traits
 // ==========================================================================
 
 template<typename VALUE, typename ALLOC>
@@ -201,7 +204,7 @@ inline void dealloc_node(ALLOC& a, uint64_t* p, size_t u64_count) noexcept {
 }
 
 // ==========================================================================
-// Insert result  (used across compact / bitmask / impl)
+// Insert / Erase result types
 // ==========================================================================
 
 struct InsertResult {
@@ -210,12 +213,12 @@ struct InsertResult {
 };
 
 struct EraseResult {
-    uint64_t* node;   // replacement node (nullptr = node removed entirely)
+    uint64_t* node;
     bool erased;
 };
 
 // ==========================================================================
-// binary_search_for_insert  – returns index if found, else -(insertion_point+1)
+// binary_search_for_insert
 // ==========================================================================
 
 template<typename K>
