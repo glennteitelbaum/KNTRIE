@@ -24,23 +24,31 @@ inline constexpr size_t BOT_LEAF_MAX  = 4096;
 // ==========================================================================
 // Node Header  (8 bytes; prefix in node[1] when skip > 0)
 //
-// flags bit 0: is_internal  (0 = leaf/compact, 1 = internal)
-// flags bit 1: is_split     (0 = compact,      1 = split/bitmask)
+// flags bit 0: 0 = leaf (compact), 1 = bitmask
 //
-// Zeroed header → leaf compact with count=0 (sentinel-compatible)
+// Zeroed header → compact leaf with entries=0 (sentinel-compatible)
 // ==========================================================================
 
 struct NodeHeader {
-    uint32_t count;
-    uint16_t top_count;
+    uint16_t entries;      // compact: k/v count; bitmask: child count
+    uint16_t descendants;  // total k/v pairs in subtree, capped at DESC_CAP
+    uint16_t alloc_u64;    // allocation size in u64s
     uint8_t  skip;
     uint8_t  flags;
 
-    bool is_internal() const noexcept { return flags & 1; }
-    bool is_split()    const noexcept { return flags & 2; }
-    bool is_leaf()     const noexcept { return !is_internal(); }
-    void set_internal(bool v) noexcept { flags = (flags & ~1) | (v ? 1 : 0); }
-    void set_split(bool v)    noexcept { flags = (flags & ~2) | (v ? 2 : 0); }
+    bool is_leaf() const noexcept { return !(flags & 1); }
+    void set_bitmask() noexcept { flags |= 1; }
+
+    static constexpr uint16_t DESC_CAP = 65535;
+
+    void add_descendants(uint16_t n) noexcept {
+        uint32_t d = static_cast<uint32_t>(descendants) + n;
+        descendants = static_cast<uint16_t>(d < DESC_CAP ? d : DESC_CAP);
+    }
+    void sub_descendants(uint16_t n) noexcept {
+        if (descendants < DESC_CAP)
+            descendants = descendants >= n ? static_cast<uint16_t>(descendants - n) : 0;
+    }
 };
 static_assert(sizeof(NodeHeader) == 8);
 
@@ -54,9 +62,8 @@ inline constexpr size_t header_u64(uint8_t skip) noexcept { return skip > 0 ? 2 
 
 // ==========================================================================
 // Global sentinel — zeroed block, valid as:
-//   - Compact leaf (count=0, flags=0 → not internal, not split)
+//   - Compact leaf (entries=0, flags=0 → is_leaf)
 //   - Bot-leaf BITS==16 (bitmap all zeros → no entries)
-//   - Bot-leaf BITS>16  (count u32 = 0 → no entries)
 // No allocation on construction; never deallocated.
 // ==========================================================================
 

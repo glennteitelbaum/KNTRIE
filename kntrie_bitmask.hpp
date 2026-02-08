@@ -104,11 +104,11 @@ struct BitmaskOps {
     // ==================================================================
 
     template<int BITS>
-    static constexpr size_t split_top_size_u64(size_t top_count, uint8_t skip) noexcept {
+    static constexpr size_t split_top_size_u64(size_t n_entries, uint8_t skip) noexcept {
         if constexpr (BITS == 16)
-            return header_u64(skip) + BITMAP256_U64 + top_count;
+            return header_u64(skip) + BITMAP256_U64 + n_entries;
         else
-            return header_u64(skip) + BITMAP256_U64 + BITMAP256_U64 + 1 + top_count;
+            return header_u64(skip) + BITMAP256_U64 + BITMAP256_U64 + 1 + n_entries;
             //                        top_bm          bot_is_int_bm   sentinel  children
     }
 
@@ -189,13 +189,15 @@ struct BitmaskOps {
                                    uint8_t ti, uint64_t* bot_ptr,
                                    bool is_leaf, ALLOC& alloc) {
         Bitmap256& tbm = top_bitmap_(node);
-        size_t otc = h->top_count, ntc = otc + 1;
+        size_t otc = h->entries, ntc = otc + 1;
         int isl = tbm.slot_for_insert(ti);
 
-        uint64_t* nn = alloc_node(alloc, split_top_size_u64<BITS>(ntc, h->skip));
+        size_t au64 = split_top_size_u64<BITS>(ntc, h->skip);
+        uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
-        nh->count = h->count + 1;
-        nh->top_count = static_cast<uint16_t>(ntc);
+        nh->entries = static_cast<uint16_t>(ntc);
+        nh->add_descendants(1);
+        nh->alloc_u64 = static_cast<uint16_t>(au64);
         if (h->skip > 0) set_prefix(nn, get_prefix(node));
 
         top_bitmap_(nn) = tbm;
@@ -214,7 +216,7 @@ struct BitmaskOps {
         nc[isl] = reinterpret_cast<uint64_t>(bot_ptr);
         for (size_t i = isl; i < otc; ++i)       nc[i + 1] = oc[i];
 
-        dealloc_node(alloc, node, split_top_size_u64<BITS>(otc, h->skip));
+        dealloc_node(alloc, node, h->alloc_u64);
         return nn;
     }
 
@@ -225,16 +227,18 @@ struct BitmaskOps {
     template<int BITS>
     static uint64_t* remove_top_slot(uint64_t* node, NodeHeader* h,
                                       int slot, uint8_t ti, ALLOC& alloc) {
-        size_t otc = h->top_count, ntc = otc - 1;
+        size_t otc = h->entries, ntc = otc - 1;
         if (ntc == 0) {
-            dealloc_node(alloc, node, split_top_size_u64<BITS>(otc, h->skip));
+            dealloc_node(alloc, node, h->alloc_u64);
             return nullptr;
         }
 
-        uint64_t* nn = alloc_node(alloc, split_top_size_u64<BITS>(ntc, h->skip));
+        size_t au64 = split_top_size_u64<BITS>(ntc, h->skip);
+        uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
-        nh->count = h->count - 1;
-        nh->top_count = static_cast<uint16_t>(ntc);
+        nh->entries = static_cast<uint16_t>(ntc);
+        nh->sub_descendants(1);
+        nh->alloc_u64 = static_cast<uint16_t>(au64);
         if (h->skip > 0) set_prefix(nn, get_prefix(node));
 
         top_bitmap_(nn) = top_bitmap_(node);
@@ -250,7 +254,7 @@ struct BitmaskOps {
         for (int i = 0; i < slot; ++i)            nc[i] = oc[i];
         for (size_t i = slot; i < ntc; ++i)       nc[i] = oc[i + 1];
 
-        dealloc_node(alloc, node, split_top_size_u64<BITS>(otc, h->skip));
+        dealloc_node(alloc, node, h->alloc_u64);
         return nn;
     }
 
@@ -262,23 +266,6 @@ struct BitmaskOps {
     static void mark_bot_internal(uint64_t* node, uint8_t ti) noexcept {
         if constexpr (BITS > 16)
             bot_is_internal_bm_(node).set_bit(ti);
-    }
-
-    // ==================================================================
-    // Split-top: recompute header internal flag from bot_is_internal bitmap
-    // ==================================================================
-
-    template<int BITS>
-    static void update_internal_flag(uint64_t* node) noexcept {
-        if constexpr (BITS > 16) {
-            auto* h = get_header(node);
-            const Bitmap256& tbm = top_bitmap_(node);
-            const Bitmap256& iibm = bot_is_internal_bm_(node);
-            bool all_internal = true;
-            for (int i = tbm.find_next_set(0); i >= 0; i = tbm.find_next_set(i + 1))
-                if (!iibm.has_bit(i)) { all_internal = false; break; }
-            h->set_internal(all_internal);
-        }
     }
 
     // ==================================================================
@@ -309,16 +296,19 @@ struct BitmaskOps {
                                      uint64_t* const* bot_ptrs,
                                      const bool* is_leaf_flags,
                                      int n_tops, uint8_t skip, uint64_t prefix,
-                                     uint32_t total_count, ALLOC& alloc) {
+                                     uint32_t total_descendants, ALLOC& alloc) {
         Bitmap256 tbm{};
         for (int i = 0; i < n_tops; ++i) tbm.set_bit(top_indices[i]);
 
-        uint64_t* nn = alloc_node(alloc, split_top_size_u64<BITS>(n_tops, skip));
+        size_t au64 = split_top_size_u64<BITS>(n_tops, skip);
+        uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
-        nh->count = total_count;
-        nh->top_count = static_cast<uint16_t>(n_tops);
+        nh->entries = static_cast<uint16_t>(n_tops);
+        nh->descendants = total_descendants > NodeHeader::DESC_CAP
+            ? NodeHeader::DESC_CAP : static_cast<uint16_t>(total_descendants);
+        nh->alloc_u64 = static_cast<uint16_t>(au64);
         nh->skip = skip;
-        nh->set_split(true);
+        nh->set_bitmask();
         if (skip > 0) set_prefix(nn, prefix);
 
         top_bitmap_(nn) = tbm;
@@ -332,12 +322,6 @@ struct BitmaskOps {
             // Sentinel at children[0]
             top_children_<BITS>(nn)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
         }
-
-        // Header internal flag: set if ALL bots are internal
-        bool any_leaf = false;
-        for (int i = 0; i < n_tops; ++i)
-            if (is_leaf_flags[i]) { any_leaf = true; break; }
-        nh->set_internal(!any_leaf);
 
         // Write real children in bitmap order
         uint64_t* rch = top_real_children_<BITS>(nn);
@@ -362,7 +346,7 @@ struct BitmaskOps {
     template<int BITS>
     static void dealloc_split_top(uint64_t* node, ALLOC& alloc) noexcept {
         auto* h = get_header(node);
-        dealloc_node(alloc, node, split_top_size_u64<BITS>(h->top_count, h->skip));
+        dealloc_node(alloc, node, h->alloc_u64);
     }
 
     // ==================================================================
@@ -372,7 +356,7 @@ struct BitmaskOps {
     template<int BITS>
     static uint32_t bot_leaf_count(const uint64_t* bot) noexcept {
         if constexpr (BITS == 16) return bot_leaf_bm_(bot).popcount();
-        else return get_header(bot)->count;
+        else return get_header(bot)->entries;
     }
 
     // ==================================================================
@@ -510,7 +494,7 @@ struct BitmaskOps {
         if constexpr (BITS == 16)
             dealloc_node(alloc, bot, bot_leaf_size_u64<16>(count));
         else
-            dealloc_node(alloc, bot, CO::template size_u64<BITS - 8>(count, 0));
+            dealloc_node(alloc, bot, get_header(bot)->alloc_u64);
     }
 
     // ==================================================================

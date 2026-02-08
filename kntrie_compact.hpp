@@ -52,7 +52,7 @@ struct IdxSearch {
 // CompactOps  – builds/searches/mutates compact leaf nodes
 //
 // Layout: [header (1-2 u64)][search_overlay + sorted_keys][values]
-//   flags=0 → not internal, not split (leaf compact)
+//   flags=0 → is_leaf (compact)
 // ==========================================================================
 
 template<typename KEY, typename VALUE, typename ALLOC>
@@ -76,20 +76,23 @@ struct CompactOps {
 
     // ==================================================================
     // Factory: build from pre-sorted working arrays
-    //   flags=0 after alloc_node (zeroed) → leaf compact naturally
     // ==================================================================
 
     template<int BITS>
     static uint64_t* make_leaf(const typename suffix_traits<BITS>::type* sorted_keys,
                                const VST* values, uint32_t count,
                                uint8_t skip, uint64_t prefix, ALLOC& alloc) {
-        using K = typename suffix_traits<BITS>::type;
-        uint64_t* node = alloc_node(alloc, size_u64<BITS>(count, skip));
+        size_t au64 = size_u64<BITS>(count, skip);
+        uint64_t* node = alloc_node(alloc, au64);
         auto* h = get_header(node);
-        h->count = count; h->skip = skip;
-        // flags remains 0 → not internal, not split (leaf compact)
+        h->entries = static_cast<uint16_t>(count);
+        h->descendants = static_cast<uint16_t>(count);
+        h->alloc_u64 = static_cast<uint16_t>(au64);
+        h->skip = skip;
+        // flags remains 0 → is_leaf (compact)
         if (skip > 0) set_prefix(node, prefix);
 
+        using K = typename suffix_traits<BITS>::type;
         K*   kd = keys_data_<BITS>(node, count);
         VST* vd = vals_<BITS>(node, count);
         if (count > 0) {
@@ -107,9 +110,9 @@ struct CompactOps {
     template<int BITS, typename Fn>
     static void for_each(const uint64_t* node, const NodeHeader* h, Fn&& cb) {
         using K = typename suffix_traits<BITS>::type;
-        const K*   kd = keys_data_<BITS>(node, h->count);
-        const VST* vd = vals_<BITS>(node, h->count);
-        for (uint32_t i = 0; i < h->count; ++i) cb(kd[i], vd[i]);
+        const K*   kd = keys_data_<BITS>(node, h->entries);
+        const VST* vd = vals_<BITS>(node, h->entries);
+        for (uint16_t i = 0; i < h->entries; ++i) cb(kd[i], vd[i]);
     }
 
     // ==================================================================
@@ -120,10 +123,10 @@ struct CompactOps {
     static void destroy_and_dealloc(uint64_t* node, ALLOC& alloc) {
         auto* h = get_header(node);
         if constexpr (!VT::is_inline) {
-            VST* vd = vals_<BITS>(node, h->count);
-            for (uint32_t i = 0; i < h->count; ++i) VT::destroy(vd[i], alloc);
+            VST* vd = vals_<BITS>(node, h->entries);
+            for (uint16_t i = 0; i < h->entries; ++i) VT::destroy(vd[i], alloc);
         }
-        dealloc_node(alloc, node, size_u64<BITS>(h->count, h->skip));
+        dealloc_node(alloc, node, h->alloc_u64);
     }
 
     // ==================================================================
@@ -136,13 +139,13 @@ struct CompactOps {
         using K = typename suffix_traits<BITS>::type;
         K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
         int idx = IdxSearch<K>::search(search_start_<BITS>(node),
-                                       static_cast<int>(h->count), suffix);
+                                       static_cast<int>(h->entries), suffix);
         if (idx < 0) return nullptr;
-        return VT::as_ptr(vals_<BITS>(node, h->count)[idx]);
+        return VT::as_ptr(vals_<BITS>(node, h->entries)[idx]);
     }
 
     // ==================================================================
-    // Insert  (returns needs_split=true when count >= COMPACT_MAX)
+    // Insert  (returns needs_split=true when entries >= COMPACT_MAX)
     // ==================================================================
 
     struct CompactInsertResult { uint64_t* node; bool inserted; bool needs_split; };
@@ -152,22 +155,25 @@ struct CompactOps {
                                       uint64_t ik, VST value, ALLOC& alloc) {
         using K = typename suffix_traits<BITS>::type;
         K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
-        K*   kd = keys_data_<BITS>(node, h->count);
-        VST* vd = vals_<BITS>(node, h->count);
+        K*   kd = keys_data_<BITS>(node, h->entries);
+        VST* vd = vals_<BITS>(node, h->entries);
 
-        int idx = binary_search_for_insert(kd, static_cast<size_t>(h->count), suffix);
+        int idx = binary_search_for_insert(kd, static_cast<size_t>(h->entries), suffix);
         if (idx >= 0) {
             VT::destroy(vd[idx], alloc);
             VT::write_slot(&vd[idx], value);
             return {node, false, false};
         }
         size_t ins = static_cast<size_t>(-(idx + 1));
-        if (h->count >= COMPACT_MAX) return {node, false, true};
+        if (h->entries >= COMPACT_MAX) return {node, false, true};
 
-        size_t nc = h->count + 1;
-        uint64_t* nn = alloc_node(alloc, size_u64<BITS>(nc, h->skip));
+        uint16_t nc = h->entries + 1;
+        size_t au64 = size_u64<BITS>(nc, h->skip);
+        uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
-        nh->count = static_cast<uint32_t>(nc);
+        nh->entries = nc;
+        nh->descendants = nc;
+        nh->alloc_u64 = static_cast<uint16_t>(au64);
         if (h->skip > 0) set_prefix(nn, get_prefix(node));
 
         K*   nk = keys_data_<BITS>(nn, nc);
@@ -176,11 +182,11 @@ struct CompactOps {
         std::memcpy(nv, vd, ins * sizeof(VST));
         nk[ins] = suffix;
         VT::write_slot(&nv[ins], value);
-        std::memcpy(nk + ins + 1, kd + ins, (h->count - ins) * sizeof(K));
-        std::memcpy(nv + ins + 1, vd + ins, (h->count - ins) * sizeof(VST));
+        std::memcpy(nk + ins + 1, kd + ins, (h->entries - ins) * sizeof(K));
+        std::memcpy(nv + ins + 1, vd + ins, (h->entries - ins) * sizeof(VST));
         IdxSearch<K>::build(search_start_<BITS>(nn), nk, static_cast<int>(nc));
 
-        dealloc_node(alloc, node, size_u64<BITS>(h->count, h->skip));
+        dealloc_node(alloc, node, h->alloc_u64);
         return {nn, true, false};
     }
 
@@ -193,7 +199,7 @@ struct CompactOps {
                              uint64_t ik, ALLOC& alloc) {
         using K = typename suffix_traits<BITS>::type;
         K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
-        uint32_t count = h->count;
+        uint16_t count = h->entries;
         K*   kd = keys_data_<BITS>(node, count);
         VST* vd = vals_<BITS>(node, count);
 
@@ -201,13 +207,17 @@ struct CompactOps {
         if (idx < 0) return {node, false};
         VT::destroy(vd[idx], alloc);
 
-        uint32_t nc = count - 1;
+        uint16_t nc = count - 1;
         if (nc == 0) {
-            dealloc_node(alloc, node, size_u64<BITS>(count, h->skip));
+            dealloc_node(alloc, node, h->alloc_u64);
             return {nullptr, true};
         }
-        uint64_t* nn = alloc_node(alloc, size_u64<BITS>(nc, h->skip));
-        auto* nh = get_header(nn); *nh = *h; nh->count = nc;
+        size_t au64 = size_u64<BITS>(nc, h->skip);
+        uint64_t* nn = alloc_node(alloc, au64);
+        auto* nh = get_header(nn); *nh = *h;
+        nh->entries = nc;
+        nh->descendants = nc;
+        nh->alloc_u64 = static_cast<uint16_t>(au64);
         if (h->skip > 0) set_prefix(nn, get_prefix(node));
 
         K*   nk = keys_data_<BITS>(nn, nc);
@@ -218,7 +228,7 @@ struct CompactOps {
         std::memcpy(nv + idx, vd + idx + 1, (nc - idx) * sizeof(VST));
         IdxSearch<K>::build(search_start_<BITS>(nn), nk, static_cast<int>(nc));
 
-        dealloc_node(alloc, node, size_u64<BITS>(count, h->skip));
+        dealloc_node(alloc, node, h->alloc_u64);
         return {nn, true};
     }
 
