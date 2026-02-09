@@ -395,7 +395,7 @@ struct BitmaskOps {
             int slot = bm.count_below(suffix);
             return VT::as_ptr(bot_leaf_vals_16_(bot)[slot]);
         } else {
-            return CO::template find<BITS - 8>(bot, get_header(bot), ik);
+            return CO::template find<BITS - 8>(bot, *get_header(bot), ik);
         }
     }
 

@@ -145,14 +145,14 @@ struct CompactOps {
     // ==================================================================
 
     template<int BITS>
-    static const VALUE* find(const uint64_t* node, const NodeHeader* h,
+    static const VALUE* find(const uint64_t* node, NodeHeader h,
                              uint64_t ik) noexcept {
         using K = typename suffix_traits<BITS>::type;
         K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
         int idx = IdxSearch<K>::search(search_start_<BITS>(node),
-                                       static_cast<int>(h->entries), suffix);
+                                       static_cast<int>(h.entries), suffix);
         if (idx < 0) [[unlikely]] return nullptr;
-        return VT::as_ptr(vals_<BITS>(node, h->entries)[idx]);
+        return VT::as_ptr(vals_<BITS>(node, h.entries)[idx]);
     }
 
     // ==================================================================
