@@ -902,7 +902,7 @@ private:
                             if constexpr (BITS > 16) {
                                 L.bot_internal++;
                                 int bc = BO::bot_internal_child_count(bot);
-                                L.bytes += BO::bot_internal_size_u64(bc) * 8;
+                                L.bytes += BO::bot_internal_alloc_u64(bot) * 8;
                                 BO::for_each_bot_child(bot,
                                     [&](uint8_t /*bi*/, uint64_t* child) {
                                         collect_stats<BITS - 16>(child, s);

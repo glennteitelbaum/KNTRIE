@@ -115,7 +115,7 @@ struct BitmaskOps {
     }
 
     static constexpr size_t bot_internal_size_u64(size_t count) noexcept {
-        return BITMAP256_U64 + 1 + count;
+        return 1 + BITMAP256_U64 + 1 + count;  // header + bitmap + sentinel + children
     }
 
     // ==================================================================
@@ -530,7 +530,14 @@ struct BitmaskOps {
         Bitmap256 bm{};
         for (int i = 0; i < n_children; ++i) bm.set_bit(indices[i]);
 
-        uint64_t* bot = alloc_node(alloc, bot_internal_size_u64(n_children));
+        size_t needed = bot_internal_size_u64(n_children);
+        size_t au64 = round_up_u64(needed);
+        uint64_t* bot = alloc_node(alloc, au64);
+        auto* h = get_header(bot);
+        h->entries = static_cast<uint16_t>(n_children);
+        h->alloc_u64 = static_cast<uint16_t>(au64);
+        h->set_bitmask();
+
         bot_bitmap_(bot) = bm;
 
         bot_int_children_(bot)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
@@ -587,17 +594,36 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: add child  (no header — always copy)
+    // Bot-internal: add child  (in-place when capacity allows)
     // ==================================================================
 
     static uint64_t* add_bot_child(uint64_t* bot, uint8_t bi,
                                     uint64_t* child_ptr, ALLOC& alloc) {
+        auto* h = get_header(bot);
         Bitmap256& bm = bot_bitmap_(bot);
-        int oc = bm.popcount();
+        int oc = h->entries;
         int isl = bm.slot_for_insert(bi);
         int nc = oc + 1;
+        size_t needed = bot_internal_size_u64(nc);
 
-        uint64_t* nb = alloc_node(alloc, bot_internal_size_u64(nc));
+        // --- In-place if we have capacity ---
+        if (needed <= h->alloc_u64) {
+            uint64_t* rch = bot_int_real_children_(bot);
+            std::memmove(rch + isl + 1, rch + isl, (oc - isl) * sizeof(uint64_t));
+            rch[isl] = reinterpret_cast<uint64_t>(child_ptr);
+            bm.set_bit(bi);
+            h->entries = static_cast<uint16_t>(nc);
+            return bot;
+        }
+
+        // --- Allocate new with padding ---
+        size_t au64 = round_up_u64(needed);
+        uint64_t* nb = alloc_node(alloc, au64);
+        auto* nh = get_header(nb);
+        nh->entries = static_cast<uint16_t>(nc);
+        nh->alloc_u64 = static_cast<uint16_t>(au64);
+        nh->set_bitmask();
+
         bot_bitmap_(nb) = bm;
         bot_bitmap_(nb).set_bit(bi);
 
@@ -609,22 +635,39 @@ struct BitmaskOps {
         nrc[isl] = reinterpret_cast<uint64_t>(child_ptr);
         for (int i = isl; i < oc; ++i)       nrc[i + 1] = orc[i];
 
-        dealloc_node(alloc, bot, bot_internal_size_u64(oc));
+        dealloc_node(alloc, bot, h->alloc_u64);
         return nb;
     }
 
     // ==================================================================
-    // Bot-internal: remove child  (no header — always copy)
+    // Bot-internal: remove child  (in-place when not oversized)
     // ==================================================================
 
     static uint64_t* remove_bot_child(uint64_t* bot, int slot, uint8_t bi,
                                        ALLOC& alloc) {
-        Bitmap256& bm = bot_bitmap_(bot);
-        int oc = bm.popcount();
+        auto* h = get_header(bot);
+        int oc = h->entries;
         int nc = oc - 1;
+        size_t needed = bot_internal_size_u64(nc);
 
-        uint64_t* nb = alloc_node(alloc, bot_internal_size_u64(nc));
-        bot_bitmap_(nb) = bm;
+        // --- In-place if not oversized ---
+        if (!should_shrink_u64(h->alloc_u64, needed)) {
+            uint64_t* rch = bot_int_real_children_(bot);
+            std::memmove(rch + slot, rch + slot + 1, (nc - slot) * sizeof(uint64_t));
+            bot_bitmap_(bot).clear_bit(bi);
+            h->entries = static_cast<uint16_t>(nc);
+            return bot;
+        }
+
+        // --- Allocate smaller with padding ---
+        size_t au64 = round_up_u64(needed);
+        uint64_t* nb = alloc_node(alloc, au64);
+        auto* nh = get_header(nb);
+        nh->entries = static_cast<uint16_t>(nc);
+        nh->alloc_u64 = static_cast<uint16_t>(au64);
+        nh->set_bitmask();
+
+        bot_bitmap_(nb) = bot_bitmap_(bot);
         bot_bitmap_(nb).clear_bit(bi);
 
         bot_int_children_(nb)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
@@ -634,7 +677,7 @@ struct BitmaskOps {
         for (int i = 0; i < slot; ++i)        nrc[i] = orc[i];
         for (int i = slot; i < nc; ++i)       nrc[i] = orc[i + 1];
 
-        dealloc_node(alloc, bot, bot_internal_size_u64(oc));
+        dealloc_node(alloc, bot, h->alloc_u64);
         return nb;
     }
 
@@ -643,7 +686,12 @@ struct BitmaskOps {
     // ==================================================================
 
     static int bot_internal_child_count(const uint64_t* bot) noexcept {
-        return bot_bitmap_(bot).popcount();
+        return get_header(bot)->entries;
+    }
+
+    // Actual allocated size (for stats — may be padded)
+    static size_t bot_internal_alloc_u64(const uint64_t* bot) noexcept {
+        return get_header(bot)->alloc_u64;
     }
 
     // ==================================================================
@@ -664,8 +712,7 @@ struct BitmaskOps {
     // ==================================================================
 
     static void dealloc_bot_internal(uint64_t* bot, ALLOC& alloc) noexcept {
-        int c = bot_bitmap_(bot).popcount();
-        dealloc_node(alloc, bot, bot_internal_size_u64(c));
+        dealloc_node(alloc, bot, get_header(bot)->alloc_u64);
     }
 
     // ==================================================================
@@ -726,23 +773,25 @@ private:
         return reinterpret_cast<const VST*>(b + BITMAP256_U64);
     }
 
+    // --- bot-internal layout: [header (1)][bitmap (4)][sentinel (1)][children...] ---
+
     static Bitmap256& bot_bitmap_(uint64_t* b) noexcept {
-        return *reinterpret_cast<Bitmap256*>(b);
+        return *reinterpret_cast<Bitmap256*>(b + 1);
     }
     static const Bitmap256& bot_bitmap_(const uint64_t* b) noexcept {
-        return *reinterpret_cast<const Bitmap256*>(b);
+        return *reinterpret_cast<const Bitmap256*>(b + 1);
     }
     static uint64_t* bot_int_children_(uint64_t* b) noexcept {
-        return b + BITMAP256_U64;
+        return b + 1 + BITMAP256_U64;
     }
     static const uint64_t* bot_int_children_(const uint64_t* b) noexcept {
-        return b + BITMAP256_U64;
+        return b + 1 + BITMAP256_U64;
     }
     static uint64_t* bot_int_real_children_(uint64_t* b) noexcept {
-        return b + BITMAP256_U64 + 1;
+        return b + 1 + BITMAP256_U64 + 1;
     }
     static const uint64_t* bot_int_real_children_(const uint64_t* b) noexcept {
-        return b + BITMAP256_U64 + 1;
+        return b + 1 + BITMAP256_U64 + 1;
     }
 
     // ==================================================================
