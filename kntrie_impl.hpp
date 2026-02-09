@@ -256,8 +256,7 @@ private:
         if (h.skip > 0) [[unlikely]] {
             uint64_t expected = KO::template extract_prefix<BITS>(ik, h.skip);
             if (expected != get_prefix(node)) [[unlikely]] return nullptr;
-            int ab = BITS - h.skip * 16;
-            if constexpr (BITS >= 48) { if (ab == 32) return find_post_skip_<32>(node, &h, ik); }
+            if constexpr (BITS >= 48) { if (h.skip == 1) return find_post_skip_<32>(node, &h, ik); }
             return find_post_skip_<16>(node, &h, ik);
         }
 
