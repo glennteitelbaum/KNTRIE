@@ -74,8 +74,7 @@ public:
         if constexpr (ROOT_BITS > 8) {
             uint8_t bi = KO::template extract_top8<ROOT_BITS>(ik);
             const uint64_t* grandchild = BO::branchless_bot_child(child, bi);
-            NodeHeader gh = *get_header(grandchild);
-            return find_impl<ROOT_BITS - 8>(grandchild, ik, gh, 0, 0);
+            return find_impl<ROOT_BITS - 8>(grandchild, ik);
         }
         return nullptr;  // unreachable for ROOT_BITS > 8
     }
@@ -242,37 +241,43 @@ private:
 
     // BITS=16: always split (bitmap top-8 → bitmap bot-8)
     template<int BITS>
-    const VALUE* find_impl(const uint64_t* node, uint64_t ik, NodeHeader h,
-                           uint64_t skip_prefix, int skip_left) const noexcept
+    const VALUE* find_impl(const uint64_t* node, uint64_t ik) const noexcept
         requires (BITS == 16)
     {
         return find_in_split<16>(node, ik);
     }
 
     template<int BITS>
-    const VALUE* find_impl(const uint64_t* node, uint64_t ik, NodeHeader h,
-                           uint64_t skip_prefix, int skip_left) const noexcept
+    const VALUE* find_impl(const uint64_t* node, uint64_t ik) const noexcept
         requires (BITS > 16)
     {
-        uint16_t key_chunk = KO::template extract_top16<BITS>(ik);
+        NodeHeader h = *get_header(node);
 
-        if (skip_left > 0) [[unlikely]] {
-            uint16_t sc = KO::get_skip_chunk(skip_prefix, h.skip, skip_left);
-            if (key_chunk != sc) [[unlikely]] return nullptr;
-            skip_left--;
-        } else if (h.skip >= 1) [[unlikely]] {
-            uint64_t np = get_prefix(node);
-            uint16_t sc = KO::get_skip_chunk(np, h.skip, h.skip);
-            if (key_chunk != sc) [[unlikely]] return nullptr;
-            if (h.skip > 1) [[unlikely]] { skip_prefix = np; skip_left = h.skip - 1; }
-            h.skip = 0;
-        } else if (h.is_leaf()) [[unlikely]] {
-            return CO::template find<BITS>(node, &h, ik);
-        } else {
-            return find_in_split<BITS>(node, ik);
+        if (h.skip > 0) [[unlikely]] {
+            uint64_t expected = KO::template extract_prefix<BITS>(ik, h.skip);
+            if (expected != get_prefix(node)) [[unlikely]] return nullptr;
+            int ab = BITS - h.skip * 16;
+            if constexpr (BITS >= 48) { if (ab == 32) return find_post_skip_<32>(node, &h, ik); }
+            if constexpr (BITS >= 32) { if (ab == 16) return find_post_skip_<16>(node, &h, ik); }
+            return nullptr;
         }
 
-        return find_impl<BITS - 16>(node, ik, h, skip_prefix, skip_left);
+        if (h.is_leaf()) [[unlikely]]
+            return CO::template find<BITS>(node, &h, ik);
+        return find_in_split<BITS>(node, ik);
+    }
+
+    // Post-skip dispatch: skip already verified, check leaf vs split
+    template<int BITS>
+    const VALUE* find_post_skip_(const uint64_t* node, const NodeHeader* h,
+                                  uint64_t ik) const noexcept {
+        if constexpr (BITS == 16)
+            return find_in_split<16>(node, ik);
+        else {
+            if (h->is_leaf()) [[unlikely]]
+                return CO::template find<BITS>(node, h, ik);
+            return find_in_split<BITS>(node, ik);
+        }
     }
 
     // ==================================================================
@@ -294,8 +299,7 @@ private:
 
             uint8_t bi = KO::template extract_top8<BITS - 8>(ik);
             const uint64_t* child = BO::branchless_bot_child(bot, bi);
-            NodeHeader ch = *get_header(child);
-            return find_impl<BITS - 16>(child, ik, ch, 0, 0);
+            return find_impl<BITS - 16>(child, ik);
         } else {
             // BITS==16: branching lookup with early exit
             auto lk = BO::template lookup_top<BITS>(node, ti);
