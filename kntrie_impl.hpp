@@ -258,8 +258,7 @@ private:
             if (expected != get_prefix(node)) [[unlikely]] return nullptr;
             int ab = BITS - h.skip * 16;
             if constexpr (BITS >= 48) { if (ab == 32) return find_post_skip_<32>(node, &h, ik); }
-            if constexpr (BITS >= 32) { if (ab == 16) return find_post_skip_<16>(node, &h, ik); }
-            return nullptr;
+            return find_post_skip_<16>(node, &h, ik);
         }
 
         if (h.is_leaf()) [[unlikely]]
