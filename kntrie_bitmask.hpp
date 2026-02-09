@@ -22,7 +22,6 @@ struct Bitmap256 {
                std::popcount(words[2]) + std::popcount(words[3]);
     }
 
-    // Original find_slot: 0-based, returns false if not found
     bool find_slot(uint8_t index, int& slot) const noexcept {
         const int w = index >> 6, b = index & 63;
         uint64_t before = words[w] << (63 - b);
@@ -37,24 +36,21 @@ struct Bitmap256 {
         return true;
     }
 
-    // Branchless find_slot: returns 1-based slot on hit, 0 on miss.
-    // Designed for children arrays with sentinel at index 0.
     int find_slot_1(uint8_t index) const noexcept {
         const int w = index >> 6, b = index & 63;
         uint64_t before = words[w] << (63 - b);
         int pc0 = std::popcount(words[0]);
         int pc1 = std::popcount(words[1]);
         int pc2 = std::popcount(words[2]);
-        int slot = std::popcount(before);  // 1-based when found
+        int slot = std::popcount(before);
         slot += pc0 & -int(w > 0);
         slot += pc1 & -int(w > 1);
         slot += pc2 & -int(w > 2);
         bool found = before & (1ULL << 63);
-        slot &= -int(found);              // 0 if not found
+        slot &= -int(found);
         return slot;
     }
 
-    // Count set bits below index (0-based dense position for insert)
     int slot_for_insert(uint8_t index) const noexcept {
         const int w = index >> 6, b = index & 63;
         int pc0 = std::popcount(words[0]);
@@ -83,13 +79,10 @@ struct Bitmap256 {
 // ==========================================================================
 // BitmaskOps  – split-top, bot-leaf, bot-internal operations
 //
-// Children layout for BITS > 16 (split-top and bot-internal):
-//   [sentinel_ptr, child_0, child_1, ...]
-//   find_slot_1 returns 1-based → children[slot] is correct
-//   insert/erase use top_real_children_ (0-based, skips sentinel)
+// Split-top nodes have NodeHeader with alloc_u64 → padded allocation,
+// in-place add/remove when capacity allows.
 //
-// Children layout for BITS == 16 (split-top only):
-//   [child_0, child_1, ...]   (no sentinel — terminal level)
+// Bot-leaf-16 and bot-internal have no header → exact allocation only.
 // ==========================================================================
 
 template<typename KEY, typename VALUE, typename ALLOC>
@@ -109,7 +102,6 @@ struct BitmaskOps {
             return header_u64(skip) + BITMAP256_U64 + n_entries;
         else
             return header_u64(skip) + BITMAP256_U64 + BITMAP256_U64 + 1 + n_entries;
-            //                        top_bm          bot_is_int_bm   sentinel  children
     }
 
     template<int BITS>
@@ -123,7 +115,7 @@ struct BitmaskOps {
     }
 
     static constexpr size_t bot_internal_size_u64(size_t count) noexcept {
-        return BITMAP256_U64 + 1 + count;  // bitmap + sentinel + children
+        return BITMAP256_U64 + 1 + count;
     }
 
     // ==================================================================
@@ -132,7 +124,7 @@ struct BitmaskOps {
 
     struct TopLookup {
         uint64_t* bot;
-        int       slot;   // 0-based into real children
+        int       slot;
         bool      found;
         bool      is_leaf;
     };
@@ -152,8 +144,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Split-top: branchless descent (for find — uses sentinel children)
-    //   Returns child pointer; sentinel on miss. BITS > 16 only.
+    // Split-top: branchless descent (for find)
     // ==================================================================
 
     template<int BITS>
@@ -164,7 +155,6 @@ struct BitmaskOps {
         return reinterpret_cast<const uint64_t*>(top_children_<BITS>(node)[slot]);
     }
 
-    // Check if top entry is a leaf (needed for the one unavoidable branch)
     template<int BITS>
     static bool is_top_entry_leaf(const uint64_t* node, uint8_t ti) noexcept {
         if constexpr (BITS == 16) return true;
@@ -182,6 +172,8 @@ struct BitmaskOps {
 
     // ==================================================================
     // Split-top: add a new top slot
+    //
+    // In-place when padded allocation has room; otherwise alloc new.
     // ==================================================================
 
     template<int BITS>
@@ -191,8 +183,24 @@ struct BitmaskOps {
         Bitmap256& tbm = top_bitmap_(node);
         size_t otc = h->entries, ntc = otc + 1;
         int isl = tbm.slot_for_insert(ti);
+        size_t needed = split_top_size_u64<BITS>(ntc, h->skip);
 
-        size_t au64 = split_top_size_u64<BITS>(ntc, h->skip);
+        // --- In-place if we have capacity ---
+        if (needed <= h->alloc_u64) {
+            uint64_t* rc = top_real_children_<BITS>(node);
+            std::memmove(rc + isl + 1, rc + isl, (otc - isl) * sizeof(uint64_t));
+            rc[isl] = reinterpret_cast<uint64_t>(bot_ptr);
+            tbm.set_bit(ti);
+            if constexpr (BITS > 16) {
+                if (!is_leaf) bot_is_internal_bm_(node).set_bit(ti);
+            }
+            h->entries = static_cast<uint16_t>(ntc);
+            h->add_descendants(1);
+            return node;
+        }
+
+        // --- Allocate new with padding ---
+        size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
         nh->entries = static_cast<uint16_t>(ntc);
@@ -206,7 +214,6 @@ struct BitmaskOps {
         if constexpr (BITS > 16) {
             bot_is_internal_bm_(nn) = bot_is_internal_bm_(node);
             if (!is_leaf) bot_is_internal_bm_(nn).set_bit(ti);
-            // Write sentinel
             top_children_<BITS>(nn)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
         }
 
@@ -222,6 +229,8 @@ struct BitmaskOps {
 
     // ==================================================================
     // Split-top: remove a top slot
+    //
+    // In-place when not oversized (>2 steps); otherwise shrink.
     // ==================================================================
 
     template<int BITS>
@@ -233,7 +242,23 @@ struct BitmaskOps {
             return nullptr;
         }
 
-        size_t au64 = split_top_size_u64<BITS>(ntc, h->skip);
+        size_t needed = split_top_size_u64<BITS>(ntc, h->skip);
+
+        // --- In-place if not oversized ---
+        if (!should_shrink_u64(h->alloc_u64, needed)) {
+            uint64_t* rc = top_real_children_<BITS>(node);
+            std::memmove(rc + slot, rc + slot + 1, (ntc - slot) * sizeof(uint64_t));
+            top_bitmap_(node).clear_bit(ti);
+            if constexpr (BITS > 16) {
+                bot_is_internal_bm_(node).clear_bit(ti);
+            }
+            h->entries = static_cast<uint16_t>(ntc);
+            h->sub_descendants(1);
+            return node;
+        }
+
+        // --- Allocate smaller with padding ---
+        size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
         nh->entries = static_cast<uint16_t>(ntc);
@@ -300,7 +325,8 @@ struct BitmaskOps {
         Bitmap256 tbm{};
         for (int i = 0; i < n_tops; ++i) tbm.set_bit(top_indices[i]);
 
-        size_t au64 = split_top_size_u64<BITS>(n_tops, skip);
+        size_t needed = split_top_size_u64<BITS>(n_tops, skip);
+        size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         nh->entries = static_cast<uint16_t>(n_tops);
@@ -314,16 +340,13 @@ struct BitmaskOps {
         top_bitmap_(nn) = tbm;
 
         if constexpr (BITS > 16) {
-            // bot_is_internal: set bit for internal (non-leaf) bots
             Bitmap256 iibm{};
             for (int i = 0; i < n_tops; ++i)
                 if (!is_leaf_flags[i]) iibm.set_bit(top_indices[i]);
             bot_is_internal_bm_(nn) = iibm;
-            // Sentinel at children[0]
             top_children_<BITS>(nn)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
         }
 
-        // Write real children in bitmap order
         uint64_t* rch = top_real_children_<BITS>(nn);
         int slot = 0;
         for (int ti = tbm.find_next_set(0); ti >= 0; ti = tbm.find_next_set(ti + 1)) {
@@ -510,10 +533,8 @@ struct BitmaskOps {
         uint64_t* bot = alloc_node(alloc, bot_internal_size_u64(n_children));
         bot_bitmap_(bot) = bm;
 
-        // Sentinel at children[0]
         bot_int_children_(bot)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
 
-        // Real children at [1..]
         uint64_t* rch = bot_int_real_children_(bot);
         int slot = 0;
         for (int bi = bm.find_next_set(0); bi >= 0; bi = bm.find_next_set(bi + 1)) {
@@ -566,7 +587,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: add child
+    // Bot-internal: add child  (no header — always copy)
     // ==================================================================
 
     static uint64_t* add_bot_child(uint64_t* bot, uint8_t bi,
@@ -580,7 +601,6 @@ struct BitmaskOps {
         bot_bitmap_(nb) = bm;
         bot_bitmap_(nb).set_bit(bi);
 
-        // Sentinel
         bot_int_children_(nb)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
 
         const uint64_t* orc = bot_int_real_children_(bot);
@@ -594,7 +614,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: remove child
+    // Bot-internal: remove child  (no header — always copy)
     // ==================================================================
 
     static uint64_t* remove_bot_child(uint64_t* bot, int slot, uint8_t bi,
@@ -653,8 +673,6 @@ struct BitmaskOps {
     // ==================================================================
 
 private:
-    // --- split-top layout ---
-
     static Bitmap256& top_bitmap_(uint64_t* n) noexcept {
         return *reinterpret_cast<Bitmap256*>(n + header_u64(get_header(n)->skip));
     }
@@ -668,7 +686,6 @@ private:
         return *reinterpret_cast<const Bitmap256*>(n + header_u64(get_header(n)->skip) + BITMAP256_U64);
     }
 
-    // Full children array (includes sentinel at [0] for BITS>16)
     template<int BITS>
     static uint64_t* top_children_(uint64_t* n) noexcept {
         if constexpr (BITS == 16)
@@ -684,7 +701,6 @@ private:
             return n + header_u64(get_header(n)->skip) + BITMAP256_U64 + BITMAP256_U64;
     }
 
-    // Real children (skips sentinel for BITS>16)
     template<int BITS>
     static uint64_t* top_real_children_(uint64_t* n) noexcept {
         if constexpr (BITS == 16) return top_children_<BITS>(n);
@@ -696,8 +712,6 @@ private:
         else return top_children_<BITS>(n) + 1;
     }
 
-    // --- bot-leaf layout ---
-
     static Bitmap256& bot_leaf_bm_(uint64_t* b) noexcept {
         return *reinterpret_cast<Bitmap256*>(b);
     }
@@ -705,7 +719,6 @@ private:
         return *reinterpret_cast<const Bitmap256*>(b);
     }
 
-    // bot-leaf-16 values (after bitmap)
     static VST* bot_leaf_vals_16_(uint64_t* b) noexcept {
         return reinterpret_cast<VST*>(b + BITMAP256_U64);
     }
@@ -713,22 +726,18 @@ private:
         return reinterpret_cast<const VST*>(b + BITMAP256_U64);
     }
 
-    // --- bot-internal layout ---
-
     static Bitmap256& bot_bitmap_(uint64_t* b) noexcept {
         return *reinterpret_cast<Bitmap256*>(b);
     }
     static const Bitmap256& bot_bitmap_(const uint64_t* b) noexcept {
         return *reinterpret_cast<const Bitmap256*>(b);
     }
-    // Full children (includes sentinel at [0])
     static uint64_t* bot_int_children_(uint64_t* b) noexcept {
         return b + BITMAP256_U64;
     }
     static const uint64_t* bot_int_children_(const uint64_t* b) noexcept {
         return b + BITMAP256_U64;
     }
-    // Real children (skips sentinel)
     static uint64_t* bot_int_real_children_(uint64_t* b) noexcept {
         return b + BITMAP256_U64 + 1;
     }
@@ -737,7 +746,7 @@ private:
     }
 
     // ==================================================================
-    // Bot-leaf insert/erase internals
+    // Bot-leaf-16 insert/erase  (no header — always copy, exact alloc)
     // ==================================================================
 
     static BotLeafInsertResult insert_bl_16_(
@@ -767,10 +776,6 @@ private:
         dealloc_node(alloc, bot, bot_leaf_size_u64<16>(count));
         return {nb, true, false};
     }
-
-    // ==================================================================
-    // Bot-leaf erase internals
-    // ==================================================================
 
     static EraseResult erase_bl_16_(uint64_t* bot, uint64_t ik, ALLOC& alloc) {
         uint8_t suffix = static_cast<uint8_t>(KOps::template extract_suffix<8>(ik));

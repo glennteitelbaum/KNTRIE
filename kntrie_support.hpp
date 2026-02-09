@@ -22,6 +22,48 @@ inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
 
 // ==========================================================================
+// Allocation size classes
+//
+// Up to 8 u64s: exact
+// Then quarter-steps within each power-of-2 range:
+//   [9,16]:   step 2  → 10,12,14,16
+//   [17,32]:  step 4  → 20,24,28,32
+//   [33,64]:  step 8  → 40,48,56,64
+//   [65,128]: step 16 → 80,96,112,128
+//   etc.
+//
+// Worst-case waste: ~25%.  Enables in-place insert/erase.
+// ==========================================================================
+
+inline constexpr size_t round_up_u64(size_t n) noexcept {
+    if (n <= 8) return n;
+    int bits = std::bit_width(n - 1);     // ceil(log2(n))
+    int k    = bits - 1;                   // lower bound exponent
+    if (k < 2) return n;
+    size_t step = size_t{1} << (k - 2);   // quarter of the range
+    return ((n + step - 1) / step) * step;
+}
+
+// Step up `steps` size classes from `cls` (for shrink hysteresis).
+inline constexpr size_t step_up_u64(size_t cls, int steps) noexcept {
+    size_t n = cls;
+    for (int i = 0; i < steps; ++i) {
+        if (n < 8) { ++n; continue; }
+        int bits = std::bit_width(n);
+        int k    = bits - 1;
+        size_t step = size_t{1} << (k >= 2 ? k - 2 : 0);
+        n += step;
+    }
+    return n;
+}
+
+// Shrink when allocated is more than 2 size-class steps above needed.
+inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcept {
+    size_t threshold = step_up_u64(round_up_u64(needed), 2);
+    return allocated > threshold;
+}
+
+// ==========================================================================
 // Node Header  (8 bytes; prefix in node[1] when skip > 0)
 //
 // flags bit 0: 0 = leaf (compact), 1 = bitmask
@@ -32,7 +74,7 @@ inline constexpr size_t BOT_LEAF_MAX  = 4096;
 struct NodeHeader {
     uint16_t entries;      // compact: k/v count; bitmask: child count
     uint16_t descendants;  // total k/v pairs in subtree, capped at DESC_CAP
-    uint16_t alloc_u64;    // allocation size in u64s
+    uint16_t alloc_u64;    // allocation size in u64s (may be padded)
     uint8_t  skip;
     uint8_t  flags;
 

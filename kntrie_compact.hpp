@@ -23,7 +23,8 @@ struct IdxSearch {
         for (int i = 0; i < i1; ++i) dest[i] = src[i * 256];
         K* d2 = dest + i1;
         for (int i = 0; i < i2; ++i) d2[i] = src[i * 16];
-        std::memcpy(d2 + i2, src, count * sizeof(K));
+        // Use memmove: src may alias dest+extra when doing in-place ops
+        std::memmove(d2 + i2, src, count * sizeof(K));
     }
     static int subsearch(const K* s, int c, K key) noexcept {
         const K* p = s, *e = s + c;
@@ -59,6 +60,9 @@ struct IdxSearch {
 //
 // Layout: [header (1-2 u64)][search_overlay + sorted_keys][values]
 //   flags=0 → is_leaf (compact)
+//
+// Allocations are padded via round_up_u64 to enable in-place insert.
+// alloc_u64 stores the actual (padded) allocation size.
 // ==========================================================================
 
 template<typename KEY, typename VALUE, typename ALLOC>
@@ -67,7 +71,7 @@ struct CompactOps {
     using VT   = ValueTraits<VALUE, ALLOC>;
     using VST  = typename VT::slot_type;
 
-    // --- allocation size ---
+    // --- exact needed size (not padded) ---
 
     template<int BITS>
     static constexpr size_t size_u64(size_t count, uint8_t skip) noexcept {
@@ -88,7 +92,8 @@ struct CompactOps {
     static uint64_t* make_leaf(const typename suffix_traits<BITS>::type* sorted_keys,
                                const VST* values, uint32_t count,
                                uint8_t skip, uint64_t prefix, ALLOC& alloc) {
-        size_t au64 = size_u64<BITS>(count, skip);
+        size_t needed = size_u64<BITS>(count, skip);
+        size_t au64 = round_up_u64(needed);
         uint64_t* node = alloc_node(alloc, au64);
         auto* h = get_header(node);
         h->entries = static_cast<uint16_t>(count);
@@ -152,6 +157,8 @@ struct CompactOps {
 
     // ==================================================================
     // Insert  (returns needs_split=true when entries >= COMPACT_MAX)
+    //
+    // In-place when padded allocation has room; otherwise alloc new.
     // ==================================================================
 
     struct CompactInsertResult { uint64_t* node; bool inserted; bool needs_split; };
@@ -173,8 +180,18 @@ struct CompactOps {
         size_t ins = static_cast<size_t>(-(idx + 1));
         if (h->entries >= COMPACT_MAX) return {node, false, true};
 
-        uint16_t nc = h->entries + 1;
-        size_t au64 = size_u64<BITS>(nc, h->skip);
+        uint16_t count = h->entries;
+        uint16_t nc = count + 1;
+        size_t needed = size_u64<BITS>(nc, h->skip);
+
+        // --- In-place if we have capacity ---
+        if (needed <= h->alloc_u64) {
+            insert_in_place_<BITS>(node, h, suffix, value, ins);
+            return {node, true, false};
+        }
+
+        // --- Allocate new with padding ---
+        size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
         nh->entries = nc;
@@ -188,8 +205,8 @@ struct CompactOps {
         std::memcpy(nv, vd, ins * sizeof(VST));
         nk[ins] = suffix;
         VT::write_slot(&nv[ins], value);
-        std::memcpy(nk + ins + 1, kd + ins, (h->entries - ins) * sizeof(K));
-        std::memcpy(nv + ins + 1, vd + ins, (h->entries - ins) * sizeof(VST));
+        std::memcpy(nk + ins + 1, kd + ins, (count - ins) * sizeof(K));
+        std::memcpy(nv + ins + 1, vd + ins, (count - ins) * sizeof(VST));
         IdxSearch<K>::build(search_start_<BITS>(nn), nk, static_cast<int>(nc));
 
         dealloc_node(alloc, node, h->alloc_u64);
@@ -198,6 +215,8 @@ struct CompactOps {
 
     // ==================================================================
     // Erase  ({nullptr,true} when last entry removed)
+    //
+    // In-place when allocation isn't oversized (>2 steps).
     // ==================================================================
 
     template<int BITS>
@@ -218,7 +237,17 @@ struct CompactOps {
             dealloc_node(alloc, node, h->alloc_u64);
             return {nullptr, true};
         }
-        size_t au64 = size_u64<BITS>(nc, h->skip);
+
+        size_t needed = size_u64<BITS>(nc, h->skip);
+
+        // --- In-place if not oversized ---
+        if (!should_shrink_u64(h->alloc_u64, needed)) {
+            erase_in_place_<BITS>(node, h, idx);
+            return {node, true};
+        }
+
+        // --- Allocate smaller with padding ---
+        size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
         nh->entries = nc;
@@ -280,6 +309,114 @@ private:
         sb = (sb + 7) & ~size_t{7};
         return reinterpret_cast<const VST*>(
             reinterpret_cast<const char*>(node + header_u64(get_header(node)->skip)) + sb);
+    }
+
+    // ==================================================================
+    // In-place insert helper
+    //
+    // Precondition: alloc_u64 has room for nc = entries+1.
+    // Shifts values rightward, then keys rightward, rebuilds idx.
+    // ==================================================================
+
+    template<int BITS>
+    static void insert_in_place_(uint64_t* node, NodeHeader* h,
+                                  typename suffix_traits<BITS>::type suffix,
+                                  VST value, size_t ins) {
+        using K = typename suffix_traits<BITS>::type;
+        uint16_t count = h->entries;
+        uint16_t nc = count + 1;
+
+        char* base = reinterpret_cast<char*>(
+            node + header_u64(h->skip));
+
+        int old_extra = IdxSearch<K>::extra(static_cast<int>(count));
+        int new_extra = IdxSearch<K>::extra(static_cast<int>(nc));
+
+        size_t old_sb = (static_cast<size_t>(old_extra) + count) * sizeof(K);
+        old_sb = (old_sb + 7) & ~size_t{7};
+        size_t new_sb = (static_cast<size_t>(new_extra) + nc) * sizeof(K);
+        new_sb = (new_sb + 7) & ~size_t{7};
+
+        VST* old_vd = reinterpret_cast<VST*>(base + old_sb);
+        VST* new_vd = reinterpret_cast<VST*>(base + new_sb);
+        K*   old_kd = reinterpret_cast<K*>(base) + old_extra;
+        K*   new_kd = reinterpret_cast<K*>(base) + new_extra;
+
+        // 1. Move all old values to new position (rightward — safe with memmove)
+        std::memmove(new_vd, old_vd, count * sizeof(VST));
+        // Create gap at insertion point
+        std::memmove(new_vd + ins + 1, new_vd + ins,
+                     (count - ins) * sizeof(VST));
+        VT::write_slot(&new_vd[ins], value);
+
+        // 2. Move keys to new position (rightward if extra grew)
+        std::memmove(new_kd, old_kd, count * sizeof(K));
+        // Create gap at insertion point
+        std::memmove(new_kd + ins + 1, new_kd + ins,
+                     (count - ins) * sizeof(K));
+        new_kd[ins] = suffix;
+
+        // 3. Rebuild search index
+        IdxSearch<K>::build(reinterpret_cast<K*>(base),
+                            new_kd, static_cast<int>(nc));
+
+        // 4. Update header
+        h->entries = nc;
+        h->descendants = nc;
+    }
+
+    // ==================================================================
+    // In-place erase helper
+    //
+    // Precondition: allocation not oversized (checked by caller).
+    // Compacts keys/values leftward, adjusts layout, rebuilds idx.
+    // ==================================================================
+
+    template<int BITS>
+    static void erase_in_place_(uint64_t* node, NodeHeader* h, int idx) {
+        using K = typename suffix_traits<BITS>::type;
+        uint16_t count = h->entries;
+        uint16_t nc = count - 1;
+
+        char* base = reinterpret_cast<char*>(
+            node + header_u64(h->skip));
+
+        int old_extra = IdxSearch<K>::extra(static_cast<int>(count));
+        int new_extra = IdxSearch<K>::extra(static_cast<int>(nc));
+
+        size_t old_sb = (static_cast<size_t>(old_extra) + count) * sizeof(K);
+        old_sb = (old_sb + 7) & ~size_t{7};
+        size_t new_sb = (static_cast<size_t>(new_extra) + nc) * sizeof(K);
+        new_sb = (new_sb + 7) & ~size_t{7};
+
+        K*   old_kd = reinterpret_cast<K*>(base) + old_extra;
+        K*   new_kd = reinterpret_cast<K*>(base) + new_extra;
+        VST* old_vd = reinterpret_cast<VST*>(base + old_sb);
+        VST* new_vd = reinterpret_cast<VST*>(base + new_sb);
+
+        // 1. Remove key at idx (compact within old region)
+        std::memmove(old_kd + idx, old_kd + idx + 1,
+                     (count - idx - 1) * sizeof(K));
+
+        // 2. Remove value at idx (compact within old region)
+        std::memmove(old_vd + idx, old_vd + idx + 1,
+                     (count - idx - 1) * sizeof(VST));
+
+        // 3. Move keys to new position (leftward if extra shrank)
+        if (new_kd != old_kd)
+            std::memmove(new_kd, old_kd, nc * sizeof(K));
+
+        // 4. Move values to new position (leftward)
+        if (new_vd != old_vd)
+            std::memmove(new_vd, old_vd, nc * sizeof(VST));
+
+        // 5. Rebuild search index
+        IdxSearch<K>::build(reinterpret_cast<K*>(base),
+                            new_kd, static_cast<int>(nc));
+
+        // 6. Update header
+        h->entries = nc;
+        h->descendants = nc;
     }
 };
 

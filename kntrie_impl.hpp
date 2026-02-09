@@ -184,9 +184,6 @@ private:
 
     // ==================================================================
     // Find within a split node
-    //
-    // BITS > 16: branchless descent using sentinel children.
-    // BITS == 16: no sentinel layout, uses branching lookup_top.
     // ==================================================================
 
     template<int BITS>
@@ -196,21 +193,17 @@ private:
         uint8_t ti = KO::template extract_top8<BITS>(ik);
 
         if constexpr (BITS > 16) {
-            // Branchless top descent — sentinel on miss
             const uint64_t* bot = BO::template branchless_top_child<BITS>(node, ti);
 
-            // One branch: leaf vs internal
             if (BO::template is_top_entry_leaf<BITS>(node, ti)) [[unlikely]] {
                 return BO::template find_in_bot_leaf<BITS>(bot, ik);
             }
 
-            // Internal: branchless bot descent — sentinel on miss
             uint8_t bi = KO::template extract_top8<BITS - 8>(ik);
             const uint64_t* child = BO::branchless_bot_child(bot, bi);
             NodeHeader ch = *get_header(child);
             return find_impl<BITS - 16>(child, ik, ch, 0, 0);
         } else {
-            // BITS == 16: terminal level, no sentinel slot — branching lookup
             auto lk = BO::template lookup_top<BITS>(node, ti);
             if (!lk.found) [[unlikely]] return nullptr;
             return BO::template find_in_bot_leaf<BITS>(lk.bot, ik);
@@ -277,7 +270,6 @@ private:
         auto lk = BO::template lookup_top<BITS>(node, ti);
 
         if (!lk.found) {
-            // New bucket — add single-entry bot_leaf
             auto* bot = BO::template make_single_bot_leaf<BITS>(ik, value, alloc_);
             auto* nn = BO::template add_top_slot<BITS>(
                 node, h, ti, bot, /*is_leaf=*/true, alloc_);
@@ -326,7 +318,6 @@ private:
             return {node, ins};
         }
 
-        // New child in bot_internal
         constexpr int CB = BITS - 16;
         using CK = typename suffix_traits<CB>::type;
         CK ck = static_cast<CK>(KO::template extract_suffix<CB>(ik));
@@ -339,7 +330,7 @@ private:
     }
 
     // ==================================================================
-    // Conversion: compact leaf → split  (peer extraction pattern)
+    // Conversion: compact leaf → split
     // ==================================================================
 
     template<int BITS>
@@ -349,7 +340,6 @@ private:
     {
         using K = typename suffix_traits<BITS>::type;
 
-        // --- Extract from compact into working arrays ---
         uint16_t old_count = h->entries;
         size_t total = old_count + 1;
         auto wk = std::make_unique<uint64_t[]>(total);
@@ -368,10 +358,8 @@ private:
         });
         if (!ins) { wk[wi] = static_cast<uint64_t>(new_suffix); wv[wi] = value; }
 
-        // --- Build new structure ---
         uint64_t* child = build_node_from_arrays<BITS>(wk.get(), wv.get(), total);
 
-        // Prepend parent's skip/prefix if present
         if (h->skip > 0) {
             auto* ch2 = get_header(child);
             uint64_t old_cp = ch2->skip > 0 ? get_prefix(child) : 0;
@@ -384,13 +372,12 @@ private:
             else { ch2->skip = ns; set_prefix(child, combined); }
         }
 
-        // Deallocate old compact leaf (values transferred, not destroyed)
         dealloc_node(alloc_, node, h->alloc_u64);
         return {child, true};
     }
 
     // ==================================================================
-    // Conversion: bot_leaf → bot_internal  (peer extraction pattern)
+    // Conversion: bot_leaf → bot_internal
     // ==================================================================
 
     template<int BITS>
@@ -402,7 +389,6 @@ private:
         constexpr int sb = BITS - 8;
         using S = typename suffix_traits<sb>::type;
 
-        // --- Extract from bot_leaf into working arrays + merge new entry ---
         size_t total = count + 1;
         auto wk = std::make_unique<S[]>(total);
         auto wv = std::make_unique<VST[]>(total);
@@ -418,7 +404,6 @@ private:
         });
         if (!ins) { wk[wi] = new_suffix; wv[wi] = value; }
 
-        // --- Group by high 8 bits, build children ---
         constexpr int CB = BITS - 16;
         using CK = typename suffix_traits<CB>::type;
         constexpr uint64_t cmask = (CB >= 64) ? ~uint64_t(0) : ((1ULL << CB) - 1);
@@ -434,7 +419,6 @@ private:
             while (i < total && static_cast<uint8_t>(wk[i] >> (sb - 8)) == bi) ++i;
             size_t cc = i - start;
 
-            // Build compact leaf for this child
             auto ck = std::make_unique<CK[]>(cc);
             for (size_t j = 0; j < cc; ++j)
                 ck[j] = static_cast<CK>(wk[start + j] & cmask);
@@ -449,25 +433,22 @@ private:
 
         auto* new_bot = BO::make_bot_internal(indices, child_ptrs, n_children, alloc_);
 
-        // Update split-top: set child and mark as internal
         BO::template set_top_child<BITS>(node, ts, new_bot);
         BO::template mark_bot_internal<BITS>(node, ti);
         h->add_descendants(1);
 
-        // Deallocate old bot_leaf (values transferred, not destroyed)
         BO::template dealloc_bot_leaf<BITS>(bot, count, alloc_);
         return {node, true};
     }
 
     // ==================================================================
-    // Build node from working arrays (recursive, handles prefix compression)
+    // Build node from working arrays
     // ==================================================================
 
     template<int BITS>
     uint64_t* build_node_from_arrays(uint64_t* suf, VST* vals, size_t count)
         requires (BITS > 0)
     {
-        // --- Compact leaf ---
         if (count <= COMPACT_MAX) {
             using K = typename suffix_traits<BITS>::type;
             auto tk = std::make_unique<K[]>(count);
@@ -484,7 +465,6 @@ private:
                 tk.get(), tv.get(), static_cast<uint32_t>(count), 0, 0, alloc_);
         }
 
-        // --- Check prefix compression ---
         if constexpr (BITS > 16) {
             uint8_t first_top = static_cast<uint8_t>(suf[0] >> (BITS - 8));
             bool all_same_top = true;
@@ -508,7 +488,6 @@ private:
 
                     uint64_t* child = build_node_from_arrays<CB>(suf, vals, count);
 
-                    // Prepend the skip prefix
                     auto* ch = get_header(child);
                     uint64_t ocp = ch->skip > 0 ? get_prefix(child) : 0;
                     uint8_t  os  = ch->skip;
@@ -523,11 +502,9 @@ private:
             }
         }
 
-        // --- Build split ---
         return build_split_from_arrays<BITS>(suf, vals, count);
     }
 
-    // Build a split node from sorted uint64_t working arrays
     template<int BITS>
     uint64_t* build_split_from_arrays(uint64_t* suf, VST* vals, size_t count)
         requires (BITS > 0)
@@ -576,7 +553,6 @@ private:
             static_cast<uint32_t>(count), alloc_);
     }
 
-    // Build a bot_internal from a range that exceeds BOT_LEAF_MAX
     template<int BITS>
     uint64_t* build_bot_internal_from_range(uint64_t* suf, VST* vals, size_t count)
         requires (BITS > 16)
@@ -619,7 +595,8 @@ private:
         assert(h->skip == 0);
 
         size_t old_sz = h->alloc_u64;
-        size_t new_sz = old_sz + 1;  // +1 u64 for prefix slot
+        size_t new_needed = old_sz + 1;  // +1 u64 for prefix slot
+        size_t new_sz = round_up_u64(new_needed);
 
         size_t data_u64 = old_sz - 1;  // everything after 1-u64 header
         uint64_t* nn = alloc_node(alloc_, new_sz);
@@ -644,7 +621,6 @@ private:
         uint64_t actual = get_prefix(node);
         int skip = h->skip;
 
-        // Find first differing 16-bit chunk (high to low)
         int common = 0;
         for (int i = skip - 1; i >= 0; --i) {
             uint16_t ec = (expected >> (i * 16)) & 0xFFFF;
@@ -661,13 +637,11 @@ private:
         uint64_t split_prefix = common > 0
             ? (expected >> ((skip - common) * 16)) : 0;
 
-        // Adjust old node's skip/prefix for remaining levels below divergence
         int rem = di;
         h->skip = static_cast<uint8_t>(rem);
         if (rem > 0)
             set_prefix(node, actual & ((1ULL << (rem * 16)) - 1));
 
-        // Create new leaf for the new key at BITS-16
         constexpr int CB = BITS - 16;
         using CK = typename suffix_traits<CB>::type;
         CK ck = static_cast<CK>(KO::template extract_suffix<CB>(ik));
@@ -679,7 +653,6 @@ private:
         uint32_t total_desc = static_cast<uint32_t>(h->descendants) + 1;
 
         if (nt == ot) {
-            // Same top 8, different bottom 8 → one top bucket with bot_internal(2)
             uint8_t nb = nc & 0xFF, ob = oc & 0xFF;
 
             uint8_t bi[2]; uint64_t* cp[2];
@@ -695,7 +668,6 @@ private:
                 total_desc, alloc_);
             return {sn, true};
         } else {
-            // Different top 8 → two top buckets, each with bot_internal(1)
             uint8_t ob = oc & 0xFF, nb = nc & 0xFF;
 
             uint8_t obi[1] = {ob}; uint64_t* ocp[1] = {node};
@@ -777,7 +749,6 @@ private:
                 h->sub_descendants(1);
                 return {node, true};
             }
-            // Bot removed — remove top slot
             auto* nn = BO::template remove_top_slot<BITS>(
                 node, h, lk.slot, ti, alloc_);
             return {nn, true};
@@ -790,7 +761,7 @@ private:
     }
 
     // ------------------------------------------------------------------
-    // Erase from bot_internal (recurse into child)
+    // Erase from bot_internal
     // ------------------------------------------------------------------
 
     template<int BITS>
@@ -812,7 +783,6 @@ private:
             return {node, true};
         }
 
-        // Child removed — shrink or remove bot_internal
         int bc = BO::bot_internal_child_count(bot);
         if (bc == 1) {
             BO::dealloc_bot_internal(bot, alloc_);
@@ -827,7 +797,7 @@ private:
     }
 
     // ==================================================================
-    // Remove all — recursive cleanup
+    // Remove all
     // ==================================================================
 
     void remove_all() noexcept {
@@ -861,7 +831,6 @@ private:
                 CO::template destroy_and_dealloc<BITS>(node, alloc_);
                 return;
             }
-            // Bitmask node
             BO::template for_each_top<BITS>(node,
                 [&](uint8_t /*ti*/, int /*slot*/, uint64_t* bot, bool is_leaf) {
                     if (is_leaf) {
