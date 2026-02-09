@@ -36,34 +36,35 @@ struct Result {
     const char* name;
     double insert_ms;
     double read_ms;
+    double erase_ms;
     size_t memory_bytes;
 };
 
 static void print_header() {
-    std::printf("%-20s %12s %12s %12s %12s %12s %12s %12s\n",
-                "Container", "Insert(ms)", "Read(ms)", "Memory(KB)",
-                "Ins rel", "Read rel", "Mem rel", "ns/read");
-    std::printf("%-20s %12s %12s %12s %12s %12s %12s %12s\n",
+    std::printf("%-20s %12s %12s %12s %12s %12s %12s %12s %12s\n",
+                "Container", "Insert(ms)", "Read(ms)", "Erase(ms)", "Memory(KB)",
+                "Ins rel", "Read rel", "Erase rel", "Mem rel");
+    std::printf("%-20s %12s %12s %12s %12s %12s %12s %12s %12s\n",
                 "--------------------", "----------", "----------", "----------",
-                "----------", "----------", "----------", "----------");
+                "----------", "----------", "----------", "----------", "----------");
 }
 
 static void print_row(const Result& r, const Result& base, size_t n) {
-    double ins_rel  = r.insert_ms  / base.insert_ms;
-    double read_rel = r.read_ms    / base.read_ms;
-    double mem_rel  = static_cast<double>(r.memory_bytes) / base.memory_bytes;
-    double ns_read  = r.read_ms * 1e6 / n;
-    std::printf("%-20s %12.2f %12.2f %12.1f %11.2fx %11.2fx %11.2fx %12.1f\n",
-                r.name, r.insert_ms, r.read_ms,
+    double ins_rel   = r.insert_ms / base.insert_ms;
+    double read_rel  = r.read_ms   / base.read_ms;
+    double erase_rel = base.erase_ms > 0 ? r.erase_ms / base.erase_ms : 0;
+    double mem_rel   = static_cast<double>(r.memory_bytes) / base.memory_bytes;
+    std::printf("%-20s %12.2f %12.2f %12.2f %12.1f %11.2fx %11.2fx %11.2fx %11.2fx\n",
+                r.name, r.insert_ms, r.read_ms, r.erase_ms,
                 r.memory_bytes / 1024.0,
-                ins_rel, read_rel, mem_rel, ns_read);
+                ins_rel, read_rel, erase_rel, mem_rel);
 }
 
 using LookupRounds = std::vector<std::vector<uint64_t>>;
 
 static Result bench_kntrie(const std::vector<uint64_t>& keys,
                             const LookupRounds& rounds) {
-    Result res{"kntrie", 0, 0, 0};
+    Result res{"kntrie", 0, 0, 0, 0};
     gteitelbaum::kntrie<uint64_t, uint64_t> trie;
 
     double t0 = now_ms();
@@ -85,12 +86,19 @@ static Result bench_kntrie(const std::vector<uint64_t>& keys,
     }
     res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
     do_not_optimize(checksum);
+
+    // Erase benchmark (shuffled order)
+    double t2 = now_ms();
+    for (auto k : rounds[0]) trie.erase(k);
+    res.erase_ms = now_ms() - t2;
+    if (!trie.empty())
+        std::fprintf(stderr, "kntrie: not empty after erase, %zu remaining\n", trie.size());
     return res;
 }
 
 static Result bench_stdmap(const std::vector<uint64_t>& keys,
                            const LookupRounds& rounds) {
-    Result res{"std::map", 0, 0, 0};
+    Result res{"std::map", 0, 0, 0, 0};
     size_t rss0 = rss_bytes();
     std::map<uint64_t, uint64_t> m;
 
@@ -111,12 +119,16 @@ static Result bench_stdmap(const std::vector<uint64_t>& keys,
     }
     res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
     do_not_optimize(checksum);
+
+    double t2 = now_ms();
+    for (auto k : rounds[0]) m.erase(k);
+    res.erase_ms = now_ms() - t2;
     return res;
 }
 
 static Result bench_unorderedmap(const std::vector<uint64_t>& keys,
                                  const LookupRounds& rounds) {
-    Result res{"std::unordered_map", 0, 0, 0};
+    Result res{"std::unordered_map", 0, 0, 0, 0};
     size_t rss0 = rss_bytes();
     std::unordered_map<uint64_t, uint64_t> m;
     m.reserve(keys.size());
@@ -138,6 +150,10 @@ static Result bench_unorderedmap(const std::vector<uint64_t>& keys,
     }
     res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
     do_not_optimize(checksum);
+
+    double t2 = now_ms();
+    for (auto k : rounds[0]) m.erase(k);
+    res.erase_ms = now_ms() - t2;
     return res;
 }
 
@@ -178,7 +194,6 @@ int main(int argc, char** argv) {
     n = keys.size();
     std::shuffle(keys.begin(), keys.end(), rng);
 
-    // Pre-generate all lookup rounds — each independently shuffled
     LookupRounds rounds(read_iters);
     for (int i = 0; i < read_iters; ++i) {
         rounds[i] = keys;
