@@ -24,15 +24,24 @@ private:
     using CO  = CompactOps<KEY, VALUE, ALLOC>;
     using BO  = BitmaskOps<KEY, VALUE, ALLOC>;
 
-    static constexpr int KEY_BITS = static_cast<int>(KO::key_bits);
+    static constexpr int KEY_BITS  = static_cast<int>(KO::key_bits);
+    static constexpr int ROOT_BITS = KEY_BITS - 8;   // bits remaining after root index
+    static_assert(ROOT_BITS >= 8, "Key type must be at least 16 bits");
 
-    uint64_t* root_;
+    // Root array: 256 slots indexed by top 8 bits of internal key.
+    // Each slot is either SENTINEL_NODE (empty), a compact leaf (CO<ROOT_BITS>),
+    // or a bot_internal whose children are at BITS = ROOT_BITS - 8.
+    uint64_t* root_[256];
     size_t    size_;
     [[no_unique_address]] ALLOC alloc_;
 
 public:
+    // ==================================================================
+    // Constructor / Destructor
+    // ==================================================================
+
     kntrie3() : size_(0), alloc_() {
-        root_ = CO::template make_leaf<KEY_BITS>(nullptr, nullptr, 0, 0, 0, alloc_);
+        for (int i = 0; i < 256; ++i) root_[i] = SENTINEL_NODE;
     }
 
     ~kntrie3() { remove_all(); }
@@ -45,40 +54,118 @@ public:
 
     void clear() noexcept {
         remove_all();
-        root_ = CO::template make_leaf<KEY_BITS>(nullptr, nullptr, 0, 0, 0, alloc_);
         size_ = 0;
     }
 
+    // ==================================================================
+    // Find
+    // ==================================================================
+
     const VALUE* find_value(const KEY& key) const noexcept {
         uint64_t ik = KO::to_internal(key);
-        NodeHeader h = *get_header(root_);
-        return find_impl<KEY_BITS>(root_, ik, h, 0, 0);
+        uint8_t ti = static_cast<uint8_t>(ik >> 56);
+        const uint64_t* child = root_[ti];
+        NodeHeader h = *get_header(child);
+
+        if (h.is_leaf())
+            return CO::template find<ROOT_BITS>(child, &h, ik);
+
+        // bot_internal: extract next 8 bits, descend
+        if constexpr (ROOT_BITS > 8) {
+            uint8_t bi = KO::template extract_top8<ROOT_BITS>(ik);
+            const uint64_t* grandchild = BO::branchless_bot_child(child, bi);
+            NodeHeader gh = *get_header(grandchild);
+            return find_impl<ROOT_BITS - 8>(grandchild, ik, gh, 0, 0);
+        }
+        return nullptr;  // unreachable for ROOT_BITS > 8
     }
 
     bool contains(const KEY& key) const noexcept {
         return find_value(key) != nullptr;
     }
 
+    // ==================================================================
+    // Insert
+    // ==================================================================
+
     std::pair<bool, bool> insert(const KEY& key, const VALUE& value) {
         uint64_t ik = KO::to_internal(key);
         VST sv = VT::store(value, alloc_);
-        auto [new_root, inserted] = insert_impl<KEY_BITS>(root_, ik, sv);
-        root_ = new_root;
-        if (inserted) { ++size_; return {true, true}; }
-        VT::destroy(sv, alloc_);
-        return {true, false};
+        uint8_t ti = static_cast<uint8_t>(ik >> 56);
+        uint64_t* child = root_[ti];
+
+        // Empty slot: create single-entry compact leaf
+        if (child == SENTINEL_NODE) {
+            using K = typename suffix_traits<ROOT_BITS>::type;
+            K suffix = static_cast<K>(KO::template extract_suffix<ROOT_BITS>(ik));
+            root_[ti] = CO::template make_leaf<ROOT_BITS>(
+                &suffix, &sv, 1, 0, 0, alloc_);
+            ++size_;
+            return {true, true};
+        }
+
+        auto* h = get_header(child);
+        if (h->is_leaf()) {
+            // Insert into compact leaf at ROOT_BITS
+            auto r = CO::template insert<ROOT_BITS>(child, h, ik, sv, alloc_);
+            if (r.needs_split) {
+                if constexpr (ROOT_BITS > 8) {
+                    root_[ti] = convert_root_child_to_bot_internal_(
+                        child, h, ik, sv);
+                    ++size_;
+                    return {true, true};
+                }
+                // ROOT_BITS == 8: can't overflow (max 256 entries, COMPACT_MAX=4096)
+            }
+            root_[ti] = r.node;
+            if (r.inserted) { ++size_; return {true, true}; }
+            VT::destroy(sv, alloc_);
+            return {true, false};
+        }
+
+        // bot_internal path
+        if constexpr (ROOT_BITS > 8) {
+            bool inserted = false;
+            root_[ti] = insert_into_root_bot_internal_(child, ik, sv, inserted);
+            if (inserted) { ++size_; return {true, true}; }
+            VT::destroy(sv, alloc_);
+            return {true, false};
+        }
+        return {true, false};  // unreachable
     }
+
+    // ==================================================================
+    // Erase
+    // ==================================================================
 
     bool erase(const KEY& key) {
         uint64_t ik = KO::to_internal(key);
-        auto [nn, erased] = erase_impl<KEY_BITS>(root_, ik);
-        if (erased) {
-            root_ = nn ? nn : CO::template make_leaf<KEY_BITS>(
-                nullptr, nullptr, 0, 0, 0, alloc_);
+        uint8_t ti = static_cast<uint8_t>(ik >> 56);
+        uint64_t* child = root_[ti];
+
+        if (child == SENTINEL_NODE) return false;
+
+        auto* h = get_header(child);
+        if (h->is_leaf()) {
+            auto r = CO::template erase<ROOT_BITS>(child, h, ik, alloc_);
+            if (!r.erased) return false;
+            root_[ti] = r.node ? r.node : SENTINEL_NODE;
             --size_;
+            return true;
         }
-        return erased;
+
+        // bot_internal path
+        if constexpr (ROOT_BITS > 8) {
+            bool erased = erase_from_root_bot_internal_(child, ti, ik);
+            if (erased) --size_;
+            return erased;
+        }
+        return false;  // unreachable
     }
+
+    // ==================================================================
+    // Stats / Memory
+    // ==================================================================
 
     struct DebugStats {
         struct Level {
@@ -93,7 +180,32 @@ public:
 
     DebugStats debug_stats() const noexcept {
         DebugStats s{};
-        collect_stats<KEY_BITS>(root_, s);
+        // Root array cost
+        s.total_bytes = 256 * sizeof(uint64_t*);
+        for (int ti = 0; ti < 256; ++ti) {
+            const uint64_t* child = root_[ti];
+            if (child == SENTINEL_NODE) continue;
+            const auto* h = get_header(child);
+            if (h->is_leaf()) {
+                // Compact leaf at ROOT_BITS — level 0
+                auto& L = s.levels[0];
+                L.compact_leaf++;
+                L.nodes++;
+                L.entries += h->entries;
+                L.bytes += static_cast<size_t>(h->alloc_u64) * 8;
+            } else {
+                if constexpr (ROOT_BITS > 8) {
+                    // bot_internal — level 0
+                    auto& L = s.levels[0];
+                    L.bot_internal++;
+                    L.bytes += BO::bot_internal_alloc_u64(child) * 8;
+                    BO::for_each_bot_child(child,
+                        [&](uint8_t, uint64_t* gc) {
+                            collect_stats<ROOT_BITS - 8>(gc, s);
+                        });
+                }
+            }
+        }
         for (int i = 0; i < 4; ++i) {
             s.total_nodes   += s.levels[i].nodes;
             s.total_bytes   += s.levels[i].bytes;
@@ -104,22 +216,28 @@ public:
 
     size_t memory_usage() const noexcept { return debug_stats().total_bytes; }
 
+    // ==================================================================
+    // Debug helpers
+    // ==================================================================
+
     struct RootInfo {
         uint16_t entries; uint16_t descendants; uint8_t skip;
         bool is_leaf; uint64_t prefix;
     };
     RootInfo debug_root_info() const {
-        auto* h = get_header(root_);
-        return {h->entries, h->descendants, h->skip,
-                h->is_leaf(),
-                h->skip > 0 ? get_prefix(root_) : 0};
+        int occupied = 0;
+        for (int i = 0; i < 256; ++i)
+            if (root_[i] != SENTINEL_NODE) ++occupied;
+        return {static_cast<uint16_t>(occupied),
+                static_cast<uint16_t>(std::min(size_, size_t{65535})),
+                0, false, 0};
     }
     uint64_t debug_key_to_internal(KEY k) const { return KO::to_internal(k); }
 
 private:
 
     // ==================================================================
-    // Find — recursive dispatch
+    // Find — recursive dispatch (BITS <= ROOT_BITS - 8)
     // ==================================================================
 
     // BITS=16: always split (bitmap top-8 → bitmap bot-8)
@@ -179,7 +297,7 @@ private:
             NodeHeader ch = *get_header(child);
             return find_impl<BITS - 16>(child, ik, ch, 0, 0);
         } else {
-            // BITS==16: branching lookup with early exit (skip popcounts on miss)
+            // BITS==16: branching lookup with early exit
             auto lk = BO::template lookup_top<BITS>(node, ti);
             if (!lk.found) [[unlikely]] return nullptr;
             return BO::template find_in_bot_leaf<BITS>(lk.bot, ik);
@@ -303,7 +421,6 @@ private:
         constexpr int CB = BITS - 16;
         uint64_t* child;
         if constexpr (CB == 16) {
-            // CB=16: must create split16 node, not compact leaf
             child = make_single_split16_(ik, value);
         } else {
             using CK = typename suffix_traits<CB>::type;
@@ -315,6 +432,138 @@ private:
         BO::template set_top_child<BITS>(node, ts, new_bot);
         h->add_descendants(1);
         return {node, true};
+    }
+
+    // ==================================================================
+    // Root-level: insert into bot_internal
+    // ==================================================================
+
+    uint64_t* insert_into_root_bot_internal_(uint64_t* bot, uint64_t ik,
+                                              VST value, bool& inserted)
+        requires (ROOT_BITS > 8)
+    {
+        constexpr int CB = ROOT_BITS - 8;  // child BITS
+        uint8_t bi = KO::template extract_top8<ROOT_BITS>(ik);
+        auto blk = BO::lookup_bot_child(bot, bi);
+
+        if (blk.found) {
+            auto [nc, ins] = insert_impl<CB>(blk.child, ik, value);
+            BO::set_bot_child(bot, blk.slot, nc);
+            inserted = ins;
+            return bot;
+        }
+
+        // Create new child at CB bits
+        uint64_t* child;
+        if constexpr (CB == 16) {
+            child = make_single_split16_(ik, value);
+        } else {
+            using CK = typename suffix_traits<CB>::type;
+            CK ck = static_cast<CK>(KO::template extract_suffix<CB>(ik));
+            child = CO::template make_leaf<CB>(&ck, &value, 1, 0, 0, alloc_);
+        }
+
+        auto* new_bot = BO::add_bot_child(bot, bi, child, alloc_);
+        inserted = true;
+        return new_bot;
+    }
+
+    // ==================================================================
+    // Root-level: convert compact leaf to bot_internal
+    // ==================================================================
+
+    uint64_t* convert_root_child_to_bot_internal_(
+            uint64_t* node, NodeHeader* h, uint64_t ik, VST value)
+        requires (ROOT_BITS > 8)
+    {
+        using K = typename suffix_traits<ROOT_BITS>::type;
+        constexpr int CB = ROOT_BITS - 8;
+        using CK = typename suffix_traits<CB>::type;
+        constexpr uint64_t cmask = (CB >= 64) ? ~uint64_t(0) : ((1ULL << CB) - 1);
+
+        uint16_t old_count = h->entries;
+        size_t total = old_count + 1;
+        auto wk = std::make_unique<K[]>(total);
+        auto wv = std::make_unique<VST[]>(total);
+
+        // Merge existing entries + new entry in sorted order
+        K new_suffix = static_cast<K>(KO::template extract_suffix<ROOT_BITS>(ik));
+        size_t wi = 0;
+        bool ins = false;
+        CO::template for_each<ROOT_BITS>(node, h, [&](K s, VST v) {
+            if (!ins && new_suffix < s) {
+                wk[wi] = new_suffix; wv[wi] = value; wi++; ins = true;
+            }
+            wk[wi] = s; wv[wi] = v; wi++;
+        });
+        if (!ins) { wk[wi] = new_suffix; wv[wi] = value; }
+
+        // Group by top 8 bits of ROOT_BITS-bit suffix → children at CB bits
+        uint8_t  indices[256];
+        uint64_t* child_ptrs[256];
+        int n_children = 0;
+
+        size_t i = 0;
+        while (i < total) {
+            uint8_t bi = static_cast<uint8_t>(
+                static_cast<uint64_t>(wk[i]) >> (ROOT_BITS - 8));
+            size_t start = i;
+            while (i < total && static_cast<uint8_t>(
+                    static_cast<uint64_t>(wk[i]) >> (ROOT_BITS - 8)) == bi)
+                ++i;
+            size_t cc = i - start;
+
+            // Build child node at CB bits
+            auto csuf = std::make_unique<uint64_t[]>(cc);
+            for (size_t j = 0; j < cc; ++j)
+                csuf[j] = static_cast<uint64_t>(wk[start + j]) & cmask;
+
+            indices[n_children]    = bi;
+            child_ptrs[n_children] = build_node_from_arrays<CB>(
+                csuf.get(), wv.get() + start, cc);
+            n_children++;
+        }
+
+        auto* bot_int = BO::make_bot_internal(
+            indices, child_ptrs, n_children, alloc_);
+
+        // Deallocate old compact leaf (values ownership transferred)
+        dealloc_node(alloc_, node, h->alloc_u64);
+        return bot_int;
+    }
+
+    // ==================================================================
+    // Root-level: erase from bot_internal
+    // ==================================================================
+
+    bool erase_from_root_bot_internal_(uint64_t* bot, uint8_t ti, uint64_t ik)
+        requires (ROOT_BITS > 8)
+    {
+        constexpr int CB = ROOT_BITS - 8;
+        uint8_t bi = KO::template extract_top8<ROOT_BITS>(ik);
+        auto blk = BO::lookup_bot_child(bot, bi);
+        if (!blk.found) return false;
+
+        auto [nc, erased] = erase_impl<CB>(blk.child, ik);
+        if (!erased) return false;
+
+        if (nc) {
+            BO::set_bot_child(bot, blk.slot, nc);
+            return true;
+        }
+
+        // Child became empty
+        int bc = BO::bot_internal_child_count(bot);
+        if (bc == 1) {
+            // bot_internal now empty — deallocate, slot becomes SENTINEL
+            BO::dealloc_bot_internal(bot, alloc_);
+            root_[ti] = SENTINEL_NODE;
+            return true;
+        }
+
+        auto* nb = BO::remove_bot_child(bot, blk.slot, bi, alloc_);
+        root_[ti] = nb;
+        return true;
     }
 
     // ==================================================================
@@ -413,7 +662,6 @@ private:
 
             uint64_t* child;
             if constexpr (CB == 16) {
-                // CB=16: must create split16 node, not compact leaf
                 child = make_split16_from_sorted_(
                     ck.get(), wv.get() + start, cc);
             } else {
@@ -646,7 +894,6 @@ private:
         // Create new single-entry child at CB bits
         uint64_t* nl;
         if constexpr (CB == 16) {
-            // CB=16: must create split16, not compact leaf
             nl = make_single_split16_(ik, value);
         } else {
             using CK = typename suffix_traits<CB>::type;
@@ -698,7 +945,6 @@ private:
     // BITS=16 helpers: always-split node creation
     // ==================================================================
 
-    // Create single-entry split<16> node (top bitmap + one bot_leaf_16)
     uint64_t* make_single_split16_(uint64_t ik, VST value) {
         uint8_t ti = KO::template extract_top8<16>(ik);
         auto* bot = BO::template make_single_bot_leaf<16>(ik, value, alloc_);
@@ -709,7 +955,6 @@ private:
             ti_arr, bp_arr, il_arr, 1, 0, 0, 1, alloc_);
     }
 
-    // Build split<16> from sorted u16 keys + values
     uint64_t* make_split16_from_sorted_(const uint16_t* keys,
                                          const VST* vals, size_t count) {
         uint8_t   top_indices[256];
@@ -777,7 +1022,6 @@ private:
         requires (BITS > 0)
     {
         if constexpr (BITS == 16) {
-            // BITS=16: always split, no compact leaves
             return erase_from_split<16>(node, h, ik);
         } else {
             if (h->is_leaf())
@@ -859,7 +1103,23 @@ private:
     // ==================================================================
 
     void remove_all() noexcept {
-        if (root_) { remove_all_impl<KEY_BITS>(root_); root_ = nullptr; }
+        for (int ti = 0; ti < 256; ++ti) {
+            uint64_t* child = root_[ti];
+            if (child == SENTINEL_NODE) continue;
+            auto* h = get_header(child);
+            if (h->is_leaf()) {
+                CO::template destroy_and_dealloc<ROOT_BITS>(child, alloc_);
+            } else {
+                if constexpr (ROOT_BITS > 8) {
+                    BO::for_each_bot_child(child,
+                        [&](uint8_t, uint64_t* gc) {
+                            remove_all_impl<ROOT_BITS - 8>(gc);
+                        });
+                    BO::dealloc_bot_internal(child, alloc_);
+                }
+            }
+            root_[ti] = SENTINEL_NODE;
+        }
         size_ = 0;
     }
 
@@ -940,7 +1200,6 @@ private:
                                bool compressed) const noexcept {
         if constexpr (BITS <= 0) return;
         else if constexpr (BITS == 16) {
-            // BITS=16: always split
             constexpr int li = (KEY_BITS - 16) / 16;
             auto& L = s.levels[li < 4 ? li : 3];
             auto* h = get_header(node);
