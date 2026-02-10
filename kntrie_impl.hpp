@@ -399,12 +399,7 @@ private:
 
         if (blk.found) {
             auto [nc, ins] = insert_impl<BITS - 16>(blk.child, ik, value);
-            if (nc != blk.child) {
-                BO::set_bot_child(bot, blk.slot, nc);
-                // Evict if old child was embedded and moved to heap
-                if (get_header(blk.child)->is_embedded())
-                    BO::evict_bot_embed_slot_(bot, blk.child);
-            }
+            BO::set_bot_child(bot, blk.slot, nc);
             if (ins) h->add_descendants(1);
             return {node, ins};
         }
@@ -439,11 +434,7 @@ private:
 
         if (blk.found) {
             auto [nc, ins] = insert_impl<CB>(blk.child, ik, value);
-            if (nc != blk.child) {
-                BO::set_bot_child(bot, blk.slot, nc);
-                if (get_header(blk.child)->is_embedded())
-                    BO::evict_bot_embed_slot_(bot, blk.child);
-            }
+            BO::set_bot_child(bot, blk.slot, nc);
             inserted = ins;
             return bot;
         }
@@ -538,17 +529,9 @@ private:
         if (!erased) return false;
 
         if (nc) {
-            if (nc != blk.child) {
-                BO::set_bot_child(bot, blk.slot, nc);
-                if (get_header(blk.child)->is_embedded())
-                    BO::evict_bot_embed_slot_(bot, blk.child);
-            }
+            BO::set_bot_child(bot, blk.slot, nc);
             return true;
         }
-
-        // Child fully erased — evict embed if needed
-        if (get_header(blk.child)->is_embedded())
-            BO::evict_bot_embed_slot_(bot, blk.child);
 
         int bc = BO::bot_internal_child_count(bot);
         if (bc == 1) {
@@ -1075,17 +1058,9 @@ private:
         h->sub_descendants(1);
 
         if (nc) {
-            if (nc != blk.child) {
-                BO::set_bot_child(bot, blk.slot, nc);
-                if (get_header(blk.child)->is_embedded())
-                    BO::evict_bot_embed_slot_(bot, blk.child);
-            }
+            BO::set_bot_child(bot, blk.slot, nc);
             return {node, true};
         }
-
-        // Child fully erased — evict embed if needed before removing slot
-        if (get_header(blk.child)->is_embedded())
-            BO::evict_bot_embed_slot_(bot, blk.child);
 
         int bc = BO::bot_internal_child_count(bot);
         if (bc == 1) {
@@ -1225,8 +1200,7 @@ private:
                 if (compressed) L.compact_leaf_compressed++;
                 L.nodes++;
                 L.entries += h->entries;
-                if (!h->is_embedded())
-                    L.bytes += static_cast<size_t>(h->alloc_u64) * 8;
+                L.bytes += static_cast<size_t>(h->alloc_u64) * 8;
             } else {
                 L.split_nodes++;
                 if (compressed) L.split_nodes_compressed++;
