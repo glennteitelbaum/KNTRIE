@@ -10,7 +10,7 @@
 namespace kn3 {
 
 // ==========================================================================
-// Search Strategy: IdxSearch  (idx1 -> idx2 -> key)
+// Search Strategy: IdxSearch  (idx1 → idx2 → key)
 // ==========================================================================
 
 template<typename K>
@@ -56,10 +56,10 @@ struct IdxSearch {
 };
 
 // ==========================================================================
-// CompactOps  -- builds/searches/mutates compact leaf nodes
+// CompactOps  – builds/searches/mutates compact leaf nodes
 //
 // Layout: [header (1-2 u64)][search_overlay + sorted_keys][values]
-//   flags_ bit 0 = 0 -> is_leaf (compact)
+//   flags=0 → is_leaf (compact)
 //
 // Allocations are padded via round_up_u64 to enable in-place insert.
 // alloc_u64 stores the actual (padded) allocation size.
@@ -99,8 +99,8 @@ struct CompactOps {
         h->entries = static_cast<uint16_t>(count);
         h->descendants = static_cast<uint16_t>(count);
         h->alloc_u64 = static_cast<uint16_t>(au64);
-        h->set_skip(skip);
-        // flags_ bit 0 remains 0 -> is_leaf (compact)
+        h->skip = skip;
+        // flags remains 0 → is_leaf (compact)
         if (skip > 0) set_prefix(node, prefix);
 
         using K = typename suffix_traits<BITS>::type;
@@ -137,8 +137,7 @@ struct CompactOps {
             VST* vd = vals_<BITS>(node, h->entries);
             for (uint16_t i = 0; i < h->entries; ++i) VT::destroy(vd[i], alloc);
         }
-        if (!h->is_embedded())
-            dealloc_node(alloc, node, h->alloc_u64);
+        dealloc_node(alloc, node, h->alloc_u64);
     }
 
     // ==================================================================
@@ -183,7 +182,7 @@ struct CompactOps {
 
         uint16_t count = h->entries;
         uint16_t nc = count + 1;
-        size_t needed = size_u64<BITS>(nc, h->skip());
+        size_t needed = size_u64<BITS>(nc, h->skip);
 
         // --- In-place if we have capacity ---
         if (needed <= h->alloc_u64) {
@@ -198,8 +197,7 @@ struct CompactOps {
         nh->entries = nc;
         nh->descendants = nc;
         nh->alloc_u64 = static_cast<uint16_t>(au64);
-        nh->clear_embedded();  // new heap node is not embedded
-        if (h->skip() > 0) set_prefix(nn, get_prefix(node));
+        if (h->skip > 0) set_prefix(nn, get_prefix(node));
 
         K*   nk = keys_data_<BITS>(nn, nc);
         VST* nv = vals_<BITS>(nn, nc);
@@ -211,8 +209,7 @@ struct CompactOps {
         std::memcpy(nv + ins + 1, vd + ins, (count - ins) * sizeof(VST));
         IdxSearch<K>::build(search_start_<BITS>(nn), nk, static_cast<int>(nc));
 
-        if (!h->is_embedded())
-            dealloc_node(alloc, node, h->alloc_u64);
+        dealloc_node(alloc, node, h->alloc_u64);
         return {nn, true, false};
     }
 
@@ -237,12 +234,11 @@ struct CompactOps {
 
         uint16_t nc = count - 1;
         if (nc == 0) {
-            if (!h->is_embedded())
-                dealloc_node(alloc, node, h->alloc_u64);
+            dealloc_node(alloc, node, h->alloc_u64);
             return {nullptr, true};
         }
 
-        size_t needed = size_u64<BITS>(nc, h->skip());
+        size_t needed = size_u64<BITS>(nc, h->skip);
 
         // --- In-place if not oversized ---
         if (!should_shrink_u64(h->alloc_u64, needed)) {
@@ -257,8 +253,7 @@ struct CompactOps {
         nh->entries = nc;
         nh->descendants = nc;
         nh->alloc_u64 = static_cast<uint16_t>(au64);
-        nh->clear_embedded();  // new heap node is not embedded
-        if (h->skip() > 0) set_prefix(nn, get_prefix(node));
+        if (h->skip > 0) set_prefix(nn, get_prefix(node));
 
         K*   nk = keys_data_<BITS>(nn, nc);
         VST* nv = vals_<BITS>(nn, nc);
@@ -268,8 +263,7 @@ struct CompactOps {
         std::memcpy(nv + idx, vd + idx + 1, (nc - idx) * sizeof(VST));
         IdxSearch<K>::build(search_start_<BITS>(nn), nk, static_cast<int>(nc));
 
-        if (!h->is_embedded())
-            dealloc_node(alloc, node, h->alloc_u64);
+        dealloc_node(alloc, node, h->alloc_u64);
         return {nn, true};
     }
 
@@ -279,12 +273,12 @@ private:
     template<int BITS>
     static auto search_start_(uint64_t* node) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        return reinterpret_cast<K*>(node + header_u64(get_header(node)->skip()));
+        return reinterpret_cast<K*>(node + header_u64(get_header(node)->skip));
     }
     template<int BITS>
     static auto search_start_(const uint64_t* node) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        return reinterpret_cast<const K*>(node + header_u64(get_header(node)->skip()));
+        return reinterpret_cast<const K*>(node + header_u64(get_header(node)->skip));
     }
 
     template<int BITS>
@@ -305,7 +299,7 @@ private:
         size_t sb = (static_cast<size_t>(ex) + count) * sizeof(K);
         sb = (sb + 7) & ~size_t{7};
         return reinterpret_cast<VST*>(
-            reinterpret_cast<char*>(node + header_u64(get_header(node)->skip())) + sb);
+            reinterpret_cast<char*>(node + header_u64(get_header(node)->skip)) + sb);
     }
     template<int BITS>
     static const VST* vals_(const uint64_t* node, size_t count) noexcept {
@@ -314,7 +308,7 @@ private:
         size_t sb = (static_cast<size_t>(ex) + count) * sizeof(K);
         sb = (sb + 7) & ~size_t{7};
         return reinterpret_cast<const VST*>(
-            reinterpret_cast<const char*>(node + header_u64(get_header(node)->skip())) + sb);
+            reinterpret_cast<const char*>(node + header_u64(get_header(node)->skip)) + sb);
     }
 
     // ==================================================================
@@ -333,7 +327,7 @@ private:
         uint16_t nc = count + 1;
 
         char* base = reinterpret_cast<char*>(
-            node + header_u64(h->skip()));
+            node + header_u64(h->skip));
 
         int old_extra = IdxSearch<K>::extra(static_cast<int>(count));
         int new_extra = IdxSearch<K>::extra(static_cast<int>(nc));
@@ -348,7 +342,7 @@ private:
         K*   old_kd = reinterpret_cast<K*>(base) + old_extra;
         K*   new_kd = reinterpret_cast<K*>(base) + new_extra;
 
-        // 1. Move all old values to new position (rightward -- safe with memmove)
+        // 1. Move all old values to new position (rightward — safe with memmove)
         std::memmove(new_vd, old_vd, count * sizeof(VST));
         // Create gap at insertion point
         std::memmove(new_vd + ins + 1, new_vd + ins,
@@ -385,7 +379,7 @@ private:
         uint16_t nc = count - 1;
 
         char* base = reinterpret_cast<char*>(
-            node + header_u64(h->skip()));
+            node + header_u64(h->skip));
 
         int old_extra = IdxSearch<K>::extra(static_cast<int>(count));
         int new_extra = IdxSearch<K>::extra(static_cast<int>(nc));
