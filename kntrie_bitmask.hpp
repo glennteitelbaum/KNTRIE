@@ -77,12 +77,7 @@ struct Bitmap256 {
 };
 
 // ==========================================================================
-// BitmaskOps  – split-top, bot-leaf, bot-internal operations
-//
-// Split-top nodes have NodeHeader with alloc_u64 → padded allocation,
-// in-place add/remove when capacity allows.
-//
-// Bot-leaf-16 and bot-internal have no header → exact allocation only.
+// BitmaskOps  -- split-top, bot-leaf, bot-internal operations
 // ==========================================================================
 
 template<typename KEY, typename VALUE, typename ALLOC>
@@ -107,8 +102,9 @@ struct BitmaskOps {
     template<int BITS>
     static constexpr size_t bot_leaf_size_u64(size_t count) noexcept {
         if constexpr (BITS == 16) {
+            // Layout: [header 1][bitmap 4][values...]
             size_t vb = count * sizeof(VST); vb = (vb + 7) & ~size_t{7};
-            return BITMAP256_U64 + vb / 8;
+            return 1 + BITMAP256_U64 + vb / 8;
         } else {
             return CO::template size_u64<BITS - 8>(count, 0);
         }
@@ -119,7 +115,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Split-top: lookup (for insert/erase — 0-based slot via real_children)
+    // Split-top: lookup (for insert/erase -- 0-based slot via real_children)
     // ==================================================================
 
     struct TopLookup {
@@ -172,8 +168,6 @@ struct BitmaskOps {
 
     // ==================================================================
     // Split-top: add a new top slot
-    //
-    // In-place when padded allocation has room; otherwise alloc new.
     // ==================================================================
 
     template<int BITS>
@@ -183,7 +177,7 @@ struct BitmaskOps {
         Bitmap256& tbm = top_bitmap_(node);
         size_t otc = h->entries, ntc = otc + 1;
         int isl = tbm.slot_for_insert(ti);
-        size_t needed = split_top_size_u64<BITS>(ntc, h->skip);
+        size_t needed = split_top_size_u64<BITS>(ntc, h->skip());
 
         // --- In-place if we have capacity ---
         if (needed <= h->alloc_u64) {
@@ -206,7 +200,7 @@ struct BitmaskOps {
         nh->entries = static_cast<uint16_t>(ntc);
         nh->add_descendants(1);
         nh->alloc_u64 = static_cast<uint16_t>(au64);
-        if (h->skip > 0) set_prefix(nn, get_prefix(node));
+        if (h->skip() > 0) set_prefix(nn, get_prefix(node));
 
         top_bitmap_(nn) = tbm;
         top_bitmap_(nn).set_bit(ti);
@@ -229,8 +223,6 @@ struct BitmaskOps {
 
     // ==================================================================
     // Split-top: remove a top slot
-    //
-    // In-place when not oversized (>2 steps); otherwise shrink.
     // ==================================================================
 
     template<int BITS>
@@ -242,7 +234,7 @@ struct BitmaskOps {
             return nullptr;
         }
 
-        size_t needed = split_top_size_u64<BITS>(ntc, h->skip);
+        size_t needed = split_top_size_u64<BITS>(ntc, h->skip());
 
         // --- In-place if not oversized ---
         if (!should_shrink_u64(h->alloc_u64, needed)) {
@@ -264,7 +256,7 @@ struct BitmaskOps {
         nh->entries = static_cast<uint16_t>(ntc);
         nh->sub_descendants(1);
         nh->alloc_u64 = static_cast<uint16_t>(au64);
-        if (h->skip > 0) set_prefix(nn, get_prefix(node));
+        if (h->skip() > 0) set_prefix(nn, get_prefix(node));
 
         top_bitmap_(nn) = top_bitmap_(node);
         top_bitmap_(nn).clear_bit(ti);
@@ -333,7 +325,7 @@ struct BitmaskOps {
         nh->descendants = total_descendants > NodeHeader::DESC_CAP
             ? NodeHeader::DESC_CAP : static_cast<uint16_t>(total_descendants);
         nh->alloc_u64 = static_cast<uint16_t>(au64);
-        nh->skip = skip;
+        nh->set_skip(skip);
         nh->set_bitmask();
         if (skip > 0) set_prefix(nn, prefix);
 
@@ -378,7 +370,7 @@ struct BitmaskOps {
 
     template<int BITS>
     static uint32_t bot_leaf_count(const uint64_t* bot) noexcept {
-        if constexpr (BITS == 16) return bot_leaf_bm_(bot).popcount();
+        if constexpr (BITS == 16) return get_header(bot)->entries;
         else return get_header(bot)->entries;
     }
 
@@ -395,7 +387,8 @@ struct BitmaskOps {
             int slot = bm.count_below(suffix);
             return VT::as_ptr(bot_leaf_vals_16_(bot)[slot]);
         } else {
-            return CO::template find<BITS - 8>(bot, *get_header(bot), ik);
+            NodeHeader h = *get_header(bot);
+            return CO::template find<BITS - 8>(bot, h, ik);
         }
     }
 
@@ -439,7 +432,11 @@ struct BitmaskOps {
     template<int BITS>
     static uint64_t* make_single_bot_leaf(uint64_t ik, VST value, ALLOC& alloc) {
         if constexpr (BITS == 16) {
-            uint64_t* bot = alloc_node(alloc, bot_leaf_size_u64<BITS>(1));
+            size_t sz = bot_leaf_size_u64<BITS>(1);
+            uint64_t* bot = alloc_node(alloc, sz);
+            auto* bh = get_header(bot);
+            bh->entries = 1;
+            bh->alloc_u64 = static_cast<uint16_t>(sz);
             uint8_t suffix = static_cast<uint8_t>(KOps::template extract_suffix<8>(ik));
             bot_leaf_bm_(bot).set_bit(suffix);
             VT::write_slot(&bot_leaf_vals_16_(bot)[0], value);
@@ -461,7 +458,11 @@ struct BitmaskOps {
             const typename suffix_traits<(BITS > 16 ? BITS - 8 : 8)>::type* sorted_suffixes,
             const VST* values, uint32_t count, ALLOC& alloc) {
         if constexpr (BITS == 16) {
-            uint64_t* bot = alloc_node(alloc, bot_leaf_size_u64<BITS>(count));
+            size_t sz = bot_leaf_size_u64<BITS>(count);
+            uint64_t* bot = alloc_node(alloc, sz);
+            auto* bh = get_header(bot);
+            bh->entries = static_cast<uint16_t>(count);
+            bh->alloc_u64 = static_cast<uint16_t>(sz);
             auto& bm = bot_leaf_bm_(bot);
             bm = Bitmap256{};
             for (uint32_t i = 0; i < count; ++i) bm.set_bit(sorted_suffixes[i]);
@@ -483,9 +484,11 @@ struct BitmaskOps {
     static void for_each_bot_leaf(const uint64_t* bot, Fn&& cb) {
         if constexpr (BITS == 16) {
             const Bitmap256& bm = bot_leaf_bm_(bot);
-            uint32_t count = bm.popcount();
+            const auto* bh = get_header(bot);
+            uint32_t count = bh->entries;
             const VST* vd = bot_leaf_vals_16_(bot);
             int slot = 0;
+            (void)count;
             for (int i = bm.find_next_set(0); i >= 0; i = bm.find_next_set(i + 1))
                 cb(static_cast<uint8_t>(i), vd[slot++]);
         } else {
@@ -500,12 +503,14 @@ struct BitmaskOps {
     template<int BITS>
     static void destroy_bot_leaf_and_dealloc(uint64_t* bot, ALLOC& alloc) {
         if constexpr (BITS == 16) {
-            uint32_t count = bot_leaf_count<BITS>(bot);
+            auto* bh = get_header(bot);
+            uint32_t count = bh->entries;
             if constexpr (!VT::is_inline) {
                 auto* vd = bot_leaf_vals_16_(bot);
                 for (uint32_t i = 0; i < count; ++i) VT::destroy(vd[i], alloc);
             }
-            dealloc_node(alloc, bot, bot_leaf_size_u64<16>(count));
+            if (!bh->is_embedded())
+                dealloc_node(alloc, bot, bh->alloc_u64);
         } else {
             CO::template destroy_and_dealloc<BITS - 8>(bot, alloc);
         }
@@ -513,11 +518,16 @@ struct BitmaskOps {
 
     // Deallocate without destroying values (ownership transferred)
     template<int BITS>
-    static void dealloc_bot_leaf(uint64_t* bot, uint32_t count, ALLOC& alloc) noexcept {
-        if constexpr (BITS == 16)
-            dealloc_node(alloc, bot, bot_leaf_size_u64<16>(count));
-        else
-            dealloc_node(alloc, bot, get_header(bot)->alloc_u64);
+    static void dealloc_bot_leaf(uint64_t* bot, uint32_t /*count*/, ALLOC& alloc) noexcept {
+        if constexpr (BITS == 16) {
+            auto* bh = get_header(bot);
+            if (!bh->is_embedded())
+                dealloc_node(alloc, bot, bh->alloc_u64);
+        } else {
+            auto* bh = get_header(bot);
+            if (!bh->is_embedded())
+                dealloc_node(alloc, bot, bh->alloc_u64);
+        }
     }
 
     // ==================================================================
@@ -576,7 +586,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: branchless descent (for find — uses sentinel)
+    // Bot-internal: branchless descent (for find -- uses sentinel)
     // ==================================================================
 
     static const uint64_t* branchless_bot_child(const uint64_t* bot, uint8_t bi) noexcept {
@@ -689,7 +699,7 @@ struct BitmaskOps {
         return get_header(bot)->entries;
     }
 
-    // Actual allocated size (for stats — may be padded)
+    // Actual allocated size (for stats -- may be padded)
     static size_t bot_internal_alloc_u64(const uint64_t* bot) noexcept {
         return get_header(bot)->alloc_u64;
     }
@@ -720,32 +730,33 @@ struct BitmaskOps {
     // ==================================================================
 
 private:
+    // --- split-top layout ---
     static Bitmap256& top_bitmap_(uint64_t* n) noexcept {
-        return *reinterpret_cast<Bitmap256*>(n + header_u64(get_header(n)->skip));
+        return *reinterpret_cast<Bitmap256*>(n + header_u64(get_header(n)->skip()));
     }
     static const Bitmap256& top_bitmap_(const uint64_t* n) noexcept {
-        return *reinterpret_cast<const Bitmap256*>(n + header_u64(get_header(n)->skip));
+        return *reinterpret_cast<const Bitmap256*>(n + header_u64(get_header(n)->skip()));
     }
     static Bitmap256& bot_is_internal_bm_(uint64_t* n) noexcept {
-        return *reinterpret_cast<Bitmap256*>(n + header_u64(get_header(n)->skip) + BITMAP256_U64);
+        return *reinterpret_cast<Bitmap256*>(n + header_u64(get_header(n)->skip()) + BITMAP256_U64);
     }
     static const Bitmap256& bot_is_internal_bm_(const uint64_t* n) noexcept {
-        return *reinterpret_cast<const Bitmap256*>(n + header_u64(get_header(n)->skip) + BITMAP256_U64);
+        return *reinterpret_cast<const Bitmap256*>(n + header_u64(get_header(n)->skip()) + BITMAP256_U64);
     }
 
     template<int BITS>
     static uint64_t* top_children_(uint64_t* n) noexcept {
         if constexpr (BITS == 16)
-            return n + header_u64(get_header(n)->skip) + BITMAP256_U64;
+            return n + header_u64(get_header(n)->skip()) + BITMAP256_U64;
         else
-            return n + header_u64(get_header(n)->skip) + BITMAP256_U64 + BITMAP256_U64;
+            return n + header_u64(get_header(n)->skip()) + BITMAP256_U64 + BITMAP256_U64;
     }
     template<int BITS>
     static const uint64_t* top_children_(const uint64_t* n) noexcept {
         if constexpr (BITS == 16)
-            return n + header_u64(get_header(n)->skip) + BITMAP256_U64;
+            return n + header_u64(get_header(n)->skip()) + BITMAP256_U64;
         else
-            return n + header_u64(get_header(n)->skip) + BITMAP256_U64 + BITMAP256_U64;
+            return n + header_u64(get_header(n)->skip()) + BITMAP256_U64 + BITMAP256_U64;
     }
 
     template<int BITS>
@@ -759,22 +770,22 @@ private:
         else return top_children_<BITS>(n) + 1;
     }
 
+    // --- bot-leaf-16 layout: [header (1)][bitmap (4)][values...] ---
     static Bitmap256& bot_leaf_bm_(uint64_t* b) noexcept {
-        return *reinterpret_cast<Bitmap256*>(b);
+        return *reinterpret_cast<Bitmap256*>(b + 1);
     }
     static const Bitmap256& bot_leaf_bm_(const uint64_t* b) noexcept {
-        return *reinterpret_cast<const Bitmap256*>(b);
+        return *reinterpret_cast<const Bitmap256*>(b + 1);
     }
 
     static VST* bot_leaf_vals_16_(uint64_t* b) noexcept {
-        return reinterpret_cast<VST*>(b + BITMAP256_U64);
+        return reinterpret_cast<VST*>(b + 1 + BITMAP256_U64);
     }
     static const VST* bot_leaf_vals_16_(const uint64_t* b) noexcept {
-        return reinterpret_cast<const VST*>(b + BITMAP256_U64);
+        return reinterpret_cast<const VST*>(b + 1 + BITMAP256_U64);
     }
 
     // --- bot-internal layout: [header (1)][bitmap (4)][sentinel (1)][children...] ---
-
     static Bitmap256& bot_bitmap_(uint64_t* b) noexcept {
         return *reinterpret_cast<Bitmap256*>(b + 1);
     }
@@ -795,14 +806,15 @@ private:
     }
 
     // ==================================================================
-    // Bot-leaf-16 insert/erase  (no header — always copy, exact alloc)
+    // Bot-leaf-16 insert/erase  (header + bitmap + values; always copy)
     // ==================================================================
 
     static BotLeafInsertResult insert_bl_16_(
             uint64_t* bot, uint64_t ik, VST value, ALLOC& alloc) {
         uint8_t suffix = static_cast<uint8_t>(KOps::template extract_suffix<8>(ik));
+        auto* bh = get_header(bot);
         Bitmap256& bm = bot_leaf_bm_(bot);
-        uint32_t count = bm.popcount();
+        uint32_t count = bh->entries;
         VST* vd = bot_leaf_vals_16_(bot);
 
         if (bm.has_bit(suffix)) {
@@ -813,7 +825,11 @@ private:
         }
 
         uint32_t nc = count + 1;
-        uint64_t* nb = alloc_node(alloc, bot_leaf_size_u64<16>(nc));
+        size_t new_sz = bot_leaf_size_u64<16>(nc);
+        uint64_t* nb = alloc_node(alloc, new_sz);
+        auto* nbh = get_header(nb);
+        nbh->entries = static_cast<uint16_t>(nc);
+        nbh->alloc_u64 = static_cast<uint16_t>(new_sz);
         Bitmap256& nbm = bot_leaf_bm_(nb);
         nbm = bm; nbm.set_bit(suffix);
         VST* nvd = bot_leaf_vals_16_(nb);
@@ -822,24 +838,31 @@ private:
         VT::write_slot(&nvd[isl], value);
         std::memcpy(nvd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
 
-        dealloc_node(alloc, bot, bot_leaf_size_u64<16>(count));
+        if (!bh->is_embedded())
+            dealloc_node(alloc, bot, bh->alloc_u64);
         return {nb, true, false};
     }
 
     static EraseResult erase_bl_16_(uint64_t* bot, uint64_t ik, ALLOC& alloc) {
         uint8_t suffix = static_cast<uint8_t>(KOps::template extract_suffix<8>(ik));
+        auto* bh = get_header(bot);
         Bitmap256& bm = bot_leaf_bm_(bot);
         if (!bm.has_bit(suffix)) return {bot, false};
-        uint32_t count = bm.popcount();
+        uint32_t count = bh->entries;
         int slot = bm.count_below(suffix);
         VT::destroy(bot_leaf_vals_16_(bot)[slot], alloc);
 
         uint32_t nc = count - 1;
         if (nc == 0) {
-            dealloc_node(alloc, bot, bot_leaf_size_u64<16>(count));
+            if (!bh->is_embedded())
+                dealloc_node(alloc, bot, bh->alloc_u64);
             return {nullptr, true};
         }
-        uint64_t* nb = alloc_node(alloc, bot_leaf_size_u64<16>(nc));
+        size_t new_sz = bot_leaf_size_u64<16>(nc);
+        uint64_t* nb = alloc_node(alloc, new_sz);
+        auto* nbh = get_header(nb);
+        nbh->entries = static_cast<uint16_t>(nc);
+        nbh->alloc_u64 = static_cast<uint16_t>(new_sz);
         Bitmap256& nbm = bot_leaf_bm_(nb);
         nbm = bm; nbm.clear_bit(suffix);
         const VST* ov = bot_leaf_vals_16_(bot);
@@ -847,7 +870,8 @@ private:
         std::memcpy(nv, ov, slot * sizeof(VST));
         std::memcpy(nv + slot, ov + slot + 1, (nc - slot) * sizeof(VST));
 
-        dealloc_node(alloc, bot, bot_leaf_size_u64<16>(count));
+        if (!bh->is_embedded())
+            dealloc_node(alloc, bot, bh->alloc_u64);
         return {nb, true};
     }
 

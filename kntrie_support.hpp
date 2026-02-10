@@ -20,16 +20,17 @@ namespace kn3 {
 inline constexpr size_t BITMAP256_U64 = 4;   // 32 bytes
 inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
+inline constexpr size_t EMBED_U64     = 8;   // 64-byte embed slot
 
 // ==========================================================================
 // Allocation size classes
 //
 // Up to 8 u64s: exact
 // Then quarter-steps within each power-of-2 range:
-//   [9,16]:   step 2  → 10,12,14,16
-//   [17,32]:  step 4  → 20,24,28,32
-//   [33,64]:  step 8  → 40,48,56,64
-//   [65,128]: step 16 → 80,96,112,128
+//   [9,16]:   step 2  -> 10,12,14,16
+//   [17,32]:  step 4  -> 20,24,28,32
+//   [33,64]:  step 8  -> 40,48,56,64
+//   [65,128]: step 16 -> 80,96,112,128
 //   etc.
 //
 // Worst-case waste: ~25%.  Enables in-place insert/erase.
@@ -66,20 +67,38 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 // ==========================================================================
 // Node Header  (8 bytes; prefix in node[1] when skip > 0)
 //
-// flags bit 0: 0 = leaf (compact), 1 = bitmask
+// flags_ layout:
+//   bit 0:     is_bitmask (0 = compact leaf, 1 = bitmask/split)
+//   bit 1:     is_embedded (this node lives inside a parent's embed slot)
+//   bits 2-3:  skip (0-3)
+//   bits 4-6:  reserved
+//   bits 7-15: n_embedded (0-511, number of children embedded in this node)
 //
-// Zeroed header → compact leaf with entries=0 (sentinel-compatible)
+// Zeroed header -> compact leaf with entries=0 (sentinel-compatible)
 // ==========================================================================
 
 struct NodeHeader {
     uint16_t entries;      // compact: k/v count; bitmask: child count
     uint16_t descendants;  // total k/v pairs in subtree, capped at DESC_CAP
     uint16_t alloc_u64;    // allocation size in u64s (may be padded)
-    uint8_t  skip;
-    uint8_t  flags;
+    uint16_t flags_;
 
-    bool is_leaf() const noexcept { return !(flags & 1); }
-    void set_bitmask() noexcept { flags |= 1; }
+    bool is_leaf() const noexcept { return !(flags_ & 1); }
+    void set_bitmask() noexcept { flags_ |= 1; }
+
+    bool is_embedded() const noexcept { return flags_ & 2; }
+    void set_embedded() noexcept { flags_ |= 2; }
+    void clear_embedded() noexcept { flags_ &= ~uint16_t(2); }
+
+    uint8_t skip() const noexcept { return (flags_ >> 2) & 0x3; }
+    void set_skip(uint8_t s) noexcept {
+        flags_ = (flags_ & ~uint16_t(0x000C)) | (uint16_t(s & 0x3) << 2);
+    }
+
+    uint16_t n_embedded() const noexcept { return flags_ >> 7; }
+    void set_n_embedded(uint16_t n) noexcept {
+        flags_ = (flags_ & 0x7F) | (n << 7);
+    }
 
     static constexpr uint16_t DESC_CAP = 65535;
 
@@ -103,13 +122,13 @@ inline void      set_prefix(uint64_t* n, uint64_t p)   noexcept { n[1] = p; }
 inline constexpr size_t header_u64(uint8_t skip) noexcept { return skip > 0 ? 2 : 1; }
 
 // ==========================================================================
-// Global sentinel — zeroed block, valid as:
-//   - Compact leaf (entries=0, flags=0 → is_leaf)
-//   - Bot-leaf BITS==16 (bitmap all zeros → no entries)
+// Global sentinel -- zeroed block, valid as:
+//   - Compact leaf (entries=0, flags_=0 -> is_leaf)
+//   - Bot-leaf BITS==16 (header entries=0, bitmap all zeros)
 // No allocation on construction; never deallocated.
 // ==========================================================================
 
-alignas(64) inline constinit uint64_t SENTINEL_NODE[4] = {};
+alignas(64) inline constinit uint64_t SENTINEL_NODE[8] = {};
 
 // ==========================================================================
 // Suffix traits
