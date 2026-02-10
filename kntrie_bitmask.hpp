@@ -104,7 +104,6 @@ struct BitmaskOps {
     template<int BITS>
     static constexpr size_t bot_leaf_size_u64(size_t count) noexcept {
         if constexpr (BITS == 16) {
-            // Layout: [header (2)][bitmap (4)][values...]
             size_t vb = count * sizeof(VST); vb = (vb + 7) & ~size_t{7};
             return HEADER_U64 + BITMAP256_U64 + vb / 8;
         } else {
@@ -113,11 +112,11 @@ struct BitmaskOps {
     }
 
     static constexpr size_t bot_internal_size_u64(size_t count) noexcept {
-        return HEADER_U64 + BITMAP256_U64 + 1 + count;  // header + bitmap + sentinel + children
+        return HEADER_U64 + BITMAP256_U64 + 1 + count;
     }
 
     // ==================================================================
-    // Split-top: lookup (for insert/erase -- 0-based slot via real_children)
+    // Split-top: lookup
     // ==================================================================
 
     struct TopLookup {
@@ -142,7 +141,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Split-top: branchless descent (for find)
+    // Split-top: branchless descent
     // ==================================================================
 
     template<int BITS>
@@ -160,7 +159,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Split-top: set child pointer (0-based slot into real children)
+    // Split-top: set child pointer
     // ==================================================================
 
     template<int BITS>
@@ -181,7 +180,6 @@ struct BitmaskOps {
         int isl = tbm.slot_for_insert(ti);
         size_t needed = split_top_size_u64<BITS>(ntc);
 
-        // --- In-place if we have capacity ---
         if (needed <= h->alloc_u64) {
             uint64_t* rc = top_real_children_<BITS>(node);
             std::memmove(rc + isl + 1, rc + isl, (otc - isl) * sizeof(uint64_t));
@@ -195,7 +193,6 @@ struct BitmaskOps {
             return node;
         }
 
-        // --- Allocate new with padding ---
         size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
@@ -238,7 +235,6 @@ struct BitmaskOps {
 
         size_t needed = split_top_size_u64<BITS>(ntc);
 
-        // --- In-place if not oversized ---
         if (!should_shrink_u64(h->alloc_u64, needed)) {
             uint64_t* rc = top_real_children_<BITS>(node);
             std::memmove(rc + slot, rc + slot + 1, (ntc - slot) * sizeof(uint64_t));
@@ -251,7 +247,6 @@ struct BitmaskOps {
             return node;
         }
 
-        // --- Allocate smaller with padding ---
         size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
@@ -288,7 +283,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Split-top: iterate  cb(uint8_t ti, int slot, uint64_t* bot, bool is_leaf)
+    // Split-top: iterate
     // ==================================================================
 
     template<int BITS, typename Fn>
@@ -307,7 +302,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Split-top: make from arrays of (ti, bot_ptr, is_leaf)
+    // Split-top: make from arrays
     // ==================================================================
 
     template<int BITS>
@@ -357,7 +352,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Split-top: deallocate (top node only, not children)
+    // Split-top: deallocate
     // ==================================================================
 
     template<int BITS>
@@ -480,7 +475,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-leaf: iterate  cb(suffix, value_slot)
+    // Bot-leaf: iterate
     // ==================================================================
 
     template<int BITS, typename Fn>
@@ -515,7 +510,6 @@ struct BitmaskOps {
         }
     }
 
-    // Deallocate without destroying values (ownership transferred)
     template<int BITS>
     static void dealloc_bot_leaf(uint64_t* bot, uint32_t /*count*/, ALLOC& alloc) noexcept {
         dealloc_node(alloc, bot, get_header(bot)->alloc_u64);
@@ -557,7 +551,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: lookup child (0-based slot, for insert/erase)
+    // Bot-internal: lookup child
     // ==================================================================
 
     struct BotChildLookup {
@@ -576,7 +570,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: branchless descent (for find -- uses sentinel)
+    // Bot-internal: branchless descent
     // ==================================================================
 
     static const uint64_t* branchless_bot_child(const uint64_t* bot, uint8_t bi) noexcept {
@@ -586,7 +580,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: set child (0-based slot)
+    // Bot-internal: set child
     // ==================================================================
 
     static void set_bot_child(uint64_t* bot, int slot, uint64_t* child) noexcept {
@@ -594,7 +588,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: add child  (in-place when capacity allows)
+    // Bot-internal: add child
     // ==================================================================
 
     static uint64_t* add_bot_child(uint64_t* bot, uint8_t bi,
@@ -606,7 +600,6 @@ struct BitmaskOps {
         int nc = oc + 1;
         size_t needed = bot_internal_size_u64(nc);
 
-        // --- In-place if we have capacity ---
         if (needed <= h->alloc_u64) {
             uint64_t* rch = bot_int_real_children_(bot);
             std::memmove(rch + isl + 1, rch + isl, (oc - isl) * sizeof(uint64_t));
@@ -616,7 +609,6 @@ struct BitmaskOps {
             return bot;
         }
 
-        // --- Allocate new with padding ---
         size_t au64 = round_up_u64(needed);
         uint64_t* nb = alloc_node(alloc, au64);
         auto* nh = get_header(nb);
@@ -640,7 +632,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: remove child  (in-place when not oversized)
+    // Bot-internal: remove child
     // ==================================================================
 
     static uint64_t* remove_bot_child(uint64_t* bot, int slot, uint8_t bi,
@@ -650,7 +642,6 @@ struct BitmaskOps {
         int nc = oc - 1;
         size_t needed = bot_internal_size_u64(nc);
 
-        // --- In-place if not oversized ---
         if (!should_shrink_u64(h->alloc_u64, needed)) {
             uint64_t* rch = bot_int_real_children_(bot);
             std::memmove(rch + slot, rch + slot + 1, (nc - slot) * sizeof(uint64_t));
@@ -659,7 +650,6 @@ struct BitmaskOps {
             return bot;
         }
 
-        // --- Allocate smaller with padding ---
         size_t au64 = round_up_u64(needed);
         uint64_t* nb = alloc_node(alloc, au64);
         auto* nh = get_header(nb);
@@ -682,7 +672,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: child count
+    // Bot-internal: child count / alloc
     // ==================================================================
 
     static int bot_internal_child_count(const uint64_t* bot) noexcept {
@@ -694,7 +684,7 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Bot-internal: iterate  cb(uint8_t bi, uint64_t* child)
+    // Bot-internal: iterate
     // ==================================================================
 
     template<typename Fn>
@@ -715,7 +705,6 @@ struct BitmaskOps {
     }
 
 private:
-    // --- split-top layout: [header (2)][top_bitmap (4)][bot_internal_bm (4, if BITS>16)][sentinel (1, if BITS>16)][children...] ---
     static Bitmap256& top_bitmap_(uint64_t* n) noexcept {
         return *reinterpret_cast<Bitmap256*>(n + HEADER_U64);
     }
@@ -731,17 +720,13 @@ private:
 
     template<int BITS>
     static uint64_t* top_children_(uint64_t* n) noexcept {
-        if constexpr (BITS == 16)
-            return n + HEADER_U64 + BITMAP256_U64;
-        else
-            return n + HEADER_U64 + BITMAP256_U64 + BITMAP256_U64;
+        if constexpr (BITS == 16) return n + HEADER_U64 + BITMAP256_U64;
+        else return n + HEADER_U64 + BITMAP256_U64 + BITMAP256_U64;
     }
     template<int BITS>
     static const uint64_t* top_children_(const uint64_t* n) noexcept {
-        if constexpr (BITS == 16)
-            return n + HEADER_U64 + BITMAP256_U64;
-        else
-            return n + HEADER_U64 + BITMAP256_U64 + BITMAP256_U64;
+        if constexpr (BITS == 16) return n + HEADER_U64 + BITMAP256_U64;
+        else return n + HEADER_U64 + BITMAP256_U64 + BITMAP256_U64;
     }
 
     template<int BITS>
@@ -755,7 +740,6 @@ private:
         else return top_children_<BITS>(n) + 1;
     }
 
-    // --- bot-leaf-16 layout: [header (2)][bitmap (4)][values...] ---
     static Bitmap256& bot_leaf_bm_(uint64_t* b) noexcept {
         return *reinterpret_cast<Bitmap256*>(b + HEADER_U64);
     }
@@ -770,7 +754,6 @@ private:
         return reinterpret_cast<const VST*>(b + HEADER_U64 + BITMAP256_U64);
     }
 
-    // --- bot-internal layout: [header (2)][bitmap (4)][sentinel (1)][children...] ---
     static Bitmap256& bot_bitmap_(uint64_t* b) noexcept {
         return *reinterpret_cast<Bitmap256*>(b + HEADER_U64);
     }
@@ -791,7 +774,7 @@ private:
     }
 
     // ==================================================================
-    // Bot-leaf-16 insert/erase  (header + bitmap + values)
+    // Bot-leaf-16 insert/erase
     // ==================================================================
 
     template<bool INSERT = true, bool ASSIGN = true>
@@ -818,7 +801,6 @@ private:
         uint32_t nc = count + 1;
         size_t new_sz = bot_leaf_size_u64<16>(nc);
 
-        // --- In-place if we have capacity ---
         if (new_sz <= bh->alloc_u64) {
             int isl = bm.count_below(suffix);
             bm.set_bit(suffix);

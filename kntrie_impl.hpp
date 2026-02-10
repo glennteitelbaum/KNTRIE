@@ -521,7 +521,6 @@ private:
         K new_suffix = static_cast<K>(KO::template extract_suffix<ROOT_BITS>(ik));
         size_t wi = 0;
         bool ins = false;
-        // for_each now skips dups automatically
         CO::template for_each<ROOT_BITS>(node, h, [&](K s, VST v) {
             if (!ins && new_suffix < s) {
                 wk[wi] = new_suffix; wv[wi] = value; wi++; ins = true;
@@ -614,7 +613,6 @@ private:
         K new_suffix = static_cast<K>(KO::template extract_suffix<BITS>(ik));
         size_t wi = 0;
         bool ins = false;
-        // for_each now skips dups automatically
         CO::template for_each<BITS>(node, h, [&](K s, VST v) {
             if (!ins && new_suffix < s) {
                 wk[wi] = static_cast<uint64_t>(new_suffix);
@@ -662,7 +660,6 @@ private:
         S new_suffix = static_cast<S>(KO::template extract_suffix<sb>(ik));
         size_t wi = 0;
         bool ins = false;
-        // for_each_bot_leaf skips dups for BITS>16 (delegates to CO::for_each)
         BO::template for_each_bot_leaf<BITS>(bot, [&](S s, VST v) {
             if (!ins && new_suffix < s) {
                 wk[wi] = new_suffix; wv[wi] = value; wi++; ins = true;
@@ -947,7 +944,7 @@ private:
     }
 
     // ==================================================================
-    // BITS=16 helpers: always-split node creation
+    // BITS=16 helpers
     // ==================================================================
 
     uint64_t* make_single_split16_(uint64_t ik, VST value,
@@ -1053,7 +1050,6 @@ private:
                 h->sub_descendants(1);
                 return {node, true};
             }
-            // Bot fully erased
             auto* nn = BO::template remove_top_slot<BITS>(
                 node, h, lk.slot, ti, alloc_);
             return {nn, true};
@@ -1089,7 +1085,6 @@ private:
             return {node, true};
         }
 
-        // Child fully erased
         int bc = BO::bot_internal_child_count(bot);
         if (bc == 1) {
             BO::dealloc_bot_internal(bot, alloc_);

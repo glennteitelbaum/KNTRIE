@@ -213,7 +213,7 @@ struct CompactOps {
 
         // --- Dups available: consume one in-place ---
         if (dups > 0) {
-            insert_consume_dup_<BITS>(kd, vd, total, ins, suffix, value);
+            insert_consume_dup_<BITS>(kd, vd, total, ins, h->entries, suffix, value);
             h->entries++;
             h->descendants++;
             return {node, true, false};
@@ -344,25 +344,47 @@ private:
     template<int BITS>
     static void insert_consume_dup_(
             typename suffix_traits<BITS>::type* kd, VST* vd,
-            int total, int ins,
+            int total, int ins, uint16_t entries,
             typename suffix_traits<BITS>::type suffix, VST value) {
         using K = typename suffix_traits<BITS>::type;
 
-        // Find nearest dup by scanning left and right from insertion point
-        int left_dup = -1;
-        for (int i = ins - 1; i >= 1; --i) {
-            if (kd[i] == kd[i - 1]) { left_dup = i; break; }
-        }
-        int right_dup = -1;
-        for (int i = ins; i < total - 1; ++i) {
-            if (kd[i] == kd[i + 1]) { right_dup = i; break; }
-        }
+        int dup_pos = -1;
 
-        // Pick closer dup
-        int dup_pos;
-        if (left_dup < 0) dup_pos = right_dup;
-        else if (right_dup < 0) dup_pos = left_dup;
-        else dup_pos = (ins - left_dup <= right_dup - ins) ? left_dup : right_dup;
+        if (total <= 64) {
+            // Small node: simple right-then-left scan
+            for (int i = ins; i < total - 1; ++i) {
+                if (kd[i] == kd[i + 1]) { dup_pos = i; break; }
+            }
+            if (dup_pos < 0) {
+                for (int i = ins - 1; i >= 1; --i) {
+                    if (kd[i] == kd[i - 1]) { dup_pos = i; break; }
+                }
+            }
+        } else {
+            // Large node: banded right-first, then left forward, repeat.
+            // Band size from seed stride: entries / (dups + 1) + 1.
+            uint16_t dups = static_cast<uint16_t>(total - entries);
+            int band = static_cast<int>(entries / (dups + 1)) + 1;
+
+            int r_lo = ins, r_hi = ins;
+            int l_hi = ins - 1, l_lo = ins - 1;
+
+            while (dup_pos < 0) {
+                r_hi = std::min(r_lo + band, total - 1);
+                for (int i = r_lo; i < r_hi; ++i) {
+                    if (kd[i] == kd[i + 1]) { dup_pos = i; break; }
+                }
+                if (dup_pos >= 0) break;
+                r_lo = r_hi;
+
+                l_lo = std::max(1, l_hi - band + 1);
+                for (int i = l_lo; i <= l_hi; ++i) {
+                    if (kd[i] == kd[i - 1]) { dup_pos = i; break; }
+                }
+                if (dup_pos >= 0) break;
+                l_hi = l_lo - 1;
+            }
+        }
 
         int write_pos;
         if (dup_pos < ins) {
