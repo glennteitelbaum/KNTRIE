@@ -110,8 +110,8 @@ struct BitmaskOps {
         }
     }
 
-    static constexpr size_t bot_internal_size_u64(size_t count) noexcept {
-        return 1 + BITMAP256_U64 + 1 + count;  // header + bitmap + sentinel + children
+    static constexpr size_t bot_internal_size_u64(size_t count, uint16_t n_embed = 0) noexcept {
+        return 1 + BITMAP256_U64 + 1 + count + n_embed * EMBED_U64;
     }
 
     // ==================================================================
@@ -537,29 +537,53 @@ struct BitmaskOps {
     static uint64_t* make_bot_internal(const uint8_t* indices,
                                         uint64_t* const* child_ptrs,
                                         int n_children, ALLOC& alloc) {
+        // Count embeddable children
+        uint16_t n_embed = 0;
+        for (int i = 0; i < n_children; ++i) {
+            auto* ch = get_header(child_ptrs[i]);
+            if (ch->alloc_u64 <= EMBED_U64) ++n_embed;
+        }
+
         Bitmap256 bm{};
         for (int i = 0; i < n_children; ++i) bm.set_bit(indices[i]);
 
-        size_t needed = bot_internal_size_u64(n_children);
+        size_t needed = bot_internal_size_u64(n_children, n_embed);
         size_t au64 = round_up_u64(needed);
         uint64_t* bot = alloc_node(alloc, au64);
         auto* h = get_header(bot);
         h->entries = static_cast<uint16_t>(n_children);
         h->alloc_u64 = static_cast<uint16_t>(au64);
         h->set_bitmask();
+        h->set_n_embedded(n_embed);
 
         bot_bitmap_(bot) = bm;
 
         bot_int_children_(bot)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
 
         uint64_t* rch = bot_int_real_children_(bot);
+        int embed_idx = 0;
         int slot = 0;
         for (int bi = bm.find_next_set(0); bi >= 0; bi = bm.find_next_set(bi + 1)) {
+            uint64_t* cp = nullptr;
             for (int i = 0; i < n_children; ++i) {
                 if (indices[i] == static_cast<uint8_t>(bi)) {
-                    rch[slot] = reinterpret_cast<uint64_t>(child_ptrs[i]);
+                    cp = child_ptrs[i];
                     break;
                 }
+            }
+
+            auto* ch = get_header(cp);
+            if (ch->alloc_u64 <= EMBED_U64) {
+                uint64_t* eslot = bot + 1 + BITMAP256_U64 + 1 + n_children + embed_idx * EMBED_U64;
+                std::memcpy(eslot, cp, ch->alloc_u64 * 8);
+                auto* eh = get_header(eslot);
+                eh->set_embedded();
+                eh->alloc_u64 = EMBED_U64;
+                rch[slot] = reinterpret_cast<uint64_t>(eslot);
+                dealloc_node(alloc, cp, ch->alloc_u64);
+                embed_idx++;
+            } else {
+                rch[slot] = reinterpret_cast<uint64_t>(cp);
             }
             ++slot;
         }
@@ -614,10 +638,15 @@ struct BitmaskOps {
         int oc = h->entries;
         int isl = bm.slot_for_insert(bi);
         int nc = oc + 1;
-        size_t needed = bot_internal_size_u64(nc);
+        uint16_t ne = h->n_embedded();
 
-        // --- In-place if we have capacity ---
-        if (needed <= h->alloc_u64) {
+        // Check if new child can be embedded
+        bool embed_new = (get_header(child_ptr)->alloc_u64 <= EMBED_U64);
+        uint16_t new_ne = ne + (embed_new ? 1 : 0);
+        size_t needed = bot_internal_size_u64(nc, new_ne);
+
+        // --- In-place only when no embeds involved ---
+        if (new_ne == 0 && needed <= h->alloc_u64) {
             uint64_t* rch = bot_int_real_children_(bot);
             std::memmove(rch + isl + 1, rch + isl, (oc - isl) * sizeof(uint64_t));
             rch[isl] = reinterpret_cast<uint64_t>(child_ptr);
@@ -627,25 +656,53 @@ struct BitmaskOps {
         }
 
         // --- Allocate new with padding ---
+        size_t old_alloc = h->alloc_u64;
         size_t au64 = round_up_u64(needed);
         uint64_t* nb = alloc_node(alloc, au64);
         auto* nh = get_header(nb);
         nh->entries = static_cast<uint16_t>(nc);
         nh->alloc_u64 = static_cast<uint16_t>(au64);
         nh->set_bitmask();
+        nh->set_n_embedded(new_ne);
 
         bot_bitmap_(nb) = bm;
         bot_bitmap_(nb).set_bit(bi);
 
         bot_int_children_(nb)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
 
+        // Copy child pointers with gap at isl
         const uint64_t* orc = bot_int_real_children_(bot);
         uint64_t*       nrc = bot_int_real_children_(nb);
         for (int i = 0; i < isl; ++i)        nrc[i] = orc[i];
-        nrc[isl] = reinterpret_cast<uint64_t>(child_ptr);
         for (int i = isl; i < oc; ++i)       nrc[i + 1] = orc[i];
 
-        dealloc_node(alloc, bot, h->alloc_u64);
+        // Copy existing embed data
+        if (ne > 0) {
+            const uint64_t* old_embed = bot + 1 + BITMAP256_U64 + 1 + oc;
+            uint64_t* new_embed = nb + 1 + BITMAP256_U64 + 1 + nc;
+            std::memcpy(new_embed, old_embed, ne * EMBED_U64 * 8);
+        }
+
+        // Fixup existing embedded child pointers
+        if (ne > 0)
+            fixup_bot_embedded_ptrs_(bot, old_alloc, nb, oc, nc);
+
+        // Handle new child
+        if (embed_new) {
+            auto* ch = get_header(child_ptr);
+            size_t child_alloc = ch->alloc_u64;
+            uint64_t* eslot = nb + 1 + BITMAP256_U64 + 1 + nc + (new_ne - 1) * EMBED_U64;
+            std::memcpy(eslot, child_ptr, child_alloc * 8);
+            auto* eh = get_header(eslot);
+            eh->set_embedded();
+            eh->alloc_u64 = EMBED_U64;
+            nrc[isl] = reinterpret_cast<uint64_t>(eslot);
+            dealloc_node(alloc, child_ptr, child_alloc);
+        } else {
+            nrc[isl] = reinterpret_cast<uint64_t>(child_ptr);
+        }
+
+        dealloc_node(alloc, bot, old_alloc);
         return nb;
     }
 
@@ -656,12 +713,21 @@ struct BitmaskOps {
     static uint64_t* remove_bot_child(uint64_t* bot, int slot, uint8_t bi,
                                        ALLOC& alloc) {
         auto* h = get_header(bot);
+        uint16_t ne = h->n_embedded();
+
+        // If removed child was embedded, evict its slot first
+        uint64_t* child_ptr = reinterpret_cast<uint64_t*>(bot_int_real_children_(bot)[slot]);
+        if (get_header(child_ptr)->is_embedded()) {
+            evict_bot_embed_slot_(bot, child_ptr);
+            ne = h->n_embedded();
+        }
+
         int oc = h->entries;
         int nc = oc - 1;
-        size_t needed = bot_internal_size_u64(nc);
+        size_t needed = bot_internal_size_u64(nc, ne);
 
-        // --- In-place if not oversized ---
-        if (!should_shrink_u64(h->alloc_u64, needed)) {
+        // --- In-place only if no embeds and not oversized ---
+        if (ne == 0 && !should_shrink_u64(h->alloc_u64, needed)) {
             uint64_t* rch = bot_int_real_children_(bot);
             std::memmove(rch + slot, rch + slot + 1, (nc - slot) * sizeof(uint64_t));
             bot_bitmap_(bot).clear_bit(bi);
@@ -670,12 +736,14 @@ struct BitmaskOps {
         }
 
         // --- Allocate smaller with padding ---
+        size_t old_alloc = h->alloc_u64;
         size_t au64 = round_up_u64(needed);
         uint64_t* nb = alloc_node(alloc, au64);
         auto* nh = get_header(nb);
         nh->entries = static_cast<uint16_t>(nc);
         nh->alloc_u64 = static_cast<uint16_t>(au64);
         nh->set_bitmask();
+        nh->set_n_embedded(ne);
 
         bot_bitmap_(nb) = bot_bitmap_(bot);
         bot_bitmap_(nb).clear_bit(bi);
@@ -687,7 +755,15 @@ struct BitmaskOps {
         for (int i = 0; i < slot; ++i)        nrc[i] = orc[i];
         for (int i = slot; i < nc; ++i)       nrc[i] = orc[i + 1];
 
-        dealloc_node(alloc, bot, h->alloc_u64);
+        // Copy embed data and fixup
+        if (ne > 0) {
+            const uint64_t* old_embed = bot + 1 + BITMAP256_U64 + 1 + oc;
+            uint64_t* new_embed = nb + 1 + BITMAP256_U64 + 1 + nc;
+            std::memcpy(new_embed, old_embed, ne * EMBED_U64 * 8);
+            fixup_bot_embedded_ptrs_(bot, old_alloc, nb, oc, nc);
+        }
+
+        dealloc_node(alloc, bot, old_alloc);
         return nb;
     }
 
@@ -723,6 +799,60 @@ struct BitmaskOps {
 
     static void dealloc_bot_internal(uint64_t* bot, ALLOC& alloc) noexcept {
         dealloc_node(alloc, bot, get_header(bot)->alloc_u64);
+    }
+
+    // ==================================================================
+    // Bot-internal: embed slot accessor
+    // ==================================================================
+
+    static uint64_t* bot_embed_slot_(uint64_t* bot, int idx) noexcept {
+        auto* h = get_header(bot);
+        return bot + 1 + BITMAP256_U64 + 1 + h->entries + idx * EMBED_U64;
+    }
+
+    // ==================================================================
+    // Bot-internal: fixup embedded child pointers after reallocation
+    // ==================================================================
+
+    static void fixup_bot_embedded_ptrs_(uint64_t* old_bot, size_t old_alloc,
+                                          uint64_t* new_bot, int old_entries, int new_entries) noexcept {
+        auto* nh = get_header(new_bot);
+        if (nh->n_embedded() == 0) return;
+        uintptr_t old_embed = reinterpret_cast<uintptr_t>(old_bot + 1 + BITMAP256_U64 + 1 + old_entries);
+        uintptr_t new_embed = reinterpret_cast<uintptr_t>(new_bot + 1 + BITMAP256_U64 + 1 + new_entries);
+        uint64_t* rch = bot_int_real_children_(new_bot);
+        uintptr_t ob = reinterpret_cast<uintptr_t>(old_bot);
+        uintptr_t oe = ob + old_alloc * 8;
+        for (int i = 0; i < new_entries; ++i) {
+            uintptr_t p = static_cast<uintptr_t>(rch[i]);
+            if (p >= ob && p < oe)
+                rch[i] = new_embed + (p - old_embed);
+        }
+    }
+
+    // ==================================================================
+    // Bot-internal: evict embed slot (swap-with-last after child moves to heap)
+    // ==================================================================
+
+    static void evict_bot_embed_slot_(uint64_t* bot, uint64_t* freed_slot_ptr) noexcept {
+        auto* h = get_header(bot);
+        uint16_t ne = h->n_embedded();
+        if (ne == 0) return;
+        uint64_t* last_slot = bot_embed_slot_(bot, ne - 1);
+        if (freed_slot_ptr != last_slot) {
+            std::memcpy(freed_slot_ptr, last_slot, EMBED_U64 * 8);
+            // Fix up the child pointer that referenced the last slot
+            uint64_t* rch = bot_int_real_children_(bot);
+            int nc = h->entries;
+            uintptr_t old_addr = reinterpret_cast<uintptr_t>(last_slot);
+            for (int i = 0; i < nc; ++i) {
+                if (static_cast<uintptr_t>(rch[i]) == old_addr) {
+                    rch[i] = reinterpret_cast<uint64_t>(freed_slot_ptr);
+                    break;
+                }
+            }
+        }
+        h->set_n_embedded(ne - 1);
     }
 
     // ==================================================================

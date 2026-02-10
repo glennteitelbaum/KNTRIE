@@ -244,8 +244,8 @@ struct CompactOps {
 
         size_t needed = size_u64<BITS>(nc, h->skip());
 
-        // --- In-place if not oversized ---
-        if (!should_shrink_u64(h->alloc_u64, needed)) {
+        // --- In-place if not oversized (or if embedded — stay in slot) ---
+        if (!should_shrink_u64(h->alloc_u64, needed) || h->is_embedded()) {
             erase_in_place_<BITS>(node, h, idx);
             return {node, true};
         }
