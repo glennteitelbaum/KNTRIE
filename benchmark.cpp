@@ -27,7 +27,7 @@ static size_t rss_bytes() {
     FILE* f = std::fopen("/proc/self/statm", "r");
     if (!f) return 0;
     unsigned long pages = 0;
-    if (std::fscanf(f, "%*lu %lu", &pages) != 1) pages = 0;
+    if (std::fscanf(f, "%*u %lu", &pages) != 1) pages = 0;
     std::fclose(f);
     return pages * 4096UL;
 }
@@ -36,39 +36,43 @@ struct Result {
     const char* name;
     double insert_ms;
     double read_ms;
-    double erase_ms;
     size_t memory_bytes;
 };
 
 static void print_header() {
-    std::printf("%-20s %12s %12s %12s %12s %12s %12s %12s %12s\n",
-                "Container", "Insert(ms)", "Read(ms)", "Erase(ms)", "Memory(KB)",
-                "Ins rel", "Read rel", "Erase rel", "Mem rel");
-    std::printf("%-20s %12s %12s %12s %12s %12s %12s %12s %12s\n",
-                "--------------------", "----------", "----------", "----------",
-                "----------", "----------", "----------", "----------", "----------");
+    std::printf("%-20s %12s %12s %12s %12s\n",
+                "Container", "Insert(ms)", "Read(ms)", "Memory(KB)", "Bytes/entry");
+    std::printf("%-20s %12s %12s %12s %12s\n",
+                "--------------------", "----------", "----------",
+                "----------", "-----------");
 }
 
-static void print_row(const Result& r, const Result& base, size_t n) {
-    double ins_rel   = r.insert_ms / base.insert_ms;
-    double read_rel  = r.read_ms   / base.read_ms;
-    double erase_rel = base.erase_ms > 0 ? r.erase_ms / base.erase_ms : 0;
-    double mem_rel   = static_cast<double>(r.memory_bytes) / base.memory_bytes;
-    std::printf("%-20s %12.2f %12.2f %12.2f %12.1f %11.2fx %11.2fx %11.2fx %11.2fx\n",
-                r.name, r.insert_ms, r.read_ms, r.erase_ms,
+static void print_row(const Result& r, size_t n) {
+    std::printf("%-20s %12.2f %12.2f %12.1f %12.1f\n",
+                r.name, r.insert_ms, r.read_ms,
                 r.memory_bytes / 1024.0,
-                ins_rel, read_rel, erase_rel, mem_rel);
+                double(r.memory_bytes) / n);
 }
 
-using LookupRounds = std::vector<std::vector<uint64_t>>;
+static void print_vs_row(const char* name, const Result& r, const Result& base) {
+    double ins_rel  = r.insert_ms  / base.insert_ms;
+    double read_rel = r.read_ms    / base.read_ms;
+    double mem_rel  = static_cast<double>(r.memory_bytes) / base.memory_bytes;
+    std::printf("%-20s %11.2fx %11.2fx %11.2fx %11.2fx\n",
+                name, ins_rel, read_rel, mem_rel, mem_rel);
+}
 
-static Result bench_kntrie(const std::vector<uint64_t>& keys,
-                            const LookupRounds& rounds) {
-    Result res{"kntrie", 0, 0, 0, 0};
-    gteitelbaum::kntrie<uint64_t, uint64_t> trie;
+template<typename KEY>
+using LookupRounds = std::vector<std::vector<KEY>>;
+
+template<typename KEY>
+static Result bench_kntrie(const std::vector<KEY>& keys,
+                            const LookupRounds<KEY>& rounds) {
+    Result res{"kntrie", 0, 0, 0};
+    gteitelbaum::kntrie<KEY, uint64_t> trie;
 
     double t0 = now_ms();
-    for (auto k : keys) trie.insert(k, k);
+    for (auto k : keys) trie.insert(k, static_cast<uint64_t>(k));
     res.insert_ms = now_ms() - t0;
 
     if (trie.size() != keys.size())
@@ -86,24 +90,18 @@ static Result bench_kntrie(const std::vector<uint64_t>& keys,
     }
     res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
     do_not_optimize(checksum);
-
-    // Erase benchmark (shuffled order)
-    double t2 = now_ms();
-    for (auto k : rounds[0]) trie.erase(k);
-    res.erase_ms = now_ms() - t2;
-    if (!trie.empty())
-        std::fprintf(stderr, "kntrie: not empty after erase, %zu remaining\n", trie.size());
     return res;
 }
 
-static Result bench_stdmap(const std::vector<uint64_t>& keys,
-                           const LookupRounds& rounds) {
-    Result res{"std::map", 0, 0, 0, 0};
+template<typename KEY>
+static Result bench_stdmap(const std::vector<KEY>& keys,
+                           const LookupRounds<KEY>& rounds) {
+    Result res{"std::map", 0, 0, 0};
     size_t rss0 = rss_bytes();
-    std::map<uint64_t, uint64_t> m;
+    std::map<KEY, uint64_t> m;
 
     double t0 = now_ms();
-    for (auto k : keys) m.emplace(k, k);
+    for (auto k : keys) m.emplace(k, static_cast<uint64_t>(k));
     res.insert_ms = now_ms() - t0;
 
     size_t rss1 = rss_bytes();
@@ -119,22 +117,19 @@ static Result bench_stdmap(const std::vector<uint64_t>& keys,
     }
     res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
     do_not_optimize(checksum);
-
-    double t2 = now_ms();
-    for (auto k : rounds[0]) m.erase(k);
-    res.erase_ms = now_ms() - t2;
     return res;
 }
 
-static Result bench_unorderedmap(const std::vector<uint64_t>& keys,
-                                 const LookupRounds& rounds) {
-    Result res{"std::unordered_map", 0, 0, 0, 0};
+template<typename KEY>
+static Result bench_unorderedmap(const std::vector<KEY>& keys,
+                                 const LookupRounds<KEY>& rounds) {
+    Result res{"std::unordered_map", 0, 0, 0};
     size_t rss0 = rss_bytes();
-    std::unordered_map<uint64_t, uint64_t> m;
+    std::unordered_map<KEY, uint64_t> m;
     m.reserve(keys.size());
 
     double t0 = now_ms();
-    for (auto k : keys) m.emplace(k, k);
+    for (auto k : keys) m.emplace(k, static_cast<uint64_t>(k));
     res.insert_ms = now_ms() - t0;
 
     size_t rss1 = rss_bytes();
@@ -150,11 +145,49 @@ static Result bench_unorderedmap(const std::vector<uint64_t>& keys,
     }
     res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
     do_not_optimize(checksum);
-
-    double t2 = now_ms();
-    for (auto k : rounds[0]) m.erase(k);
-    res.erase_ms = now_ms() - t2;
     return res;
+}
+
+template<typename KEY>
+static void run_bench(const char* key_label, size_t n, const std::string& pattern,
+                      int read_iters, std::mt19937_64& rng) {
+    std::vector<KEY> keys(n);
+
+    if (pattern == "sequential") {
+        for (size_t i = 0; i < n; ++i) keys[i] = static_cast<KEY>(i);
+    } else if (pattern == "dense16") {
+        constexpr uint64_t base = std::is_same_v<KEY, int32_t> ? 0x1234ULL : 0x123400000000ULL;
+        for (size_t i = 0; i < n; ++i)
+            keys[i] = static_cast<KEY>(base + (rng() % (n * 2)));
+    } else {
+        for (size_t i = 0; i < n; ++i) keys[i] = static_cast<KEY>(rng());
+    }
+
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    n = keys.size();
+    std::shuffle(keys.begin(), keys.end(), rng);
+
+    LookupRounds<KEY> rounds(read_iters);
+    for (int i = 0; i < read_iters; ++i) {
+        rounds[i] = keys;
+        std::shuffle(rounds[i].begin(), rounds[i].end(), rng);
+    }
+
+    std::printf("=== %s — %s, N=%zu, iters=%d ===\n\n",
+                key_label, pattern.c_str(), n, read_iters);
+
+    Result r_trie = bench_kntrie(keys, rounds);
+    Result r_map  = bench_stdmap(keys, rounds);
+    Result r_umap = bench_unorderedmap(keys, rounds);
+
+    print_header();
+    print_row(r_trie, n);
+    print_row(r_map,  n);
+    print_vs_row("  map vs kntrie", r_map, r_trie);
+    print_row(r_umap, n);
+    print_vs_row("  umap vs kntrie", r_umap, r_trie);
+    std::printf("\n");
 }
 
 int main(int argc, char** argv) {
@@ -177,56 +210,10 @@ int main(int argc, char** argv) {
         else                   read_iters = 1;
     }
 
-    std::vector<uint64_t> keys(n);
     std::mt19937_64 rng(42);
+    run_bench<uint64_t>("kntrie<uint64_t, uint64_t>", n, pattern, read_iters, rng);
+    rng.seed(42);
+    run_bench<int32_t>("kntrie<int32_t, uint64_t>", n, pattern, read_iters, rng);
 
-    if (pattern == "sequential") {
-        std::iota(keys.begin(), keys.end(), 0ULL);
-    } else if (pattern == "dense16") {
-        for (size_t i = 0; i < n; ++i)
-            keys[i] = 0x123400000000ULL + (rng() % (n * 2));
-    } else if (pattern == "bell") {
-        std::normal_distribution<double> dist(128.0, 40.0);
-        std::mt19937 rng32(42);
-        for (size_t i = 0; i < n; ++i) {
-            uint64_t k = 0;
-            for (int b = 0; b < 8; ++b) {
-                int v = static_cast<int>(dist(rng32));
-                v = std::clamp(v, 0, 255);
-                k = (k << 8) | static_cast<uint64_t>(v);
-            }
-            keys[i] = k;
-        }
-    } else {
-        for (size_t i = 0; i < n; ++i) keys[i] = rng();
-    }
-
-    std::sort(keys.begin(), keys.end());
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-    n = keys.size();
-    std::shuffle(keys.begin(), keys.end(), rng);
-
-    LookupRounds rounds(read_iters);
-    for (int i = 0; i < read_iters; ++i) {
-        rounds[i] = keys;
-        std::shuffle(rounds[i].begin(), rounds[i].end(), rng);
-    }
-
-    std::printf("=== kntrie benchmark ===\nN = %zu unique keys, pattern = %s, read_iters = %d\n\n",
-                n, pattern.c_str(), read_iters);
-
-    Result r_trie = bench_kntrie(keys, rounds);
-    Result r_map  = bench_stdmap(keys, rounds);
-    Result r_umap = bench_unorderedmap(keys, rounds);
-
-    print_header();
-    print_row(r_trie, r_trie, n);
-    print_row(r_map,  r_trie, n);
-    print_row(r_umap, r_trie, n);
-
-    std::printf("\nBytes/entry:\n");
-    std::printf("  kntrie:            %6.1f\n", double(r_trie.memory_bytes) / n);
-    std::printf("  std::map:           %6.1f\n", double(r_map.memory_bytes) / n);
-    std::printf("  std::unordered_map: %6.1f\n", double(r_umap.memory_bytes) / n);
     return 0;
 }
