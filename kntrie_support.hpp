@@ -20,6 +20,7 @@ namespace kn3 {
 inline constexpr size_t BITMAP256_U64 = 4;   // 32 bytes
 inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
+inline constexpr size_t HEADER_U64    = 2;   // header is always 2 u64s
 
 // ==========================================================================
 // Allocation size classes
@@ -64,12 +65,16 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 }
 
 // ==========================================================================
-// Node Header  (8 bytes; prefix in node[1] when skip > 0)
+// Node Header  (16 bytes = 2 u64s, always)
+//
+// node[0]: NodeHeader (8 bytes)
+// node[1]: prefix (uint64_t, 0 when skip==0)
 //
 // flags_ layout:
-//   bit 0:     is_bitmask (0 = compact leaf, 1 = bitmask/split)
-//   bits 2-3:  skip (0-3)
-//   bits 4-15: reserved
+//   bit 0:      is_bitmask (0 = compact leaf, 1 = bitmask/split)
+//   bits 1-2:   skip (0-3)
+//   bit 3:      reserved
+//   bits 4-15:  dups (12 bits, max 4095)
 //
 // Zeroed header -> compact leaf with entries=0 (sentinel-compatible)
 // ==========================================================================
@@ -83,9 +88,14 @@ struct NodeHeader {
     bool is_leaf() const noexcept { return !(flags_ & 1); }
     void set_bitmask() noexcept { flags_ |= 1; }
 
-    uint8_t skip() const noexcept { return (flags_ >> 2) & 0x3; }
+    uint8_t skip() const noexcept { return (flags_ >> 1) & 0x3; }
     void set_skip(uint8_t s) noexcept {
-        flags_ = (flags_ & ~uint16_t(0x000C)) | (uint16_t(s & 0x3) << 2);
+        flags_ = (flags_ & ~uint16_t(0x0006)) | (uint16_t(s & 0x3) << 1);
+    }
+
+    uint16_t dups() const noexcept { return flags_ >> 4; }
+    void set_dups(uint16_t d) noexcept {
+        flags_ = (flags_ & 0x000F) | (d << 4);
     }
 
     static constexpr uint16_t DESC_CAP = 65535;
@@ -107,8 +117,6 @@ inline const NodeHeader* get_header(const uint64_t* n) noexcept { return reinter
 inline uint64_t  get_prefix(const uint64_t* n) noexcept { return n[1]; }
 inline void      set_prefix(uint64_t* n, uint64_t p)   noexcept { n[1] = p; }
 
-inline constexpr size_t header_u64(uint8_t skip) noexcept { return skip > 0 ? 2 : 1; }
-
 // ==========================================================================
 // Global sentinel -- zeroed block, valid as:
 //   - Compact leaf (entries=0, flags_=0 -> is_leaf)
@@ -128,6 +136,42 @@ struct suffix_traits {
                  std::conditional_t<BITS <= 16, uint16_t,
                  std::conditional_t<BITS <= 32, uint32_t, uint64_t>>>;
     static constexpr size_t size = sizeof(type);
+};
+
+// ==========================================================================
+// SlotTable -- constexpr lookup: max total slots for a given alloc_u64
+//
+// Indexed directly by alloc_u64. table[0] = table[1] = 0.
+// Not yet used -- prepared for Phase 2 (dup tombstones).
+// ==========================================================================
+
+template<int BITS, typename VST>
+struct SlotTable {
+    using K = typename suffix_traits<BITS>::type;
+    static constexpr size_t MAX_ALLOC = 10240;
+
+    static constexpr auto build() {
+        std::array<uint16_t, MAX_ALLOC + 1> tbl{};
+        tbl[0] = 0; tbl[1] = 0;
+        for (size_t au64 = 2; au64 <= MAX_ALLOC; ++au64) {
+            size_t avail = (au64 - HEADER_U64) * 8;
+            size_t total = avail / (sizeof(K) + sizeof(VST));
+            while (total > 0) {
+                size_t kb = (total * sizeof(K) + 7) & ~size_t{7};
+                size_t vb = (total * sizeof(VST) + 7) & ~size_t{7};
+                if (kb + vb <= avail) break;
+                --total;
+            }
+            tbl[au64] = static_cast<uint16_t>(total);
+        }
+        return tbl;
+    }
+
+    static constexpr auto table = build();
+
+    static constexpr uint16_t max_slots(size_t alloc_u64) noexcept {
+        return table[alloc_u64];
+    }
 };
 
 // ==========================================================================

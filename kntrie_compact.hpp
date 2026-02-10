@@ -10,12 +10,12 @@
 namespace kn3 {
 
 // ==========================================================================
-// Search Strategy: JumpSearch  (stride 256 → 16 → 1, no index overlay)
+// Search Strategy: JumpSearch  (stride 256 -> 16 -> 1, no index overlay)
 // ==========================================================================
 
 template<typename K>
 struct JumpSearch {
-    // Returns index if found (≥0), or -1 if not found.
+    // Returns index if found (>=0), or -1 if not found.
     static int search(const K* keys, int count, K key) noexcept {
         const K* end = keys + count;
         const K* p = keys;
@@ -25,7 +25,7 @@ struct JumpSearch {
         return (p < end && *p == key) ? static_cast<int>(p - keys) : -1;
     }
 
-    // Returns index if found (≥0), or -(insertion_point + 1) if not found.
+    // Returns index if found (>=0), or -(insertion_point + 1) if not found.
     static int search_insert(const K* keys, int count, K key) noexcept {
         if (count == 0) [[unlikely]] return -(0 + 1);
         const K* end = keys + count;
@@ -43,8 +43,9 @@ struct JumpSearch {
 // ==========================================================================
 // CompactOps  -- builds/searches/mutates compact leaf nodes
 //
-// Layout: [header (1-2 u64)][sorted_keys (aligned)][values (aligned)]
+// Layout: [header (2 u64)][sorted_keys (aligned)][values (aligned)]
 //   flags_ bit 0 = 0 -> is_leaf (compact)
+//   node[0] = NodeHeader, node[1] = prefix (0 when skip==0)
 //
 // Allocations are padded via round_up_u64 to enable in-place insert.
 // alloc_u64 stores the actual (padded) allocation size.
@@ -59,13 +60,13 @@ struct CompactOps {
     // --- exact needed size (not padded) ---
 
     template<int BITS>
-    static constexpr size_t size_u64(size_t count, uint8_t skip) noexcept {
+    static constexpr size_t size_u64(size_t count) noexcept {
         using K = typename suffix_traits<BITS>::type;
         size_t kb = count * sizeof(K);
         kb = (kb + 7) & ~size_t{7};
         size_t vb = count * sizeof(VST);
         vb = (vb + 7) & ~size_t{7};
-        return header_u64(skip) + (kb + vb) / 8;
+        return HEADER_U64 + (kb + vb) / 8;
     }
 
     // ==================================================================
@@ -76,7 +77,7 @@ struct CompactOps {
     static uint64_t* make_leaf(const typename suffix_traits<BITS>::type* sorted_keys,
                                const VST* values, uint32_t count,
                                uint8_t skip, uint64_t prefix, ALLOC& alloc) {
-        size_t needed = size_u64<BITS>(count, skip);
+        size_t needed = size_u64<BITS>(count);
         size_t au64 = round_up_u64(needed);
         uint64_t* node = alloc_node(alloc, au64);
         auto* h = get_header(node);
@@ -140,12 +141,17 @@ struct CompactOps {
     // ==================================================================
     // Insert  (returns needs_split=true when entries >= COMPACT_MAX)
     //
+    // Template params:
+    //   INSERT: allow inserting new keys
+    //   ASSIGN: allow overwriting existing values
+    //
     // In-place when padded allocation has room; otherwise alloc new.
     // ==================================================================
 
     struct CompactInsertResult { uint64_t* node; bool inserted; bool needs_split; };
 
-    template<int BITS>
+    template<int BITS, bool INSERT = true, bool ASSIGN = true>
+    requires (INSERT || ASSIGN)
     static CompactInsertResult insert(uint64_t* node, NodeHeader* h,
                                       uint64_t ik, VST value, ALLOC& alloc) {
         using K = typename suffix_traits<BITS>::type;
@@ -156,16 +162,20 @@ struct CompactOps {
         int idx = JumpSearch<K>::search_insert(kd,
                                                 static_cast<int>(h->entries), suffix);
         if (idx >= 0) {
-            VT::destroy(vd[idx], alloc);
-            VT::write_slot(&vd[idx], value);
+            if constexpr (ASSIGN) {
+                VT::destroy(vd[idx], alloc);
+                VT::write_slot(&vd[idx], value);
+            }
             return {node, false, false};
         }
+        if constexpr (!INSERT) return {node, false, false};
+
         size_t ins = static_cast<size_t>(-(idx + 1));
         if (h->entries >= COMPACT_MAX) return {node, false, true};
 
         uint16_t count = h->entries;
         uint16_t nc = count + 1;
-        size_t needed = size_u64<BITS>(nc, h->skip());
+        size_t needed = size_u64<BITS>(nc);
 
         // --- In-place if we have capacity ---
         if (needed <= h->alloc_u64) {
@@ -220,7 +230,7 @@ struct CompactOps {
             return {nullptr, true};
         }
 
-        size_t needed = size_u64<BITS>(nc, h->skip());
+        size_t needed = size_u64<BITS>(nc);
 
         // --- In-place if not oversized ---
         if (!should_shrink_u64(h->alloc_u64, needed)) {
@@ -248,19 +258,45 @@ struct CompactOps {
         return {nn, true};
     }
 
+    // ==================================================================
+    // Dedup+seed placeholder (Phase 2 -- written, not called)
+    //
+    // Will redistribute duplicate tombstones evenly across the key array
+    // after a fresh allocation or resize.
+    // ==================================================================
+
+    template<int BITS>
+    static void seed_dups(uint64_t* /*node*/, NodeHeader* /*h*/) noexcept {
+        // Phase 2: will redistribute dup entries evenly across sorted keys.
+        // Algorithm:
+        //   1. Calculate total_slots from SlotTable[alloc_u64]
+        //   2. dups_available = total_slots - entries
+        //   3. Spread entries apart, inserting dup copies at even intervals
+        //   4. Update h->set_dups(dups_available)
+    }
+
+    template<int BITS>
+    static void dedup(uint64_t* /*node*/, NodeHeader* /*h*/) noexcept {
+        // Phase 2: will compact out duplicate tombstones before resize.
+        // Algorithm:
+        //   1. Scan keys, skip consecutive duplicates
+        //   2. Compact keys[] and vals[] leftward
+        //   3. Update h->entries, h->set_dups(0)
+    }
+
 private:
     // --- layout helpers (private) ---
-    // Layout: [header][keys...][padding to 8-byte][values...]
+    // Layout: [header (2 u64)][keys...][padding to 8-byte][values...]
 
     template<int BITS>
     static auto keys_(uint64_t* node) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        return reinterpret_cast<K*>(node + header_u64(get_header(node)->skip()));
+        return reinterpret_cast<K*>(node + HEADER_U64);
     }
     template<int BITS>
     static auto keys_(const uint64_t* node) noexcept {
         using K = typename suffix_traits<BITS>::type;
-        return reinterpret_cast<const K*>(node + header_u64(get_header(node)->skip()));
+        return reinterpret_cast<const K*>(node + HEADER_U64);
     }
 
     template<int BITS>
@@ -269,7 +305,7 @@ private:
         size_t kb = count * sizeof(K);
         kb = (kb + 7) & ~size_t{7};
         return reinterpret_cast<VST*>(
-            reinterpret_cast<char*>(node + header_u64(get_header(node)->skip())) + kb);
+            reinterpret_cast<char*>(node + HEADER_U64) + kb);
     }
     template<int BITS>
     static const VST* vals_(const uint64_t* node, size_t count) noexcept {
@@ -277,14 +313,11 @@ private:
         size_t kb = count * sizeof(K);
         kb = (kb + 7) & ~size_t{7};
         return reinterpret_cast<const VST*>(
-            reinterpret_cast<const char*>(node + header_u64(get_header(node)->skip())) + kb);
+            reinterpret_cast<const char*>(node + HEADER_U64) + kb);
     }
 
     // ==================================================================
     // In-place insert helper
-    //
-    // Precondition: alloc_u64 has room for nc = entries+1.
-    // Shifts values rightward to accommodate extra key, then inserts.
     // ==================================================================
 
     template<int BITS>
@@ -295,8 +328,7 @@ private:
         uint16_t count = h->entries;
         uint16_t nc = count + 1;
 
-        char* base = reinterpret_cast<char*>(
-            node + header_u64(h->skip()));
+        char* base = reinterpret_cast<char*>(node + HEADER_U64);
 
         size_t old_kb = count * sizeof(K);
         old_kb = (old_kb + 7) & ~size_t{7};
@@ -307,12 +339,15 @@ private:
         VST* new_vd = reinterpret_cast<VST*>(base + new_kb);
         K*   kd = reinterpret_cast<K*>(base);
 
-        // 1. Move values rightward if key region grew
-        if (new_kb != old_kb)
-            std::memmove(new_vd, old_vd, count * sizeof(VST));
-        // Create gap at insertion point in values
-        std::memmove(new_vd + ins + 1, new_vd + ins,
-                     (count - ins) * sizeof(VST));
+        // 1. Move values: each element moves exactly once
+        if (new_kb != old_kb) {
+            std::memmove(new_vd, old_vd, ins * sizeof(VST));
+            std::memmove(new_vd + ins + 1, old_vd + ins,
+                         (count - ins) * sizeof(VST));
+        } else {
+            std::memmove(new_vd + ins + 1, new_vd + ins,
+                         (count - ins) * sizeof(VST));
+        }
         VT::write_slot(&new_vd[ins], value);
 
         // 2. Create gap at insertion point in keys
@@ -327,9 +362,6 @@ private:
 
     // ==================================================================
     // In-place erase helper
-    //
-    // Precondition: allocation not oversized (checked by caller).
-    // Compacts keys/values, shifts values leftward if key region shrank.
     // ==================================================================
 
     template<int BITS>
@@ -338,8 +370,7 @@ private:
         uint16_t count = h->entries;
         uint16_t nc = count - 1;
 
-        char* base = reinterpret_cast<char*>(
-            node + header_u64(h->skip()));
+        char* base = reinterpret_cast<char*>(node + HEADER_U64);
 
         size_t old_kb = count * sizeof(K);
         old_kb = (old_kb + 7) & ~size_t{7};
@@ -354,15 +385,17 @@ private:
         std::memmove(kd + idx, kd + idx + 1,
                      (count - idx - 1) * sizeof(K));
 
-        // 2. Close gap in values
-        std::memmove(old_vd + idx, old_vd + idx + 1,
-                     (count - idx - 1) * sizeof(VST));
+        // 2. Move values: each element moves exactly once
+        if (new_kb != old_kb) {
+            std::memmove(new_vd, old_vd, idx * sizeof(VST));
+            std::memmove(new_vd + idx, old_vd + idx + 1,
+                         (nc - idx) * sizeof(VST));
+        } else {
+            std::memmove(old_vd + idx, old_vd + idx + 1,
+                         (nc - idx) * sizeof(VST));
+        }
 
-        // 3. Shift values leftward if key region shrank
-        if (new_kb != old_kb)
-            std::memmove(new_vd, old_vd, nc * sizeof(VST));
-
-        // 4. Update header
+        // 3. Update header
         h->entries = nc;
         h->descendants = nc;
     }
