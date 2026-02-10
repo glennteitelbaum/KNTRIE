@@ -11,6 +11,7 @@
 #include <numeric>
 #include <algorithm>
 #include <string>
+#include <set>
 
 static double now_ms() {
     using clk = std::chrono::high_resolution_clock;
@@ -23,21 +24,15 @@ static void do_not_optimize(T const& val) {
     asm volatile("" : : "r,m"(val) : "memory");
 }
 
-static size_t rss_bytes() {
-    FILE* f = std::fopen("/proc/self/statm", "r");
-    if (!f) return 0;
-    unsigned long pages = 0;
-    if (std::fscanf(f, "%*u %lu", &pages) != 1) pages = 0;
-    std::fclose(f);
-    return pages * 4096UL;
-}
-
 struct Result {
     const char* name;
-    double read_ms;
+    double find_ms;
     double insert_ms;
+    size_t mem_bytes;     // after insert
     double erase_ms;
-    size_t memory_bytes;
+    double churn_ms;
+    double find2_ms;
+    size_t mem2_bytes;    // after churn
 };
 
 static void fmt_vs(char* buf, size_t sz, double ratio) {
@@ -48,139 +43,236 @@ static void fmt_vs(char* buf, size_t sz, double ratio) {
 }
 
 template<typename KEY>
-using LookupRounds = std::vector<std::vector<KEY>>;
+struct Workload {
+    std::vector<KEY> keys;
+    std::vector<KEY> erase_keys;
+    std::vector<KEY> churn_keys;
+    std::vector<KEY> find1_keys;
+    std::vector<KEY> find2_keys;
+    int find_iters;
+};
 
 template<typename KEY>
-static Result bench_kntrie(const std::vector<KEY>& keys,
-                            const LookupRounds<KEY>& rounds) {
-    Result res{"kntrie", 0, 0, 0, 0};
+static Workload<KEY> make_workload(size_t n, const std::string& pattern,
+                                    int find_iters, std::mt19937_64& rng) {
+    Workload<KEY> w;
+    w.find_iters = find_iters;
+
+    std::vector<KEY> raw(n);
+    if (pattern == "sequential") {
+        for (size_t i = 0; i < n; ++i) raw[i] = static_cast<KEY>(i);
+    } else if (pattern == "dense16") {
+        constexpr uint64_t base = std::is_same_v<KEY, int32_t> ? 0x1234ULL : 0x123400000000ULL;
+        for (size_t i = 0; i < n; ++i)
+            raw[i] = static_cast<KEY>(base + (rng() % (n * 2)));
+    } else {
+        for (size_t i = 0; i < n; ++i) raw[i] = static_cast<KEY>(rng());
+    }
+    std::sort(raw.begin(), raw.end());
+    raw.erase(std::unique(raw.begin(), raw.end()), raw.end());
+    n = raw.size();
+    std::shuffle(raw.begin(), raw.end(), rng);
+    w.keys = raw;
+
+    for (size_t i = 0; i < n; i += 2)
+        w.erase_keys.push_back(raw[i]);
+
+    std::vector<KEY> reinstated;
+    for (size_t i = 0; i < n; i += 4)
+        reinstated.push_back(raw[i]);
+
+    std::set<KEY> original_set(raw.begin(), raw.end());
+    size_t n_new = n / 4;
+    std::vector<KEY> new_keys;
+    new_keys.reserve(n_new);
+    while (new_keys.size() < n_new) {
+        KEY k = static_cast<KEY>(rng());
+        if (original_set.find(k) == original_set.end()) {
+            new_keys.push_back(k);
+            original_set.insert(k);
+        }
+    }
+
+    w.churn_keys = reinstated;
+    w.churn_keys.insert(w.churn_keys.end(), new_keys.begin(), new_keys.end());
+    std::shuffle(w.churn_keys.begin(), w.churn_keys.end(), rng);
+
+    w.find1_keys = raw;
+    std::shuffle(w.find1_keys.begin(), w.find1_keys.end(), rng);
+
+    w.find2_keys = raw;
+    std::shuffle(w.find2_keys.begin(), w.find2_keys.end(), rng);
+
+    return w;
+}
+
+template<typename KEY>
+static Result bench_kntrie(const Workload<KEY>& w) {
+    Result res{"kntrie", 0, 0, 0, 0, 0, 0, 0};
     gteitelbaum::kntrie<KEY, uint64_t> trie;
 
     double t0 = now_ms();
-    for (auto k : keys) trie.insert(k, static_cast<uint64_t>(k));
+    for (auto k : w.keys) trie.insert(k, static_cast<uint64_t>(k));
     res.insert_ms = now_ms() - t0;
 
-    if (trie.size() != keys.size())
-        std::fprintf(stderr, "kntrie: size mismatch %zu vs %zu\n", trie.size(), keys.size());
-
-    res.memory_bytes = trie.memory_usage();
+    res.mem_bytes = trie.memory_usage();
 
     uint64_t checksum = 0;
     double t1 = now_ms();
-    for (auto& lk : rounds) {
-        for (auto k : lk) {
+    for (int r = 0; r < w.find_iters; ++r) {
+        for (auto k : w.find1_keys) {
             auto* v = trie.find_value(k);
             checksum += v ? *v : 0;
         }
     }
-    res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
+    res.find_ms = (now_ms() - t1) / w.find_iters;
     do_not_optimize(checksum);
 
-    auto erase_keys = keys;
-    std::mt19937_64 erng(123);
-    std::shuffle(erase_keys.begin(), erase_keys.end(), erng);
     double t2 = now_ms();
-    for (auto k : erase_keys) trie.erase(k);
+    for (auto k : w.erase_keys) trie.erase(k);
     res.erase_ms = now_ms() - t2;
 
-    if (!trie.empty())
-        std::fprintf(stderr, "kntrie: not empty after erase, %zu left\n", trie.size());
+    double t3 = now_ms();
+    for (auto k : w.churn_keys) trie.insert(k, static_cast<uint64_t>(k));
+    res.churn_ms = now_ms() - t3;
+
+    res.mem2_bytes = trie.memory_usage();
+
+    checksum = 0;
+    double t4 = now_ms();
+    for (int r = 0; r < w.find_iters; ++r) {
+        for (auto k : w.find2_keys) {
+            auto* v = trie.find_value(k);
+            checksum += v ? *v : 0;
+        }
+    }
+    res.find2_ms = (now_ms() - t4) / w.find_iters;
+    do_not_optimize(checksum);
 
     return res;
 }
 
 template<typename KEY>
-static Result bench_stdmap(const std::vector<KEY>& keys,
-                           const LookupRounds<KEY>& rounds) {
-    Result res{"std::map", 0, 0, 0, 0};
-    size_t rss0 = rss_bytes();
+static Result bench_stdmap(const Workload<KEY>& w) {
+    Result res{"map", 0, 0, 0, 0, 0, 0, 0};
     std::map<KEY, uint64_t> m;
 
     double t0 = now_ms();
-    for (auto k : keys) m.emplace(k, static_cast<uint64_t>(k));
+    for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
     res.insert_ms = now_ms() - t0;
 
-    size_t rss1 = rss_bytes();
-    res.memory_bytes = (rss1 > rss0) ? (rss1 - rss0) : (m.size() * 72);
+    res.mem_bytes = m.size() * 72;
 
     uint64_t checksum = 0;
     double t1 = now_ms();
-    for (auto& lk : rounds) {
-        for (auto k : lk) {
+    for (int r = 0; r < w.find_iters; ++r) {
+        for (auto k : w.find1_keys) {
             auto it = m.find(k);
             checksum += (it != m.end()) ? it->second : 0;
         }
     }
-    res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
+    res.find_ms = (now_ms() - t1) / w.find_iters;
     do_not_optimize(checksum);
 
-    auto erase_keys = keys;
-    std::mt19937_64 erng(123);
-    std::shuffle(erase_keys.begin(), erase_keys.end(), erng);
     double t2 = now_ms();
-    for (auto k : erase_keys) m.erase(k);
+    for (auto k : w.erase_keys) m.erase(k);
     res.erase_ms = now_ms() - t2;
+
+    double t3 = now_ms();
+    for (auto k : w.churn_keys) m.emplace(k, static_cast<uint64_t>(k));
+    res.churn_ms = now_ms() - t3;
+
+    res.mem2_bytes = m.size() * 72;
+
+    checksum = 0;
+    double t4 = now_ms();
+    for (int r = 0; r < w.find_iters; ++r) {
+        for (auto k : w.find2_keys) {
+            auto it = m.find(k);
+            checksum += (it != m.end()) ? it->second : 0;
+        }
+    }
+    res.find2_ms = (now_ms() - t4) / w.find_iters;
+    do_not_optimize(checksum);
 
     return res;
 }
 
 template<typename KEY>
-static Result bench_unorderedmap(const std::vector<KEY>& keys,
-                                 const LookupRounds<KEY>& rounds) {
-    Result res{"std::unordered_map", 0, 0, 0, 0};
-    size_t rss0 = rss_bytes();
+static Result bench_unorderedmap(const Workload<KEY>& w) {
+    Result res{"umap", 0, 0, 0, 0, 0, 0, 0};
     std::unordered_map<KEY, uint64_t> m;
-    m.reserve(keys.size());
+    m.reserve(w.keys.size());
 
     double t0 = now_ms();
-    for (auto k : keys) m.emplace(k, static_cast<uint64_t>(k));
+    for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
     res.insert_ms = now_ms() - t0;
 
-    size_t rss1 = rss_bytes();
-    res.memory_bytes = (rss1 > rss0) ? (rss1 - rss0) : (m.size() * 64 + m.bucket_count() * 8);
+    res.mem_bytes = m.size() * 64 + m.bucket_count() * 8;
 
     uint64_t checksum = 0;
     double t1 = now_ms();
-    for (auto& lk : rounds) {
-        for (auto k : lk) {
+    for (int r = 0; r < w.find_iters; ++r) {
+        for (auto k : w.find1_keys) {
             auto it = m.find(k);
             checksum += (it != m.end()) ? it->second : 0;
         }
     }
-    res.read_ms = (now_ms() - t1) / static_cast<int>(rounds.size());
+    res.find_ms = (now_ms() - t1) / w.find_iters;
     do_not_optimize(checksum);
 
-    auto erase_keys = keys;
-    std::mt19937_64 erng(123);
-    std::shuffle(erase_keys.begin(), erase_keys.end(), erng);
     double t2 = now_ms();
-    for (auto k : erase_keys) m.erase(k);
+    for (auto k : w.erase_keys) m.erase(k);
     res.erase_ms = now_ms() - t2;
+
+    double t3 = now_ms();
+    for (auto k : w.churn_keys) m.emplace(k, static_cast<uint64_t>(k));
+    res.churn_ms = now_ms() - t3;
+
+    res.mem2_bytes = m.size() * 64 + m.bucket_count() * 8;
+
+    checksum = 0;
+    double t4 = now_ms();
+    for (int r = 0; r < w.find_iters; ++r) {
+        for (auto k : w.find2_keys) {
+            auto it = m.find(k);
+            checksum += (it != m.end()) ? it->second : 0;
+        }
+    }
+    res.find2_ms = (now_ms() - t4) / w.find_iters;
+    do_not_optimize(checksum);
 
     return res;
 }
 
 static void md_header() {
-    std::printf("| N | | Find(ms) | Insert(ms) | Erase(ms) | Memory(KB) | B/entry |\n");
-    std::printf("|---|-|----------|------------|-----------|------------|--------|\n");
+    std::printf("| N | | F | I | M | B | E | C2 | F2 | M2 | B2 |\n");
+    std::printf("|---|-|---|---|---|---|---|----|----|----|----|\n");
 }
 
 static void md_row(const char* nlabel, const char* name, const Result& r, size_t n) {
-    std::printf("| %s | %s | %.2f | %.2f | %.2f | %.1f | %.1f |\n",
-                nlabel, name, r.read_ms, r.insert_ms, r.erase_ms,
-                r.memory_bytes / 1024.0, double(r.memory_bytes) / n);
+    std::printf("| %s | %s | %.2f | %.2f | %.1f | %.1f | %.2f | %.2f | %.2f | %.1f | %.1f |\n",
+                nlabel, name, r.find_ms, r.insert_ms,
+                r.mem_bytes / 1024.0, double(r.mem_bytes) / n,
+                r.erase_ms, r.churn_ms, r.find2_ms,
+                r.mem2_bytes / 1024.0, double(r.mem2_bytes) / n);
 }
 
 static void md_vs_row(const char* name, const Result& r, const Result& base) {
-    char rd[32], ins[32], er[32], mem[32], bpe[32];
-    fmt_vs(rd,  sizeof(rd),  r.read_ms    / base.read_ms);
+    char fd[32], ins[32], m1[32], b1[32], er[32], ch[32], fd2[32], m2[32], b2[32];
+    fmt_vs(fd,  sizeof(fd),  r.find_ms    / base.find_ms);
     fmt_vs(ins, sizeof(ins), r.insert_ms  / base.insert_ms);
+    double mr1 = double(r.mem_bytes) / base.mem_bytes;
+    fmt_vs(m1,  sizeof(m1),  mr1);
+    fmt_vs(b1,  sizeof(b1),  mr1);
     fmt_vs(er,  sizeof(er),  r.erase_ms   / base.erase_ms);
-    double mr = double(r.memory_bytes) / base.memory_bytes;
-    fmt_vs(mem, sizeof(mem), mr);
-    fmt_vs(bpe, sizeof(bpe), mr);
-    std::printf("| | _%s_ | _%s_ | _%s_ | _%s_ | _%s_ | _%s_ |\n",
-                name, rd, ins, er, mem, bpe);
+    fmt_vs(ch,  sizeof(ch),  r.churn_ms   / base.churn_ms);
+    fmt_vs(fd2, sizeof(fd2), r.find2_ms   / base.find2_ms);
+    double mr2 = double(r.mem2_bytes) / base.mem2_bytes;
+    fmt_vs(m2,  sizeof(m2),  mr2);
+    fmt_vs(b2,  sizeof(b2),  mr2);
+    std::printf("| | _%s_ | _%s_ | _%s_ | _%s_ | _%s_ | _%s_ | _%s_ | _%s_ | _%s_ | _%s_ |\n",
+                name, fd, ins, m1, b1, er, ch, fd2, m2, b2);
 }
 
 static const char* fmt_n(size_t n, char* buf, size_t sz) {
@@ -193,44 +285,24 @@ static const char* fmt_n(size_t n, char* buf, size_t sz) {
 }
 
 template<typename KEY>
-static void run_one(size_t n, const std::string& pattern, int read_iters,
+static void run_one(size_t n, const std::string& pattern, int find_iters,
                     std::mt19937_64& rng, bool print_hdr) {
-    std::vector<KEY> keys(n);
-
-    if (pattern == "sequential") {
-        for (size_t i = 0; i < n; ++i) keys[i] = static_cast<KEY>(i);
-    } else if (pattern == "dense16") {
-        constexpr uint64_t base = std::is_same_v<KEY, int32_t> ? 0x1234ULL : 0x123400000000ULL;
-        for (size_t i = 0; i < n; ++i)
-            keys[i] = static_cast<KEY>(base + (rng() % (n * 2)));
-    } else {
-        for (size_t i = 0; i < n; ++i) keys[i] = static_cast<KEY>(rng());
-    }
-
-    std::sort(keys.begin(), keys.end());
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-    n = keys.size();
-    std::shuffle(keys.begin(), keys.end(), rng);
-
-    LookupRounds<KEY> rounds(read_iters);
-    for (int i = 0; i < read_iters; ++i) {
-        rounds[i] = keys;
-        std::shuffle(rounds[i].begin(), rounds[i].end(), rng);
-    }
+    auto w = make_workload<KEY>(n, pattern, find_iters, rng);
+    n = w.keys.size();
 
     if (print_hdr) md_header();
 
-    Result r_trie = bench_kntrie(keys, rounds);
-    Result r_map  = bench_stdmap(keys, rounds);
-    Result r_umap = bench_unorderedmap(keys, rounds);
+    Result r_trie = bench_kntrie(w);
+    Result r_map  = bench_stdmap(w);
+    Result r_umap = bench_unorderedmap(w);
 
     char nlabel[32];
     fmt_n(n, nlabel, sizeof(nlabel));
 
     md_row(nlabel, "kntrie", r_trie, n);
-    md_row("", "std::map", r_map, n);
+    md_row("", "map", r_map, n);
     md_vs_row("map vs", r_map, r_trie);
-    md_row("", "unordered_map", r_umap, n);
+    md_row("", "umap", r_umap, n);
     md_vs_row("umap vs", r_umap, r_trie);
 }
 
@@ -248,6 +320,17 @@ int main() {
 
     std::printf("# kntrie3 Benchmark Results\n\n");
     std::printf("Compiler: `g++ -std=c++23 -O2 -march=x86-64-v3`\n\n");
+    std::printf("Workload: insert N, find N (all hit), erase N/2, churn N/4 old + N/4 new, find N (25%% miss)\n\n");
+    std::printf("- N = number of entries\n");
+    std::printf("- F = Find all N keys in ms (all hits)\n");
+    std::printf("- I = Insert N keys in ms\n");
+    std::printf("- M = Memory after insert in KB\n");
+    std::printf("- B = Bytes per entry after insert\n");
+    std::printf("- E = Erase N/2 keys in ms\n");
+    std::printf("- C2 = Churn insert N/4 old + N/4 new in ms\n");
+    std::printf("- F2 = Find all N original keys in ms (25%% misses)\n");
+    std::printf("- M2 = Memory after churn in KB\n");
+    std::printf("- B2 = Bytes per entry after churn\n\n");
     std::printf("In _vs_ rows, >1x means kntrie is better. **Bold** = kntrie wins.\n\n");
 
     for (auto* pat : patterns) {
