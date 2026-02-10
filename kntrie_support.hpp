@@ -286,6 +286,18 @@ struct EraseResult {
     bool erased;
 };
 
+// ==========================================================================
+// binary_search_for_insert
+// ==========================================================================
+
+template<typename K>
+inline int binary_search_for_insert(const K* data, size_t count, K target) noexcept {
+    auto it = std::lower_bound(data, data + count, target);
+    if (it != data + count && *it == target)
+        return static_cast<int>(it - data);
+    return -(static_cast<int>(it - data) + 1);
+}
+
 } // namespace kn3
 
 #endif // KNTRIE_SUPPORT_HPP

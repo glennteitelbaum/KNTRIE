@@ -51,29 +51,6 @@ struct IdxSearch {
         if (idx >= 0 && keys[ks + idx] == key) [[likely]] return ks + idx;
         return -1;
     }
-    // Same idx1→idx2→key path as search, but returns insertion point when not found.
-    // Returns: index if found (≥0), or -(insertion_point + 1) if not found.
-    static int search_insert(const K* start, int count, K key) noexcept {
-        int i1 = idx1_count(count), i2 = idx2_count(count);
-        const K* d2 = start + i1; const K* keys = d2 + i2;
-        int ks = 0;
-        if (i1 > 0) [[unlikely]] {
-            [[assume(i1 >= 1 && i1 <= 17)]];
-            int b = subsearch(start, i1, key);
-            if (b < 0) [[unlikely]] return -(0 + 1);  // insert at 0
-            d2 += b * 16; i2 = std::min(16, i2 - b * 16); ks = b * 256; }
-        if (i2 > 0) [[unlikely]] {
-            [[assume(i2 >= 1 && i2 <= 16)]];
-            int b = subsearch(d2, i2, key);
-            if (b < 0) [[unlikely]] return -(ks + 1);  // insert at ks
-            ks += b * 16; }
-        int kl = std::min(16, count - ks);
-        [[assume(kl >= 0 && kl <= 16)]];
-        int idx = subsearch(keys + ks, kl, key);
-        if (idx >= 0 && keys[ks + idx] == key) [[likely]] return ks + idx;
-        int ins = (idx >= 0) ? ks + idx + 1 : ks;
-        return -(ins + 1);
-    }
     static K*       keys_ptr(K* s, int c)       noexcept { return s + extra(c); }
     static const K* keys_ptr(const K* s, int c) noexcept { return s + extra(c); }
 };
@@ -195,8 +172,7 @@ struct CompactOps {
         K*   kd = keys_data_<BITS>(node, h->entries);
         VST* vd = vals_<BITS>(node, h->entries);
 
-        int idx = IdxSearch<K>::search_insert(search_start_<BITS>(node),
-                                               static_cast<int>(h->entries), suffix);
+        int idx = binary_search_for_insert(kd, static_cast<size_t>(h->entries), suffix);
         if (idx >= 0) {
             VT::destroy(vd[idx], alloc);
             VT::write_slot(&vd[idx], value);
@@ -255,8 +231,7 @@ struct CompactOps {
         K*   kd = keys_data_<BITS>(node, count);
         VST* vd = vals_<BITS>(node, count);
 
-        int idx = IdxSearch<K>::search(search_start_<BITS>(node),
-                                       static_cast<int>(count), suffix);
+        int idx = binary_search_for_insert(kd, static_cast<size_t>(count), suffix);
         if (idx < 0) return {node, false};
         VT::destroy(vd[idx], alloc);
 
