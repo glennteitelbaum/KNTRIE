@@ -30,39 +30,24 @@ struct Bitmap256 {
     template<SlotMode MODE>
     int find_slot(uint8_t index) const noexcept {
         const int w = index >> 6, b = index & 63;
-
-        if constexpr (MODE == SlotMode::UNFILTERED) {
-            int pc0 = std::popcount(words[0]);
-            int pc1 = std::popcount(words[1]);
-            int pc2 = std::popcount(words[2]);
-            int slot = std::popcount(words[w] & ((1ULL << b) - 1));
-            slot += pc0 & -int(w > 0);
-            slot += pc1 & -int(w > 1);
-            slot += pc2 & -int(w > 2);
-            return slot;
-        } else {
-            uint64_t before = words[w] << (63 - b);
-            int pc0 = std::popcount(words[0]);
-            int pc1 = std::popcount(words[1]);
-            int pc2 = std::popcount(words[2]);
-
-            if constexpr (MODE == SlotMode::FAST_EXIT) {
-                if (!(before & (1ULL << 63))) [[unlikely]] return -1;
-                int slot = std::popcount(before) - 1;
-                slot += pc0 & -int(w > 0);
-                slot += pc1 & -int(w > 1);
-                slot += pc2 & -int(w > 2);
-                return slot;
-            } else { // BRANCHLESS
-                int slot = std::popcount(before);
-                slot += pc0 & -int(w > 0);
-                slot += pc1 & -int(w > 1);
-                slot += pc2 & -int(w > 2);
-                bool found = before & (1ULL << 63);
-                slot &= -int(found);
-                return slot;
-            }
+        uint64_t before = words[w] << (63 - b);
+        if constexpr (MODE == SlotMode::FAST_EXIT) {
+            if (!(before & (1ULL << 63))) [[unlikely]] return -1;
         }
+
+        int slot = std::popcount(before);
+        slot += std::popcount(words[0]) & -int(w > 0);
+        slot += std::popcount(words[1]) & -int(w > 1);
+        slot += std::popcount(words[2]) & -int(w > 2);
+
+        if constexpr (MODE == SlotMode::BRANCHLESS)
+            slot &= -int(bool(before & (1ULL << 63)));
+        else if constexpr (MODE == SlotMode::FAST_EXIT)
+            slot--;
+        else
+            slot -= int(bool(before & (1ULL << 63)));
+
+        return slot;
     }
 
     int find_next_set(int start) const noexcept {
