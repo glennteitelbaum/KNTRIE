@@ -1,243 +1,403 @@
-# Dup Tombstone Design
+# Dup Tombstone Implementation Plan v3
 
-## Problem
+## Terminology
 
-Compact leaf insert and erase are O(n) due to memmove of keys and values arrays.
-At ~4000 entries with u64 key+value, each insert/erase shifts ~16-32KB of data.
-This dominates cost at 250K-1M entries in the random pattern.
-
-## Core Idea
-
-Maintain duplicate entries (copies of adjacent keys+values) distributed throughout
-the sorted arrays. These dups act as free slots that can be consumed by insert
-or created by erase, reducing shifts from O(n) to O(gap_distance).
-
-The node is always at full allocated capacity: `entries + dups = total_slots_for_alloc`.
+- `entries`: count of unique real entries (stored in header)
+- `total`: `SlotTable<BITS, VST>::max_slots(alloc_u64)` — physical slot count, property of allocation size
+- `dups`: `total - entries` — derived, never stored
+- All dup slots hold the same key AND same value (including same T*) as their neighbor
+- There is no "canonical" copy — any occurrence of a key is equally valid
+- JumpSearch finds the LAST match, which is always valid
 
 ## Header Changes
 
-```
-NodeHeader::flags_ (uint16_t):
-  bit 0:     leaf/bitmask
-  bits 1-2:  skip (max 3)
-  bit 3:     (reserved)
-  bits 4-15: dups (12 bits, max 4095)
-```
-
-Accessors:
-```cpp
-uint16_t dups() const noexcept { return flags_ >> 4; }
-void set_dups(uint16_t d) noexcept {
-    flags_ = (flags_ & 0x000F) | (d << 4);
-}
-```
-
-`entries` remains the count of real (unique) entries. Total occupied slots = `entries + dups`.
-
-## Node Layout
-
-Unchanged structure: `[header][sorted_keys][values]`
-
-But the arrays have `entries + dups` slots. Dup keys are copies of their left
-neighbor. Dup values are copies of the same neighbor's value.
-
-Example — 8 real entries, 4 dups (every 2nd entry):
-```
-keys:   [1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8]
-values: [a, a, b, c, c, d, e, e, f, g, g, h]
-```
-
-JumpSearch finds the **last** match for any key, which is always a valid entry.
-Dups are invisible to search — finding key=1 returns position 1 (the dup),
-which holds the correct value `a`.
-
-## Total Slots Calculation
-
-Given `alloc_u64` and `skip`, compute max total slots:
+**Remove dups from header.** Bits 4-15 of `flags_` no longer used for dups.
+Remove `dups()` and `set_dups()` accessors.
 
 ```cpp
-template<int BITS>
-static constexpr size_t max_slots(size_t alloc_u64, uint8_t skip) noexcept {
-    using K = typename suffix_traits<BITS>::type;
-    size_t avail = (alloc_u64 - header_u64(skip)) * 8;
-    // Find max total where ceil8(total*sizeof(K)) + ceil8(total*sizeof(VST)) <= avail
-    size_t total = avail / (sizeof(K) + sizeof(VST));
-    while (total > 0) {
-        size_t kb = (total * sizeof(K) + 7) & ~size_t{7};
-        size_t vb = (total * sizeof(VST) + 7) & ~size_t{7};
-        if (kb + vb <= avail) break;
-        --total;
-    }
-    return total;
-}
+// flags_ layout (simplified):
+//   bit 0:      is_bitmask
+//   bits 1-2:   skip (0-3)
+//   bits 3-15:  reserved
 ```
 
-On any allocation: `dups = max_slots(alloc_u64, skip) - entries`.
+## Derived dups
 
-## Seeding Strategy
-
-When building or resizing a node with `entries` real entries into an allocation
-with room for `total` slots, distribute `dups = total - entries` dup slots
-evenly among the real entries.
-
-Algorithm:
-```
-stride = entries / (dups + 1)   // entries between dups
-remainder = entries % (dups + 1)
-
-write_pos = 0
-src_pos = 0
-dups_placed = 0
-for each dup to place:
-    chunk = stride + (dups_placed < remainder ? 1 : 0)
-    copy keys[src_pos .. src_pos+chunk) to output[write_pos ..]
-    copy vals[src_pos .. src_pos+chunk) to output[write_pos ..]
-    write_pos += chunk
-    src_pos += chunk
-    // place dup: copy of previous entry
-    output_key[write_pos] = output_key[write_pos - 1]
-    output_val[write_pos] = output_val[write_pos - 1]
-    write_pos++
-    dups_placed++
-// copy remaining real entries
-copy keys[src_pos .. entries) to output[write_pos ..]
-copy vals[src_pos .. entries) to output[write_pos ..]
+Every operation computes:
+```cpp
+uint16_t total = SlotTable<BITS, VST>::max_slots(h->alloc_u64);
+uint16_t dups  = total - h->entries;
 ```
 
-Example: 8 entries, alloc fits 12 total, 4 dups, stride=2:
-```
-src:  [1, 2, 3, 4, 5, 6, 7, 8]
-out:  [1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 8, 8]
-              ^        ^        ^        ^  dups
-```
+This is always correct because:
+- `make_leaf` fills `total` slots (entries + seeded dups)
+- Insert consumes a dup: entries++, total unchanged → dups decreases by 1
+- Erase creates a dup: entries--, total unchanged → dups increases by 1
+- Resize: new total from new alloc, new dups = new total - entries
 
-## Erase — O(1)
+## Layout
 
-```
-1. Find key at position idx (via JumpSearch) in 0..entries+dups
-2. Overwrite key[idx] with key[idx-1] or key[idx+1]
-   (copy the value too)
-3. Destroy old value if T* (only if non-inline)
-4. entries--, dups++
-5. Check should_shrink(alloc, size_u64_for(entries)):
-   - If yes: realloc smaller, dedup, reseed
-```
+`vals_<BITS>(node, count)` currently takes entry count to compute offset.
+**Must pass `total`** (from SlotTable) since keys array has `total` elements.
 
-No memmove. One key write, one value write (or two if T*: destroy + copy).
+Every call site: `vals_<BITS>(node, SlotTable<BITS, VST>::max_slots(h->alloc_u64))`
 
-Edge case: erasing first entry (idx=0) — copy from right neighbor.
-Edge case: erasing where idx is adjacent to a dup — still works, creates
-another dup of the same key. Harmless, dedup handles later.
+## size_u64 (unchanged)
 
-## Insert (dups > 0) — O(gap_distance)
+`size_u64<BITS>(count)` computes exact u64s needed for `count` slots.
+Used with real entry count for shrink/grow decisions:
+- `size_u64(entries + 1)` for insert grow check
+- `size_u64(entries - 1)` for erase shrink check
+
+## Operation: Find
 
 ```
-1. search_insert to find insertion point ins in 0..entries+dups
-2. Check if key exists (update path):
-   - If found: overwrite value at found position. Done.
-3. Find nearest dup:
-   - Scan left from ins: find i where key[i] == key[i-1]
-   - Scan right from ins: find i where key[i] == key[i+1]
-   - Pick closer one at position dup_pos
-4. Shift the range between dup_pos and ins:
-   - If dup_pos < ins: shift [dup_pos+1 .. ins) left by 1, insert at ins-1
-   - If dup_pos > ins: shift [ins .. dup_pos) right by 1, insert at ins
-5. Write new key+value at freed position
-6. entries++, dups--
+find<BITS>(node, h, ik):
+  suffix = extract_suffix(ik)
+  total = SlotTable<BITS, VST>::max_slots(h->alloc_u64)
+  idx = JumpSearch::search(keys, total, suffix)
+  if idx < 0: return nullptr
+  return as_ptr(vals_<BITS>(node, total)[idx])
 ```
 
-Average shift distance: `total_slots / (2 * dups)`.
-With 4096 slots and 256 dups: ~8 entries shifted.
-With 4096 slots and 64 dups: ~32 entries shifted.
-Still much better than ~2000.
+No behavior change. JumpSearch over more slots, finds last match.
 
-## Insert (dups == 0) — Resize Up
+## Operation: Insert (dups > 0, in-place)
 
-```
-1. Compute needed = size_u64(entries + 1, skip)
-2. alloc_u64 = round_up_u64(needed)  // jumps to next size class
-3. Allocate new node
-4. Copy entries (no dedup needed since dups==0)
-5. Seed dups for new allocation
-6. Insert the new entry using normal dups>0 path
-```
-
-## Dedup (during resize only)
-
-Forward scan with read/write pointers:
+No realloc. Consume one dup.
 
 ```
-read = 0, write = 0
-while read < entries + dups:
-    if read > 0 && key[read] == key[read-1]:
-        read++          // skip dup, do NOT destroy value (it's a copy)
-        continue
-    if write != read:
-        key[write] = key[read]
-        val[write] = val[read]
-    write++
-    read++
-// write == entries (real count)
+insert<BITS>(node, h, ik, value, alloc):
+  suffix = extract_suffix(ik)
+  total = max_slots(h->alloc_u64)
+  dups = total - h->entries
+  kd = keys_<BITS>(node)
+  vd = vals_<BITS>(node, total)
+
+  idx = JumpSearch::search_insert(kd, total, suffix)
+  
+  if idx >= 0:  // key exists — update path
+    if ASSIGN:
+      if !is_inline: destroy(vd[idx])
+      write_slot(&vd[idx], value)
+      // Walk LEFT: update dups with same key (share new T*)
+      for i = idx - 1; i >= 0 && kd[i] == suffix; --i:
+        vd[i] = vd[idx]  // don't destroy — old T* already destroyed above
+    return {node, false, false}
+  
+  if !INSERT: return {node, false, false}
+  
+  ins = -(idx + 1)  // insertion point
+  
+  if dups > 0:
+    // Find nearest dup: scan left and right from ins
+    left_dup = -1
+    for i = ins - 1; i >= 1; --i:
+      if kd[i] == kd[i-1]: left_dup = i; break
+    
+    right_dup = -1  
+    for i = ins; i < total - 1; ++i:
+      if kd[i] == kd[i+1]: right_dup = i; break
+    
+    dup_pos = pick_closer(left_dup, right_dup, ins)
+    
+    if dup_pos < ins:
+      memmove(kd + dup_pos, kd + dup_pos + 1, (ins - 1 - dup_pos) * sizeof(K))
+      memmove(vd + dup_pos, vd + dup_pos + 1, (ins - 1 - dup_pos) * sizeof(VST))
+      write_pos = ins - 1
+    else:
+      memmove(kd + ins + 1, kd + ins, (dup_pos - ins) * sizeof(K))
+      memmove(vd + ins + 1, vd + ins, (dup_pos - ins) * sizeof(VST))
+      write_pos = ins
+    
+    kd[write_pos] = suffix
+    write_slot(&vd[write_pos], value)
+    h->entries++
+    return {node, true, false}
+  
+  // dups == 0: need realloc
+  if h->entries >= COMPACT_MAX: return {node, false, true}  // needs_split
+  ... realloc path (see Resize section) ...
 ```
 
-O(entries + dups) but only happens during realloc which is already O(n).
+## Operation: Insert (dups == 0, realloc)
 
-## Impact on Find
+```
+  needed = size_u64<BITS>(entries + 1)
+  au64 = round_up_u64(needed)
+  nn = alloc_node(alloc, au64)
+  new_total = max_slots(au64)
+  new_dups = new_total - (entries + 1)
+  
+  // Build new node: merge existing entries + new entry, then seed dups
+  // Source has 0 dups (old total == entries), so no dedup needed
+  // Just insert new key in sorted position and seed
+  
+  // Setup header
+  nh->entries = entries + 1
+  nh->alloc_u64 = au64
+  ... copy skip/prefix ...
+  
+  // Merge + seed into new arrays
+  seed_with_insert<BITS>(nn, kd_old, vd_old, entries, suffix, value, new_total)
+  
+  dealloc_node(alloc, node, h->alloc_u64)
+  return {nn, true, false}
+```
 
-**None.** JumpSearch over `entries + dups` slots. Finds last match.
-Dups have identical key+value to their neighbor. Any match returns correct data.
+## Operation: Erase (in-place)
 
-## Impact on Update (insert existing key)
+```
+erase<BITS>(node, h, ik, alloc):
+  suffix = extract_suffix(ik)
+  total = max_slots(h->alloc_u64)
+  kd = keys_<BITS>(node)
+  vd = vals_<BITS>(node, total)
+  
+  idx = JumpSearch::search(kd, total, suffix)
+  if idx < 0: return {node, false}
+  
+  nc = h->entries - 1
+  
+  if nc == 0:
+    // Last real entry. Destroy and dealloc.
+    // (dups may exist but they're copies of this same entry)
+    if !is_inline: destroy(vd[idx])
+    dealloc_node(...)
+    return {nullptr, true}
+  
+  needed = size_u64<BITS>(nc)
+  if should_shrink_u64(h->alloc_u64, needed):
+    // Realloc smaller — dedup, skip erased key, seed (see Resize section)
+    ...
+  
+  // In-place: convert run of this key to neighbor dups
+  // Find full run of this key
+  first = idx
+  while first > 0 && kd[first - 1] == suffix: first--
+  // run is [first .. idx], length = idx - first + 1
+  
+  // Destroy value ONCE (all slots in run share same T*)
+  if !is_inline: destroy(vd[first])
+  
+  // Overwrite entire run with neighbor
+  if first > 0:
+    neighbor_key = kd[first - 1]
+    neighbor_val = vd[first - 1]
+  else:
+    neighbor_key = kd[idx + 1]
+    neighbor_val = vd[idx + 1]
+  
+  for i = first; i <= idx; ++i:
+    kd[i] = neighbor_key
+    vd[i] = neighbor_val
+  
+  h->entries = nc
+  // dups automatically increased by 1 (total unchanged, entries decreased)
+  return {node, true}
+```
 
-JumpSearch finds the last occurrence. Update overwrites that slot.
-If the key has a dup, the dup now holds a stale value.
+## Operation: Erase (realloc shrink)
 
-Fix: after updating position `idx`, check `if (idx > 0 && key[idx-1] == suffix)`
-and update that value too. One extra comparison, adjacent memory. Repeat leftward
-for multiple dups of same key (rare — at most 2 in practice).
+```
+  needed = size_u64<BITS>(nc)
+  au64 = round_up_u64(needed)
+  nn = alloc_node(alloc, au64)
+  new_total = max_slots(au64)
+  new_dups = new_total - nc
+  
+  // Dedup source, skip erased key, seed into new node
+  // Source: total slots with dups mixed in
+  
+  nh->entries = nc
+  nh->alloc_u64 = au64
+  ... copy skip/prefix ...
+  
+  seed_with_skip<BITS>(nn, kd, vd, total, suffix, nc, new_total)
+  
+  // Destroy erased value (only if not shared — but during dedup we find it)
+  // Actually: handle destroy before seeding, during the dedup scan
+  
+  dealloc_node(alloc, node, h->alloc_u64)
+  return {nn, true}
+```
 
-## Impact on Convert-to-Split
+## Seed Algorithms
 
-`for_each` iterates all `entries + dups` slots. Must skip dups during
-conversion. Simple check: `if (i > 0 && key[i] == key[i-1]) continue;`
+### seed_from_real<BITS>(node, real_keys, real_vals, n_entries, total)
 
-## Impact on JumpSearch
+Seeds `total - n_entries` dups evenly among `n_entries` real entries.
+Used when we have a clean array of unique entries.
 
-`search()` and `search_insert()` receive `entries + dups` as count.
-No code change needed — dups are valid sorted entries.
+```
+  if n_entries == total:
+    memcpy keys and vals
+    return
+  
+  kd = keys_<BITS>(node)
+  vd = vals_<BITS>(node, total)
+  n_dups = total - n_entries
+  
+  stride = n_entries / (n_dups + 1)
+  remainder = n_entries % (n_dups + 1)
+  
+  write = 0; src = 0; placed = 0
+  while placed < n_dups:
+    chunk = stride + (placed < remainder ? 1 : 0)
+    memcpy(kd + write, real_keys + src, chunk * sizeof(K))
+    memcpy(vd + write, real_vals + src, chunk * sizeof(VST))
+    write += chunk; src += chunk
+    kd[write] = kd[write - 1]
+    vd[write] = vd[write - 1]
+    write++; placed++
+  
+  remaining = n_entries - src
+  memcpy(kd + write, real_keys + src, remaining * sizeof(K))
+  memcpy(vd + write, real_vals + src, remaining * sizeof(VST))
+```
 
-`search_insert()` for finding insertion point: returns position in the
-full array including dups. This is correct — we insert among all slots.
+### seed_with_insert<BITS>(node, old_keys, old_vals, old_count, new_suffix, new_val, total)
 
-## Resize Triggers
+Dedup source (if any dups), merge in new entry at sorted position, seed into total slots.
+Source `old_count` is the physical slot count (may contain dups from old node).
 
-| Operation | Trigger | Action |
-|-----------|---------|--------|
-| Insert, dups > 0 | — | Consume dup, small shift |
-| Insert, dups == 0 | Always | Realloc up + seed dups |
-| Erase | should_shrink(alloc, size_for(entries)) | Realloc down + dedup + seed |
-| Erase | !should_shrink | O(1) dup creation |
+```
+  // Temp arrays for real entries + new entry
+  n_entries = old_entries_count + 1  // caller provides real count via header
+  ... collect real entries from source (skip dups), insert new key in order ...
+  seed_from_real<BITS>(node, temp_keys, temp_vals, n_entries, total)
+```
 
-## Expected Performance
+### seed_with_skip<BITS>(node, old_keys, old_vals, old_total, skip_suffix, n_entries, total)
 
-At 4000 entries with 100 dups (reasonable density):
+Dedup source, skip one occurrence of skip_suffix, seed into total slots.
 
-| Operation | Before | After |
-|-----------|--------|-------|
-| Erase | O(2000) memmove | O(1) |
-| Insert | O(2000) memmove | O(20) shift |
-| Find | unchanged | unchanged |
-| Memory | unchanged | unchanged (same alloc, slots redistributed) |
+```
+  // Collect real entries from source, skipping dups and one occurrence of skip_suffix
+  // Destroy the skipped entry's value (T*) during collection
+  ... collect into temp, skipping dups and one skip_suffix ...
+  seed_from_real<BITS>(node, temp_keys, temp_vals, n_entries, total)
+```
 
-## Implementation Order
+Note: For T*, during dedup collection, all slots with same key share same T*.
+Only the LAST occurrence in a run gets its T* carried forward to temp. 
+Skipped dups don't get destroyed (same pointer as the surviving entry).
+The skip_suffix entry gets destroyed.
 
-1. Header: add dups accessors to flags_
-2. max_slots calculation
-3. Seeding function
-4. Dedup function
-5. Erase: O(1) path
-6. Insert: nearest-dup path
-7. Update: propagate to adjacent dups
-8. for_each: skip dups
-9. Convert-to-split: skip dups
-10. Resize paths: integrate dedup + reseed
+## Operation: Update (insert_or_assign, existing key)
+
+JumpSearch finds LAST match at `idx`. Update that slot and walk left:
+
+```
+  if !is_inline: destroy(vd[idx])
+  write_slot(&vd[idx], value)
+  for i = idx - 1; i >= 0 && kd[i] == suffix; --i:
+    vd[i] = vd[idx]  // share new T* or copy inline value
+```
+
+## Operation: for_each (skip dups)
+
+```
+for_each<BITS>(node, h, cb):
+  total = max_slots(h->alloc_u64)
+  kd = keys_<BITS>(node)
+  vd = vals_<BITS>(node, total)
+  for i = 0; i < total; ++i:
+    if i > 0 && kd[i] == kd[i-1]: continue
+    cb(kd[i], vd[i])
+```
+
+## Operation: destroy_and_dealloc (avoid double-free T*)
+
+```
+destroy_and_dealloc<BITS>(node, alloc):
+  h = get_header(node)
+  total = max_slots(h->alloc_u64)
+  if !is_inline:
+    kd = keys_<BITS>(node)
+    vd = vals_<BITS>(node, total)
+    for i = 0; i < total; ++i:
+      if i > 0 && kd[i] == kd[i-1]: continue  // same T* as prev
+      destroy(vd[i], alloc)
+  dealloc_node(alloc, node, h->alloc_u64)
+```
+
+## make_leaf changes
+
+After allocating with round_up_u64, seed dups from the padding space:
+
+```
+make_leaf<BITS>(sorted_keys, values, count, skip, prefix, alloc):
+  needed = size_u64<BITS>(count)
+  au64 = round_up_u64(needed)
+  total = max_slots(au64)
+  
+  nn = alloc_node(alloc, au64)
+  ... setup header with entries = count ...
+  
+  if total == count:
+    // No room for dups, copy directly (existing behavior)
+    memcpy keys, memcpy vals
+  else:
+    // Seed dups
+    seed_from_real<BITS>(nn, sorted_keys, values, count, total)
+  
+  return nn
+```
+
+## convert_to_split (skip dups)
+
+When converting compact leaf to split, iterate with dup-skipping:
+```
+  total = max_slots(h->alloc_u64)
+  // ... collect unique entries only ...
+  for i = 0; i < total; ++i:
+    if i > 0 && kd[i] == kd[i-1]: continue
+    // add to working arrays
+```
+
+## Summary of header changes
+
+**Remove:**
+- `NodeHeader::dups()` 
+- `NodeHeader::set_dups()`
+- Bits 4-15 usage in flags_
+
+**Keep:**
+- `SlotTable<BITS, VST>::max_slots(alloc_u64)` — the single source of truth
+
+## Functions removed
+
+- `insert_in_place_` — replaced by dup-consumption logic in insert
+- `erase_in_place_` — replaced by O(1) dup-creation logic in erase
+
+## Functions added
+
+- `seed_from_real<BITS>()` — seed dups evenly into node from clean array
+- `seed_with_insert<BITS>()` — dedup + merge new entry + seed (for insert realloc)
+- `seed_with_skip<BITS>()` — dedup + skip erased entry + seed (for erase realloc)
+
+## Files changed
+
+### kntrie_support.hpp
+- Remove `dups()` / `set_dups()` from NodeHeader
+- Clean up flags_ comment
+
+### kntrie_compact.hpp
+- All `vals_()` calls: pass `max_slots(alloc_u64)` 
+- `find`: search over total slots
+- `insert`: dup-consumption (in-place) or realloc+seed
+- `erase`: O(1) dup-creation (in-place) or realloc+dedup+seed
+- Remove `insert_in_place_`, `erase_in_place_`
+- `for_each`: skip dups
+- `destroy_and_dealloc`: skip dups for T*
+- `make_leaf`: seed dups
+- Add seed helpers
+
+### kntrie_impl.hpp
+- `convert_to_split`: use dup-skipping for_each
+- `convert_root_child_to_bot_internal_`: same
+
+### kntrie_bitmask.hpp
+- Bot-leaf BITS>16 delegates to CompactOps — inherits all fixes
+- Bot-leaf-16 (bitmap): NO changes (no dups)
