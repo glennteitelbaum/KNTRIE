@@ -73,8 +73,7 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 // flags_ layout:
 //   bit 0:      is_bitmask (0 = compact leaf, 1 = bitmask/split)
 //   bits 1-2:   skip (0-3)
-//   bit 3:      reserved
-//   bits 4-15:  dups (12 bits, max 4095)
+//   bits 3-15:  reserved
 //
 // Zeroed header -> compact leaf with entries=0 (sentinel-compatible)
 // ==========================================================================
@@ -91,11 +90,6 @@ struct NodeHeader {
     uint8_t skip() const noexcept { return (flags_ >> 1) & 0x3; }
     void set_skip(uint8_t s) noexcept {
         flags_ = (flags_ & ~uint16_t(0x0006)) | (uint16_t(s & 0x3) << 1);
-    }
-
-    uint16_t dups() const noexcept { return flags_ >> 4; }
-    void set_dups(uint16_t d) noexcept {
-        flags_ = (flags_ & 0x000F) | (d << 4);
     }
 
     static constexpr uint16_t DESC_CAP = 65535;
@@ -142,7 +136,7 @@ struct suffix_traits {
 // SlotTable -- constexpr lookup: max total slots for a given alloc_u64
 //
 // Indexed directly by alloc_u64. table[0] = table[1] = 0.
-// Not yet used -- prepared for Phase 2 (dup tombstones).
+// Total slots = entries + dups. Dups are derived: total - entries.
 // ==========================================================================
 
 template<int BITS, typename VST>

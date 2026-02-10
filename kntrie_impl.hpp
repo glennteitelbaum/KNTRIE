@@ -265,8 +265,6 @@ private:
     {
         NodeHeader h = *get_header(node);
 
-        // skip at BITS=16 is unreachable in normal operation, but handle
-        // defensively: verify prefix, then proceed at BITS=16
         if (h.skip() > 0) [[unlikely]] {
             uint64_t expected = KO::template extract_prefix<BITS>(ik, h.skip());
             if (expected != get_prefix(node)) [[unlikely]] return nullptr;
@@ -330,8 +328,6 @@ private:
 
     // ==================================================================
     // Insert -- recursive dispatch
-    //
-    // Template params INSERT/ASSIGN threaded through to compact/bitmask ops.
     // ==================================================================
 
     template<int BITS, bool INSERT = true, bool ASSIGN = true>
@@ -525,6 +521,7 @@ private:
         K new_suffix = static_cast<K>(KO::template extract_suffix<ROOT_BITS>(ik));
         size_t wi = 0;
         bool ins = false;
+        // for_each now skips dups automatically
         CO::template for_each<ROOT_BITS>(node, h, [&](K s, VST v) {
             if (!ins && new_suffix < s) {
                 wk[wi] = new_suffix; wv[wi] = value; wi++; ins = true;
@@ -617,6 +614,7 @@ private:
         K new_suffix = static_cast<K>(KO::template extract_suffix<BITS>(ik));
         size_t wi = 0;
         bool ins = false;
+        // for_each now skips dups automatically
         CO::template for_each<BITS>(node, h, [&](K s, VST v) {
             if (!ins && new_suffix < s) {
                 wk[wi] = static_cast<uint64_t>(new_suffix);
@@ -636,7 +634,6 @@ private:
             uint8_t  ns     = h->skip() + os;
             uint64_t parent_prefix = get_prefix(node);
             uint64_t combined = (parent_prefix << (16 * os)) | old_cp;
-            // Header is always 2 u64s -- just set skip and prefix directly
             ch2->set_skip(ns);
             set_prefix(child, combined);
         }
@@ -665,6 +662,7 @@ private:
         S new_suffix = static_cast<S>(KO::template extract_suffix<sb>(ik));
         size_t wi = 0;
         bool ins = false;
+        // for_each_bot_leaf skips dups for BITS>16 (delegates to CO::for_each)
         BO::template for_each_bot_leaf<BITS>(bot, [&](S s, VST v) {
             if (!ins && new_suffix < s) {
                 wk[wi] = new_suffix; wv[wi] = value; wi++; ins = true;
@@ -767,7 +765,6 @@ private:
 
                     uint64_t* child = build_node_from_arrays<CB>(suf, vals, count);
 
-                    // Header is always 2 u64s -- just set skip and prefix
                     auto* ch = get_header(child);
                     uint64_t ocp = ch->skip() > 0 ? get_prefix(child) : 0;
                     uint8_t  os  = ch->skip();
@@ -1015,7 +1012,7 @@ private:
             if      (ab == 48) return erase_at_bits<48>(node, get_header(node), ik);
             else if (ab == 32) return erase_at_bits<32>(node, get_header(node), ik);
             else if (ab == 16) return erase_at_bits<16>(node, get_header(node), ik);
-            else               return {node, false};  // unreachable safety
+            else               return {node, false};
         }
         return erase_at_bits<BITS>(node, h, ik);
     }
