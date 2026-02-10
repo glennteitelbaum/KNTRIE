@@ -81,53 +81,19 @@ public:
     }
 
     // ==================================================================
-    // Insert  (insert_or_assign semantics to match prior behavior)
+    // Insert  (insert-only: does NOT overwrite existing values)
     // ==================================================================
 
     std::pair<bool, bool> insert(const KEY& key, const VALUE& value) {
-        uint64_t ik = KO::to_internal(key);
-        VST sv = VT::store(value, alloc_);
-        uint8_t ti = static_cast<uint8_t>(ik >> 56);
-        uint64_t* child = root_[ti];
+        return insert_dispatch_<true, false>(key, value);
+    }
 
-        // Empty slot: create single-entry compact leaf
-        if (child == SENTINEL_NODE) {
-            using K = typename suffix_traits<ROOT_BITS>::type;
-            K suffix = static_cast<K>(KO::template extract_suffix<ROOT_BITS>(ik));
-            root_[ti] = CO::template make_leaf<ROOT_BITS>(
-                &suffix, &sv, 1, 0, 0, alloc_);
-            ++size_;
-            return {true, true};
-        }
+    // ==================================================================
+    // Insert-or-assign  (overwrites existing values)
+    // ==================================================================
 
-        auto* h = get_header(child);
-        if (h->is_leaf()) {
-            auto r = CO::template insert<ROOT_BITS, true, true>(
-                child, h, ik, sv, alloc_);
-            if (r.needs_split) {
-                if constexpr (ROOT_BITS > 8) {
-                    root_[ti] = convert_root_child_to_bot_internal_(
-                        child, h, ik, sv);
-                    ++size_;
-                    return {true, true};
-                }
-            }
-            root_[ti] = r.node;
-            if (r.inserted) { ++size_; return {true, true}; }
-            VT::destroy(sv, alloc_);
-            return {true, false};
-        }
-
-        // bot_internal path
-        if constexpr (ROOT_BITS > 8) {
-            bool inserted = false;
-            root_[ti] = insert_into_root_bot_internal_<true, true>(
-                child, ik, sv, inserted);
-            if (inserted) { ++size_; return {true, true}; }
-            VT::destroy(sv, alloc_);
-            return {true, false};
-        }
-        return {true, false};
+    std::pair<bool, bool> insert_or_assign(const KEY& key, const VALUE& value) {
+        return insert_dispatch_<true, true>(key, value);
     }
 
     // ==================================================================
@@ -229,6 +195,59 @@ public:
 private:
 
     // ==================================================================
+    // Insert dispatch (shared by insert / insert_or_assign)
+    // ==================================================================
+
+    template<bool INSERT, bool ASSIGN>
+    std::pair<bool, bool> insert_dispatch_(const KEY& key, const VALUE& value) {
+        uint64_t ik = KO::to_internal(key);
+        VST sv = VT::store(value, alloc_);
+        uint8_t ti = static_cast<uint8_t>(ik >> 56);
+        uint64_t* child = root_[ti];
+
+        // Empty slot: create single-entry compact leaf
+        if (child == SENTINEL_NODE) {
+            if constexpr (!INSERT) { VT::destroy(sv, alloc_); return {true, false}; }
+            using K = typename suffix_traits<ROOT_BITS>::type;
+            K suffix = static_cast<K>(KO::template extract_suffix<ROOT_BITS>(ik));
+            root_[ti] = CO::template make_leaf<ROOT_BITS>(
+                &suffix, &sv, 1, 0, 0, alloc_);
+            ++size_;
+            return {true, true};
+        }
+
+        auto* h = get_header(child);
+        if (h->is_leaf()) {
+            auto r = CO::template insert<ROOT_BITS, INSERT, ASSIGN>(
+                child, h, ik, sv, alloc_);
+            if (r.needs_split) {
+                if constexpr (!INSERT) { VT::destroy(sv, alloc_); return {true, false}; }
+                if constexpr (ROOT_BITS > 8) {
+                    root_[ti] = convert_root_child_to_bot_internal_(
+                        child, h, ik, sv);
+                    ++size_;
+                    return {true, true};
+                }
+            }
+            root_[ti] = r.node;
+            if (r.inserted) { ++size_; return {true, true}; }
+            VT::destroy(sv, alloc_);
+            return {true, false};
+        }
+
+        // bot_internal path
+        if constexpr (ROOT_BITS > 8) {
+            bool inserted = false;
+            root_[ti] = insert_into_root_bot_internal_<INSERT, ASSIGN>(
+                child, ik, sv, inserted);
+            if (inserted) { ++size_; return {true, true}; }
+            VT::destroy(sv, alloc_);
+            return {true, false};
+        }
+        return {true, false};
+    }
+
+    // ==================================================================
     // Find -- recursive dispatch (BITS <= ROOT_BITS - 8)
     // ==================================================================
 
@@ -236,6 +255,17 @@ private:
     const VALUE* find_impl(const uint64_t* node, uint64_t ik) const noexcept
         requires (BITS == 16)
     {
+        NodeHeader h = *get_header(node);
+
+        // skip at BITS=16 is unreachable in normal operation, but handle
+        // defensively: verify prefix, then proceed at BITS=16
+        if (h.skip() > 0) [[unlikely]] {
+            uint64_t expected = KO::template extract_prefix<BITS>(ik, h.skip());
+            if (expected != get_prefix(node)) [[unlikely]] return nullptr;
+        }
+
+        if (h.is_leaf()) [[unlikely]]
+            return CO::template find<16>(node, h, ik);
         return find_in_split<16>(node, ik);
     }
 
@@ -258,13 +288,9 @@ private:
     template<int BITS>
     const VALUE* find_dispatch_(const uint64_t* node, NodeHeader h,
                                 uint64_t ik) const noexcept {
-        if constexpr (BITS == 16)
-            return find_in_split<16>(node, ik);
-        else {
-            if (h.is_leaf()) [[unlikely]]
-                return CO::template find<BITS>(node, h, ik);
-            return find_in_split<BITS>(node, ik);
-        }
+        if (h.is_leaf()) [[unlikely]]
+            return CO::template find<BITS>(node, h, ik);
+        return find_in_split<BITS>(node, ik);
     }
 
     // ==================================================================
@@ -336,20 +362,16 @@ private:
                                 uint64_t ik, VST value)
         requires (BITS > 0)
     {
-        if constexpr (BITS == 16) {
-            return insert_into_split<16, INSERT, ASSIGN>(node, h, ik, value);
-        } else {
-            if (h->is_leaf()) {
-                auto r = CO::template insert<BITS, INSERT, ASSIGN>(
-                    node, h, ik, value, alloc_);
-                if (r.needs_split) {
-                    if constexpr (!INSERT) return {node, false};
-                    return convert_to_split<BITS>(node, h, ik, value);
-                }
-                return {r.node, r.inserted};
+        if (h->is_leaf()) {
+            auto r = CO::template insert<BITS, INSERT, ASSIGN>(
+                node, h, ik, value, alloc_);
+            if (r.needs_split) {
+                if constexpr (!INSERT) return {node, false};
+                return convert_to_split<BITS>(node, h, ik, value);
             }
-            return insert_into_split<BITS, INSERT, ASSIGN>(node, h, ik, value);
+            return {r.node, r.inserted};
         }
+        return insert_into_split<BITS, INSERT, ASSIGN>(node, h, ik, value);
     }
 
     // ------------------------------------------------------------------
@@ -869,7 +891,10 @@ private:
 
         uint64_t* nl;
         if constexpr (CB == 16) {
-            nl = make_single_split16_(ik, value);
+            uint8_t nls = static_cast<uint8_t>(rem);
+            uint64_t nl_prefix = rem > 0
+                ? (expected & ((1ULL << (rem * 16)) - 1)) : 0;
+            nl = make_single_split16_(ik, value, nls, nl_prefix);
         } else {
             using CK = typename suffix_traits<CB>::type;
             CK ck = static_cast<CK>(KO::template extract_suffix<CB>(ik));
@@ -920,14 +945,15 @@ private:
     // BITS=16 helpers: always-split node creation
     // ==================================================================
 
-    uint64_t* make_single_split16_(uint64_t ik, VST value) {
+    uint64_t* make_single_split16_(uint64_t ik, VST value,
+                                    uint8_t skip = 0, uint64_t prefix = 0) {
         uint8_t ti = KO::template extract_top8<16>(ik);
         auto* bot = BO::template make_single_bot_leaf<16>(ik, value, alloc_);
         uint8_t   ti_arr[1] = {ti};
         uint64_t* bp_arr[1] = {bot};
         bool      il_arr[1] = {true};
         return BO::template make_split_top<16>(
-            ti_arr, bp_arr, il_arr, 1, 0, 0, 1, alloc_);
+            ti_arr, bp_arr, il_arr, 1, skip, prefix, 1, alloc_);
     }
 
     uint64_t* make_split16_from_sorted_(const uint16_t* keys,
@@ -965,26 +991,25 @@ private:
     // ==================================================================
 
     template<int BITS>
-    EraseResult erase_impl(uint64_t* node, uint64_t ik, int skip_remaining = -1)
+    EraseResult erase_impl(uint64_t* node, uint64_t ik)
         requires (BITS <= 0)
     { return {node, false}; }
 
     template<int BITS>
-    EraseResult erase_impl(uint64_t* node, uint64_t ik, int skip_remaining = -1)
+    EraseResult erase_impl(uint64_t* node, uint64_t ik)
         requires (BITS > 0)
     {
-        if (skip_remaining < 0) {
-            auto* h = get_header(node);
-            if (h->skip() > 0) [[unlikely]] {
-                uint64_t exp = KO::template extract_prefix<BITS>(ik, h->skip());
-                if (exp != get_prefix(node)) return {node, false};
-                return erase_impl<BITS - 16>(node, ik, h->skip() - 1);
-            }
-            return erase_at_bits<BITS>(node, h, ik);
+        auto* h = get_header(node);
+        if (h->skip() > 0) [[unlikely]] {
+            uint64_t exp = KO::template extract_prefix<BITS>(ik, h->skip());
+            if (exp != get_prefix(node)) return {node, false};
+            int ab = BITS - h->skip() * 16;
+            if      (ab == 48) return erase_at_bits<48>(node, get_header(node), ik);
+            else if (ab == 32) return erase_at_bits<32>(node, get_header(node), ik);
+            else if (ab == 16) return erase_at_bits<16>(node, get_header(node), ik);
+            else               return {node, false};  // unreachable safety
         }
-        if (skip_remaining > 0)
-            return erase_impl<BITS - 16>(node, ik, skip_remaining - 1);
-        return erase_at_bits<BITS>(node, get_header(node), ik);
+        return erase_at_bits<BITS>(node, h, ik);
     }
 
     template<int BITS>
@@ -996,13 +1021,9 @@ private:
     EraseResult erase_at_bits(uint64_t* node, NodeHeader* h, uint64_t ik)
         requires (BITS > 0)
     {
-        if constexpr (BITS == 16) {
-            return erase_from_split<16>(node, h, ik);
-        } else {
-            if (h->is_leaf())
-                return CO::template erase<BITS>(node, h, ik, alloc_);
-            return erase_from_split<BITS>(node, h, ik);
-        }
+        if (h->is_leaf())
+            return CO::template erase<BITS>(node, h, ik, alloc_);
+        return erase_from_split<BITS>(node, h, ik);
     }
 
     // ------------------------------------------------------------------
@@ -1123,13 +1144,7 @@ private:
     template<int BITS>
     void remove_all_at_bits(uint64_t* node) noexcept {
         if constexpr (BITS <= 0) return;
-        else if constexpr (BITS == 16) {
-            BO::template for_each_top<16>(node,
-                [&](uint8_t, int, uint64_t* bot, bool) {
-                    BO::template destroy_bot_leaf_and_dealloc<16>(bot, alloc_);
-                });
-            BO::template dealloc_split_top<16>(node, alloc_);
-        } else {
+        else {
             auto* h = get_header(node);
             if (h->is_leaf()) {
                 CO::template destroy_and_dealloc<BITS>(node, alloc_);
@@ -1178,22 +1193,7 @@ private:
     void collect_stats_at_bits(const uint64_t* node, DebugStats& s,
                                bool compressed) const noexcept {
         if constexpr (BITS <= 0) return;
-        else if constexpr (BITS == 16) {
-            constexpr int li = (KEY_BITS - 16) / 16;
-            auto& L = s.levels[li < 4 ? li : 3];
-            auto* h = get_header(node);
-            L.split_nodes++;
-            if (compressed) L.split_nodes_compressed++;
-            L.nodes++;
-            L.bytes += static_cast<size_t>(h->alloc_u64) * 8;
-            BO::template for_each_top<16>(node,
-                [&](uint8_t, int, uint64_t* bot, bool) {
-                    L.bot_leaf++;
-                    uint32_t bc = BO::template bot_leaf_count<16>(bot);
-                    L.entries += bc;
-                    L.bytes += BO::template bot_leaf_size_u64<16>(bc) * 8;
-                });
-        } else {
+        else {
             constexpr int li = (KEY_BITS - BITS) / 16;
             auto& L = s.levels[li < 4 ? li : 3];
             auto* h = get_header(node);

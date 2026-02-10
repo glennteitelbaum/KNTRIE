@@ -71,6 +71,9 @@ public:
     std::pair<bool, bool> insert(const KEY& key, const VALUE& value) {
         return impl_.insert(key, value);
     }
+    std::pair<bool, bool> insert_or_assign(const KEY& key, const VALUE& value) {
+        return impl_.insert_or_assign(key, value);
+    }
     template<typename... Args>
     std::pair<iterator, bool> emplace(Args&&... args) {
         value_type kv(std::forward<Args>(args)...);
