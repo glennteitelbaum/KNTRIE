@@ -270,8 +270,7 @@ private:
             if (expected != get_prefix(node)) [[unlikely]] return nullptr;
         }
 
-        if (h.is_leaf()) [[unlikely]]
-            return CO::template find<16>(node, h, ik);
+        // At BITS=16 nodes are always split, never compact leaf
         return find_in_split<16>(node, ik);
     }
 
@@ -294,9 +293,14 @@ private:
     template<int BITS>
     const VALUE* find_dispatch_(const uint64_t* node, NodeHeader h,
                                 uint64_t ik) const noexcept {
-        if (h.is_leaf()) [[unlikely]]
-            return CO::template find<BITS>(node, h, ik);
-        return find_in_split<BITS>(node, ik);
+        if constexpr (BITS == 16) {
+            // At BITS=16 nodes are always split, never compact leaf
+            return find_in_split<16>(node, ik);
+        } else {
+            if (h.is_leaf()) [[unlikely]]
+                return CO::template find<BITS>(node, h, ik);
+            return find_in_split<BITS>(node, ik);
+        }
     }
 
     // ==================================================================
