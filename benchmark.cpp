@@ -185,6 +185,18 @@ int main(int argc, char** argv) {
     } else if (pattern == "dense16") {
         for (size_t i = 0; i < n; ++i)
             keys[i] = 0x123400000000ULL + (rng() % (n * 2));
+    } else if (pattern == "bell") {
+        std::normal_distribution<double> dist(128.0, 40.0);
+        std::mt19937 rng32(42);
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t k = 0;
+            for (int b = 0; b < 8; ++b) {
+                int v = static_cast<int>(dist(rng32));
+                v = std::clamp(v, 0, 255);
+                k = (k << 8) | static_cast<uint64_t>(v);
+            }
+            keys[i] = k;
+        }
     } else {
         for (size_t i = 0; i < n; ++i) keys[i] = rng();
     }
