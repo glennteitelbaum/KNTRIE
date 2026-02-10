@@ -92,11 +92,13 @@ struct BitmaskOps {
     // ==================================================================
 
     template<int BITS>
-    static constexpr size_t split_top_size_u64(size_t n_entries, uint8_t skip) noexcept {
+    static constexpr size_t split_top_size_u64(size_t n_entries, uint8_t skip, uint16_t n_embed = 0) noexcept {
+        size_t base;
         if constexpr (BITS == 16)
-            return header_u64(skip) + BITMAP256_U64 + n_entries;
+            base = header_u64(skip) + BITMAP256_U64 + n_entries;
         else
-            return header_u64(skip) + BITMAP256_U64 + BITMAP256_U64 + 1 + n_entries;
+            base = header_u64(skip) + BITMAP256_U64 + BITMAP256_U64 + 1 + n_entries;
+        return base + n_embed * EMBED_U64;
     }
 
     template<int BITS>
@@ -177,10 +179,15 @@ struct BitmaskOps {
         Bitmap256& tbm = top_bitmap_(node);
         size_t otc = h->entries, ntc = otc + 1;
         int isl = tbm.slot_for_insert(ti);
-        size_t needed = split_top_size_u64<BITS>(ntc, h->skip());
+        uint16_t ne = h->n_embedded();
 
-        // --- In-place if we have capacity ---
-        if (needed <= h->alloc_u64) {
+        // Check if new child can be embedded
+        bool embed_new = (get_header(bot_ptr)->alloc_u64 <= EMBED_U64);
+        uint16_t new_ne = ne + (embed_new ? 1 : 0);
+        size_t needed = split_top_size_u64<BITS>(ntc, h->skip(), new_ne);
+
+        // --- In-place only when no embeds involved ---
+        if (new_ne == 0 && needed <= h->alloc_u64) {
             uint64_t* rc = top_real_children_<BITS>(node);
             std::memmove(rc + isl + 1, rc + isl, (otc - isl) * sizeof(uint64_t));
             rc[isl] = reinterpret_cast<uint64_t>(bot_ptr);
@@ -194,12 +201,14 @@ struct BitmaskOps {
         }
 
         // --- Allocate new with padding ---
+        size_t old_alloc = h->alloc_u64;
         size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
         nh->entries = static_cast<uint16_t>(ntc);
         nh->add_descendants(1);
         nh->alloc_u64 = static_cast<uint16_t>(au64);
+        nh->set_n_embedded(new_ne);
         if (h->skip() > 0) set_prefix(nn, get_prefix(node));
 
         top_bitmap_(nn) = tbm;
@@ -211,13 +220,39 @@ struct BitmaskOps {
             top_children_<BITS>(nn)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
         }
 
+        // Copy child pointers with gap at isl
         const uint64_t* oc = top_real_children_<BITS>(node);
         uint64_t*       nc = top_real_children_<BITS>(nn);
         for (int i = 0; i < isl; ++i)            nc[i] = oc[i];
-        nc[isl] = reinterpret_cast<uint64_t>(bot_ptr);
         for (size_t i = isl; i < otc; ++i)       nc[i + 1] = oc[i];
 
-        dealloc_node(alloc, node, h->alloc_u64);
+        // Copy existing embed data
+        if (ne > 0) {
+            const uint64_t* old_embed = top_real_children_<BITS>(node) + otc;
+            uint64_t* new_embed = top_real_children_<BITS>(nn) + ntc;
+            std::memcpy(new_embed, old_embed, ne * EMBED_U64 * 8);
+        }
+
+        // Fixup existing embedded child pointers
+        if (ne > 0)
+            fixup_top_embedded_ptrs_<BITS>(node, old_alloc, nn, otc, ntc);
+
+        // Handle new child
+        if (embed_new) {
+            auto* ch = get_header(bot_ptr);
+            size_t child_alloc = ch->alloc_u64;
+            uint64_t* eslot = top_real_children_<BITS>(nn) + ntc + (new_ne - 1) * EMBED_U64;
+            std::memcpy(eslot, bot_ptr, child_alloc * 8);
+            auto* eh = get_header(eslot);
+            eh->set_embedded();
+            eh->alloc_u64 = EMBED_U64;
+            nc[isl] = reinterpret_cast<uint64_t>(eslot);
+            dealloc_node(alloc, bot_ptr, child_alloc);
+        } else {
+            nc[isl] = reinterpret_cast<uint64_t>(bot_ptr);
+        }
+
+        dealloc_node(alloc, node, old_alloc);
         return nn;
     }
 
@@ -230,14 +265,16 @@ struct BitmaskOps {
                                       int slot, uint8_t ti, ALLOC& alloc) {
         size_t otc = h->entries, ntc = otc - 1;
         if (ntc == 0) {
-            dealloc_node(alloc, node, h->alloc_u64);
+            if (!h->is_embedded())
+                dealloc_node(alloc, node, h->alloc_u64);
             return nullptr;
         }
 
-        size_t needed = split_top_size_u64<BITS>(ntc, h->skip());
+        uint16_t ne = h->n_embedded();
+        size_t needed = split_top_size_u64<BITS>(ntc, h->skip(), ne);
 
-        // --- In-place if not oversized ---
-        if (!should_shrink_u64(h->alloc_u64, needed)) {
+        // --- In-place only if no embeds and not oversized ---
+        if (ne == 0 && !should_shrink_u64(h->alloc_u64, needed)) {
             uint64_t* rc = top_real_children_<BITS>(node);
             std::memmove(rc + slot, rc + slot + 1, (ntc - slot) * sizeof(uint64_t));
             top_bitmap_(node).clear_bit(ti);
@@ -250,12 +287,14 @@ struct BitmaskOps {
         }
 
         // --- Allocate smaller with padding ---
+        size_t old_alloc = h->alloc_u64;
         size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
         nh->entries = static_cast<uint16_t>(ntc);
         nh->sub_descendants(1);
         nh->alloc_u64 = static_cast<uint16_t>(au64);
+        nh->set_n_embedded(ne);
         if (h->skip() > 0) set_prefix(nn, get_prefix(node));
 
         top_bitmap_(nn) = top_bitmap_(node);
@@ -271,7 +310,15 @@ struct BitmaskOps {
         for (int i = 0; i < slot; ++i)            nc[i] = oc[i];
         for (size_t i = slot; i < ntc; ++i)       nc[i] = oc[i + 1];
 
-        dealloc_node(alloc, node, h->alloc_u64);
+        // Copy embed data and fixup
+        if (ne > 0) {
+            const uint64_t* old_embed = top_real_children_<BITS>(node) + otc;
+            uint64_t* new_embed = top_real_children_<BITS>(nn) + ntc;
+            std::memcpy(new_embed, old_embed, ne * EMBED_U64 * 8);
+            fixup_top_embedded_ptrs_<BITS>(node, old_alloc, nn, otc, ntc);
+        }
+
+        dealloc_node(alloc, node, old_alloc);
         return nn;
     }
 
@@ -314,10 +361,17 @@ struct BitmaskOps {
                                      const bool* is_leaf_flags,
                                      int n_tops, uint8_t skip, uint64_t prefix,
                                      uint32_t total_descendants, ALLOC& alloc) {
+        // Count embeddable children
+        uint16_t n_embed = 0;
+        for (int i = 0; i < n_tops; ++i) {
+            auto* ch = get_header(bot_ptrs[i]);
+            if (ch->alloc_u64 <= EMBED_U64) ++n_embed;
+        }
+
         Bitmap256 tbm{};
         for (int i = 0; i < n_tops; ++i) tbm.set_bit(top_indices[i]);
 
-        size_t needed = split_top_size_u64<BITS>(n_tops, skip);
+        size_t needed = split_top_size_u64<BITS>(n_tops, skip, n_embed);
         size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
@@ -327,6 +381,7 @@ struct BitmaskOps {
         nh->alloc_u64 = static_cast<uint16_t>(au64);
         nh->set_skip(skip);
         nh->set_bitmask();
+        nh->set_n_embedded(n_embed);
         if (skip > 0) set_prefix(nn, prefix);
 
         top_bitmap_(nn) = tbm;
@@ -340,13 +395,29 @@ struct BitmaskOps {
         }
 
         uint64_t* rch = top_real_children_<BITS>(nn);
+        int embed_idx = 0;
         int slot = 0;
         for (int ti = tbm.find_next_set(0); ti >= 0; ti = tbm.find_next_set(ti + 1)) {
+            uint64_t* cp = nullptr;
             for (int i = 0; i < n_tops; ++i) {
                 if (top_indices[i] == static_cast<uint8_t>(ti)) {
-                    rch[slot] = reinterpret_cast<uint64_t>(bot_ptrs[i]);
+                    cp = bot_ptrs[i];
                     break;
                 }
+            }
+
+            auto* ch = get_header(cp);
+            if (ch->alloc_u64 <= EMBED_U64) {
+                uint64_t* eslot = rch + n_tops + embed_idx * EMBED_U64;
+                std::memcpy(eslot, cp, ch->alloc_u64 * 8);
+                auto* eh = get_header(eslot);
+                eh->set_embedded();
+                eh->alloc_u64 = EMBED_U64;
+                rch[slot] = reinterpret_cast<uint64_t>(eslot);
+                dealloc_node(alloc, cp, ch->alloc_u64);
+                embed_idx++;
+            } else {
+                rch[slot] = reinterpret_cast<uint64_t>(cp);
             }
             ++slot;
         }
@@ -361,7 +432,8 @@ struct BitmaskOps {
     template<int BITS>
     static void dealloc_split_top(uint64_t* node, ALLOC& alloc) noexcept {
         auto* h = get_header(node);
-        dealloc_node(alloc, node, h->alloc_u64);
+        if (!h->is_embedded())
+            dealloc_node(alloc, node, h->alloc_u64);
     }
 
     // ==================================================================
@@ -702,7 +774,8 @@ struct BitmaskOps {
             nrc[isl] = reinterpret_cast<uint64_t>(child_ptr);
         }
 
-        dealloc_node(alloc, bot, old_alloc);
+        if (!h->is_embedded())
+            dealloc_node(alloc, bot, old_alloc);
         return nb;
     }
 
@@ -714,13 +787,6 @@ struct BitmaskOps {
                                        ALLOC& alloc) {
         auto* h = get_header(bot);
         uint16_t ne = h->n_embedded();
-
-        // If removed child was embedded, evict its slot first
-        uint64_t* child_ptr = reinterpret_cast<uint64_t*>(bot_int_real_children_(bot)[slot]);
-        if (get_header(child_ptr)->is_embedded()) {
-            evict_bot_embed_slot_(bot, child_ptr);
-            ne = h->n_embedded();
-        }
 
         int oc = h->entries;
         int nc = oc - 1;
@@ -763,7 +829,8 @@ struct BitmaskOps {
             fixup_bot_embedded_ptrs_(bot, old_alloc, nb, oc, nc);
         }
 
-        dealloc_node(alloc, bot, old_alloc);
+        if (!h->is_embedded())
+            dealloc_node(alloc, bot, old_alloc);
         return nb;
     }
 
@@ -798,7 +865,9 @@ struct BitmaskOps {
     // ==================================================================
 
     static void dealloc_bot_internal(uint64_t* bot, ALLOC& alloc) noexcept {
-        dealloc_node(alloc, bot, get_header(bot)->alloc_u64);
+        auto* h = get_header(bot);
+        if (!h->is_embedded())
+            dealloc_node(alloc, bot, h->alloc_u64);
     }
 
     // ==================================================================
@@ -856,8 +925,123 @@ struct BitmaskOps {
     }
 
     // ==================================================================
-    // Private layout accessors
+    // Bot-internal: try to embed a replacement child in-place
+    //
+    // Only embeds if parent has capacity for one more embed slot.
+    // Returns true if embedding happened (old child deallocated).
     // ==================================================================
+
+    static bool try_embed_bot_child_(uint64_t* bot, int slot,
+                                      uint64_t* child, ALLOC& alloc) noexcept {
+        auto* ch = get_header(child);
+        if (ch->is_embedded() || ch->alloc_u64 > EMBED_U64) return false;
+
+        auto* h = get_header(bot);
+        uint16_t ne = h->n_embedded();
+        size_t needed = bot_internal_size_u64(h->entries, ne + 1);
+        if (needed > h->alloc_u64) return false;
+
+        uint64_t* eslot = bot_embed_slot_(bot, ne);
+        std::memcpy(eslot, child, ch->alloc_u64 * 8);
+        if (ch->alloc_u64 < EMBED_U64)
+            std::memset(eslot + ch->alloc_u64, 0, (EMBED_U64 - ch->alloc_u64) * 8);
+        get_header(eslot)->set_embedded();
+        bot_int_real_children_(bot)[slot] = reinterpret_cast<uint64_t>(eslot);
+        h->set_n_embedded(ne + 1);
+        dealloc_node(alloc, child, ch->alloc_u64);
+        return true;
+    }
+
+    template<int BITS>
+    static uint64_t* top_embed_slot_(uint64_t* node, int idx) noexcept {
+        auto* h = get_header(node);
+        return top_real_children_<BITS>(node) + h->entries + idx * EMBED_U64;
+    }
+
+    // ==================================================================
+    // Split-top: fixup embedded child pointers after reallocation
+    // ==================================================================
+
+    template<int BITS>
+    static void fixup_top_embedded_ptrs_(uint64_t* old_node, size_t old_alloc,
+                                          uint64_t* new_node, size_t old_entries, size_t new_entries) noexcept {
+        auto* nh = get_header(new_node);
+        if (nh->n_embedded() == 0) return;
+        uintptr_t old_embed = reinterpret_cast<uintptr_t>(top_real_children_<BITS>(old_node) + old_entries);
+        uintptr_t new_embed = reinterpret_cast<uintptr_t>(top_real_children_<BITS>(new_node) + new_entries);
+        uint64_t* rch = top_real_children_<BITS>(new_node);
+        uintptr_t ob = reinterpret_cast<uintptr_t>(old_node);
+        uintptr_t oe = ob + old_alloc * 8;
+        for (size_t i = 0; i < new_entries; ++i) {
+            uintptr_t p = static_cast<uintptr_t>(rch[i]);
+            if (p >= ob && p < oe)
+                rch[i] = new_embed + (p - old_embed);
+        }
+    }
+
+    // ==================================================================
+    // Split-top: evict embed slot (swap-with-last after child moves to heap)
+    // ==================================================================
+
+    template<int BITS>
+    static void evict_top_embed_slot_(uint64_t* node, uint64_t* freed_slot_ptr) noexcept {
+        auto* h = get_header(node);
+        uint16_t ne = h->n_embedded();
+        if (ne == 0) return;
+        uint64_t* last_slot = top_embed_slot_<BITS>(node, ne - 1);
+        if (freed_slot_ptr != last_slot) {
+            std::memcpy(freed_slot_ptr, last_slot, EMBED_U64 * 8);
+            // Fix up the child pointer that referenced the last slot
+            uint64_t* rch = top_real_children_<BITS>(node);
+            size_t nc = h->entries;
+            uintptr_t old_addr = reinterpret_cast<uintptr_t>(last_slot);
+            for (size_t i = 0; i < nc; ++i) {
+                if (static_cast<uintptr_t>(rch[i]) == old_addr) {
+                    rch[i] = reinterpret_cast<uint64_t>(freed_slot_ptr);
+                    break;
+                }
+            }
+        }
+        h->set_n_embedded(ne - 1);
+    }
+
+    // ==================================================================
+    // Split-top: try to embed a replacement child in-place
+    //
+    // Only embeds if parent has capacity for one more embed slot.
+    // Returns true if embedding happened (old child deallocated).
+    // ==================================================================
+
+    template<int BITS>
+    static bool try_embed_top_child_(uint64_t* node, int slot,
+                                      uint64_t* child, ALLOC& alloc) noexcept {
+        auto* ch = get_header(child);
+        if (ch->is_embedded() || ch->alloc_u64 > EMBED_U64) return false;
+
+        auto* h = get_header(node);
+        uint16_t ne = h->n_embedded();
+        size_t needed = split_top_size_u64<BITS>(h->entries, h->skip(), ne + 1);
+        if (needed > h->alloc_u64) return false;
+
+        uint64_t* eslot = top_embed_slot_<BITS>(node, ne);
+        std::memcpy(eslot, child, ch->alloc_u64 * 8);
+        if (ch->alloc_u64 < EMBED_U64)
+            std::memset(eslot + ch->alloc_u64, 0, (EMBED_U64 - ch->alloc_u64) * 8);
+        get_header(eslot)->set_embedded();
+        top_real_children_<BITS>(node)[slot] = reinterpret_cast<uint64_t>(eslot);
+        h->set_n_embedded(ne + 1);
+        dealloc_node(alloc, child, ch->alloc_u64);
+        return true;
+    }
+
+    // ==================================================================
+    // Split-top: public accessor for child pointers (used by prepend_skip)
+    // ==================================================================
+
+    template<int BITS>
+    static uint64_t* top_real_children_pub_(uint64_t* n) noexcept {
+        return top_real_children_<BITS>(n);
+    }
 
 private:
     // --- split-top layout ---
@@ -956,6 +1140,17 @@ private:
 
         uint32_t nc = count + 1;
         size_t new_sz = bot_leaf_size_u64<16>(nc);
+
+        // --- In-place if we have capacity ---
+        if (new_sz <= bh->alloc_u64) {
+            int isl = bm.count_below(suffix);
+            bm.set_bit(suffix);
+            std::memmove(vd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
+            VT::write_slot(&vd[isl], value);
+            bh->entries = static_cast<uint16_t>(nc);
+            return {bot, true, false};
+        }
+
         uint64_t* nb = alloc_node(alloc, new_sz);
         auto* nbh = get_header(nb);
         nbh->entries = static_cast<uint16_t>(nc);
@@ -988,7 +1183,17 @@ private:
                 dealloc_node(alloc, bot, bh->alloc_u64);
             return {nullptr, true};
         }
+
+        // --- In-place if embedded or not oversized ---
         size_t new_sz = bot_leaf_size_u64<16>(nc);
+        if (bh->is_embedded() || !should_shrink_u64(bh->alloc_u64, new_sz)) {
+            VST* vd = bot_leaf_vals_16_(bot);
+            bm.clear_bit(suffix);
+            std::memmove(vd + slot, vd + slot + 1, (nc - slot) * sizeof(VST));
+            bh->entries = static_cast<uint16_t>(nc);
+            return {bot, true};
+        }
+
         uint64_t* nb = alloc_node(alloc, new_sz);
         auto* nbh = get_header(nb);
         nbh->entries = static_cast<uint16_t>(nc);

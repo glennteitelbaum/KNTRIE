@@ -363,17 +363,31 @@ private:
         }
 
         if (lk.is_leaf) {
+            bool was_embedded = get_header(lk.bot)->is_embedded();
             auto r = BO::template insert_into_bot_leaf<BITS>(
                 lk.bot, ik, value, alloc_);
 
             if (r.overflow) {
                 if constexpr (BITS > 16) {
                     uint32_t bc = BO::template bot_leaf_count<BITS>(lk.bot);
-                    return convert_bot_leaf_to_internal<BITS>(
+                    auto result = convert_bot_leaf_to_internal<BITS>(
                         node, h, ti, lk.slot, lk.bot, bc, ik, value);
+                    if (was_embedded)
+                        BO::template evict_top_embed_slot_<BITS>(result.node, lk.bot);
+                    // Try to embed the new bot_internal in the parent
+                    auto lk2 = BO::template lookup_top<BITS>(result.node, ti);
+                    if (lk2.found)
+                        BO::template try_embed_top_child_<BITS>(
+                            result.node, lk2.slot, lk2.bot, alloc_);
+                    return result;
                 }
             }
-            BO::template set_top_child<BITS>(node, lk.slot, r.new_bot);
+            if (r.new_bot != lk.bot) {
+                BO::template set_top_child<BITS>(node, lk.slot, r.new_bot);
+                if (was_embedded)
+                    BO::template evict_top_embed_slot_<BITS>(node, lk.bot);
+                BO::template try_embed_top_child_<BITS>(node, lk.slot, r.new_bot, alloc_);
+            }
             if (r.inserted) h->add_descendants(1);
             return {node, r.inserted};
         }
@@ -398,12 +412,13 @@ private:
         auto blk = BO::lookup_bot_child(bot, bi);
 
         if (blk.found) {
+            bool was_embedded = get_header(blk.child)->is_embedded();
             auto [nc, ins] = insert_impl<BITS - 16>(blk.child, ik, value);
             if (nc != blk.child) {
                 BO::set_bot_child(bot, blk.slot, nc);
-                // Evict if old child was embedded and moved to heap
-                if (get_header(blk.child)->is_embedded())
+                if (was_embedded)
                     BO::evict_bot_embed_slot_(bot, blk.child);
+                BO::try_embed_bot_child_(bot, blk.slot, nc, alloc_);
             }
             if (ins) h->add_descendants(1);
             return {node, ins};
@@ -419,8 +434,13 @@ private:
             child = CO::template make_leaf<CB>(&ck, &value, 1, 0, 0, alloc_);
         }
 
+        bool bot_was_embedded = get_header(bot)->is_embedded();
         auto* new_bot = BO::add_bot_child(bot, bi, child, alloc_);
-        BO::template set_top_child<BITS>(node, ts, new_bot);
+        if (new_bot != bot) {
+            BO::template set_top_child<BITS>(node, ts, new_bot);
+            if (bot_was_embedded)
+                BO::template evict_top_embed_slot_<BITS>(node, bot);
+        }
         h->add_descendants(1);
         return {node, true};
     }
@@ -438,11 +458,13 @@ private:
         auto blk = BO::lookup_bot_child(bot, bi);
 
         if (blk.found) {
+            bool was_embedded = get_header(blk.child)->is_embedded();
             auto [nc, ins] = insert_impl<CB>(blk.child, ik, value);
             if (nc != blk.child) {
                 BO::set_bot_child(bot, blk.slot, nc);
-                if (get_header(blk.child)->is_embedded())
+                if (was_embedded)
                     BO::evict_bot_embed_slot_(bot, blk.child);
+                BO::try_embed_bot_child_(bot, blk.slot, nc, alloc_);
             }
             inserted = ins;
             return bot;
@@ -534,20 +556,22 @@ private:
         auto blk = BO::lookup_bot_child(bot, bi);
         if (!blk.found) return false;
 
+        bool was_embedded = get_header(blk.child)->is_embedded();
         auto [nc, erased] = erase_impl<CB>(blk.child, ik);
         if (!erased) return false;
 
         if (nc) {
             if (nc != blk.child) {
                 BO::set_bot_child(bot, blk.slot, nc);
-                if (get_header(blk.child)->is_embedded())
+                if (was_embedded)
                     BO::evict_bot_embed_slot_(bot, blk.child);
+                BO::try_embed_bot_child_(bot, blk.slot, nc, alloc_);
             }
             return true;
         }
 
-        // Child fully erased — evict embed if needed
-        if (get_header(blk.child)->is_embedded())
+        // Child fully erased
+        if (was_embedded)
             BO::evict_bot_embed_slot_(bot, blk.child);
 
         int bc = BO::bot_internal_child_count(bot);
@@ -847,6 +871,27 @@ private:
         get_header(nn)->alloc_u64 = static_cast<uint16_t>(new_sz);
         set_prefix(nn, prefix);
         std::memcpy(nn + 2, node + 1, data_u64 * 8);
+
+        // Fix up embedded child pointers: data shifted from node+1 to nn+2
+        if (get_header(nn)->n_embedded() > 0 && !get_header(nn)->is_leaf()) {
+            uintptr_t old_base = reinterpret_cast<uintptr_t>(node);
+            uintptr_t old_end  = old_base + old_sz * 8;
+            // Data at old node+1 is now at nn+2, so delta = (nn+2) - (node+1)
+            ptrdiff_t delta = reinterpret_cast<char*>(nn + 2) -
+                              reinterpret_cast<char*>(node + 1);
+            // For split_top nodes, scan child pointers
+            if constexpr (BITS >= 16) {
+                uint64_t* rch = BO::template top_real_children_pub_<BITS>(nn);
+                size_t nc = get_header(nn)->entries;
+                for (size_t i = 0; i < nc; ++i) {
+                    uintptr_t p = static_cast<uintptr_t>(rch[i]);
+                    if (p >= old_base && p < old_end)
+                        rch[i] = static_cast<uint64_t>(
+                            p + static_cast<uintptr_t>(delta));
+                }
+            }
+        }
+
         dealloc_node(alloc_, node, old_sz);
         return nn;
     }
@@ -1037,14 +1082,24 @@ private:
         if (!lk.found) return {node, false};
 
         if (lk.is_leaf) {
+            bool was_embedded = get_header(lk.bot)->is_embedded();
             auto [new_bot, erased] = BO::template erase_from_bot_leaf<BITS>(
                 lk.bot, ik, alloc_);
             if (!erased) return {node, false};
             if (new_bot) {
-                BO::template set_top_child<BITS>(node, lk.slot, new_bot);
+                if (new_bot != lk.bot) {
+                    BO::template set_top_child<BITS>(node, lk.slot, new_bot);
+                    if (was_embedded)
+                        BO::template evict_top_embed_slot_<BITS>(node, lk.bot);
+                    BO::template try_embed_top_child_<BITS>(
+                        node, lk.slot, new_bot, alloc_);
+                }
                 h->sub_descendants(1);
                 return {node, true};
             }
+            // Bot fully erased
+            if (was_embedded)
+                BO::template evict_top_embed_slot_<BITS>(node, lk.bot);
             auto* nn = BO::template remove_top_slot<BITS>(
                 node, h, lk.slot, ti, alloc_);
             return {nn, true};
@@ -1066,10 +1121,12 @@ private:
                                          uint64_t* bot, uint64_t ik)
         requires (BITS > 16)
     {
+        bool bot_was_embedded = get_header(bot)->is_embedded();
         uint8_t bi = KO::template extract_top8<BITS - 8>(ik);
         auto blk = BO::lookup_bot_child(bot, bi);
         if (!blk.found) return {node, false};
 
+        bool was_embedded = get_header(blk.child)->is_embedded();
         auto [nc, erased] = erase_impl<BITS - 16>(blk.child, ik);
         if (!erased) return {node, false};
         h->sub_descendants(1);
@@ -1077,26 +1134,34 @@ private:
         if (nc) {
             if (nc != blk.child) {
                 BO::set_bot_child(bot, blk.slot, nc);
-                if (get_header(blk.child)->is_embedded())
+                if (was_embedded)
                     BO::evict_bot_embed_slot_(bot, blk.child);
+                BO::try_embed_bot_child_(bot, blk.slot, nc, alloc_);
             }
             return {node, true};
         }
 
-        // Child fully erased — evict embed if needed before removing slot
-        if (get_header(blk.child)->is_embedded())
+        // Child fully erased
+        if (was_embedded)
             BO::evict_bot_embed_slot_(bot, blk.child);
 
         int bc = BO::bot_internal_child_count(bot);
         if (bc == 1) {
             BO::dealloc_bot_internal(bot, alloc_);
+            if (bot_was_embedded)
+                BO::template evict_top_embed_slot_<BITS>(node, bot);
             auto* nn = BO::template remove_top_slot<BITS>(
                 node, h, ts, ti, alloc_);
             return {nn, true};
         }
 
         auto* nb = BO::remove_bot_child(bot, blk.slot, bi, alloc_);
-        BO::template set_top_child<BITS>(node, ts, nb);
+        if (nb != bot) {
+            BO::template set_top_child<BITS>(node, ts, nb);
+            if (bot_was_embedded)
+                BO::template evict_top_embed_slot_<BITS>(node, bot);
+            BO::template try_embed_top_child_<BITS>(node, ts, nb, alloc_);
+        }
         return {node, true};
     }
 
@@ -1213,7 +1278,8 @@ private:
                     L.bot_leaf++;
                     uint32_t bc = BO::template bot_leaf_count<16>(bot);
                     L.entries += bc;
-                    L.bytes += BO::template bot_leaf_size_u64<16>(bc) * 8;
+                    if (!get_header(bot)->is_embedded())
+                        L.bytes += BO::template bot_leaf_size_u64<16>(bc) * 8;
                 });
         } else {
             constexpr int li = (KEY_BITS - BITS) / 16;
@@ -1239,12 +1305,14 @@ private:
                             L.bot_leaf++;
                             uint32_t bc = BO::template bot_leaf_count<BITS>(bot);
                             L.entries += bc;
-                            L.bytes += BO::template bot_leaf_size_u64<BITS>(bc) * 8;
+                            if (!get_header(bot)->is_embedded())
+                                L.bytes += BO::template bot_leaf_size_u64<BITS>(bc) * 8;
                         } else {
                             if constexpr (BITS > 16) {
                                 L.bot_internal++;
                                 int bc = BO::bot_internal_child_count(bot);
-                                L.bytes += BO::bot_internal_alloc_u64(bot) * 8;
+                                if (!get_header(bot)->is_embedded())
+                                    L.bytes += BO::bot_internal_alloc_u64(bot) * 8;
                                 BO::for_each_bot_child(bot,
                                     [&](uint8_t, uint64_t* child) {
                                         collect_stats<BITS - 16>(child, s);
