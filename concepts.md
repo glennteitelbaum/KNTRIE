@@ -42,11 +42,11 @@ The result is a structure whose depth and memory usage adapt to the actual key d
 
 ### VALUE STORAGE
 
-Values stored in the trie are handled through a compile-time trait, `ValueTraits<VALUE, ALLOC>`, that selects one of two strategies:
+Values stored in the kntrie are handled through a compile-time trait, `ValueTraits<VALUE, ALLOC>`, that selects one of two strategies:
 
 **Inline storage** applies when `sizeof(VALUE) <= 8` and the type is trivially copyable. The value is stored directly in the slot array alongside the keys — no indirection, no heap allocation, no destructor call needed. For the common case of `kntrie<uint64_t, uint64_t>`, each value is just 8 bytes sitting in a contiguous array. This gives excellent cache behavior during scans and searches.
 
-**Heap-allocated T\*** applies for larger or non-trivial types. The trie allocates a `VALUE*` on the heap via the rebind allocator, constructs the value in place, and stores the pointer in the slot array. The slot is still 8 bytes (a pointer), so the node layout is identical — only the interpretation changes. Destroy must be called explicitly when erasing or deallocating.
+**Heap-allocated T\*** applies for larger or non-trivial types. The kntrie allocates a `VALUE*` on the heap via the rebind allocator, constructs the value in place, and stores the pointer in the slot array. The slot is still 8 bytes (a pointer), so the node layout is identical — only the interpretation changes. Destroy must be called explicitly when erasing or deallocating.
 
 The `slot_type` is either `VALUE` (inline) or `VALUE*` (heap), and all node code operates on `slot_type` uniformly. The `as_ptr` helper returns a `const VALUE*` regardless — for inline, it's a reinterpret_cast of the slot's address; for heap, it's the pointer itself.
 
@@ -70,7 +70,7 @@ The worst-case overhead is roughly 25%. This padding creates room for in-place i
 
 ### KEY REPRESENTATION
 
-All key types — `uint16_t`, `int32_t`, `uint64_t`, signed or unsigned — are transformed into a canonical 64-bit internal representation before any trie operation. This transformation is the foundation that makes the entire structure work uniformly.
+All key types — `uint16_t`, `int32_t`, `uint64_t`, signed or unsigned — are transformed into a canonical 64-bit internal representation before any kntrie operation. This transformation is the foundation that makes the entire structure work uniformly.
 
 **Signed key handling.** Signed integers have a problem: their binary representation doesn't sort in the same order as their numeric value. Negative numbers have the high bit set but should sort before positives. The fix is an XOR flip of the sign bit:
 
@@ -114,7 +114,7 @@ The `[[unlikely]]` annotation reflects that most nodes don't have skips, keeping
 
 ### RECURSIVE TEMPLATES
 
-The trie is parameterized by `BITS` — the number of significant key bits remaining at each level. A `uint64_t` key starts at BITS=56 (after the root consumes the top 8), and each branch level consumes 16 bits (8 for the top index, 8 for the bottom index), so levels go 56 → 40 → 24 → 16 terminal. For `uint32_t`: 24 → 16 terminal. For `uint16_t`: 8 → terminal immediately.
+The kntrie is parameterized by `BITS` — the number of significant key bits remaining at each level. A `uint64_t` key starts at BITS=56 (after the root consumes the top 8), and each branch level consumes 16 bits (8 for the top index, 8 for the bottom index), so levels go 56 → 40 → 24 → 16 terminal. For `uint32_t`: 24 → 16 terminal. For `uint16_t`: 8 → terminal immediately.
 
 Every function that operates on a node — `find`, `insert`, `erase`, `remove_all`, `collect_stats` — is templated on `BITS` and recursively instantiates itself at `BITS - 16` when descending into a child. This gives the compiler full knowledge of the layout at each level, enabling it to compute offsets, inline aggressively, and eliminate dead code for impossible cases.
 
@@ -147,7 +147,7 @@ This is a real engineering tradeoff: the find path is roughly 2x the code size i
 
 ### ROOT
 
-The root of the trie is a flat array of 256 `uint64_t*` pointers, indexed by the top 8 bits of the internal key (`ik >> 56`). This is not a node in the usual sense — it has no header, no allocation, no bitmap. It's a fixed-size array embedded directly in the `kntrie3` object.
+The root of the kntrie is a flat array of 256 `uint64_t*` pointers, indexed by the top 8 bits of the internal key (`ik >> 56`). This is not a node in the usual sense — it has no header, no allocation, no bitmap. It's a fixed-size array embedded directly in the `kntrie3` object.
 
 This design eliminates an entire level of indirection and branching. The first step of every find is a direct array lookup — no bitmap popcount, no branch on "is this slot occupied." The compiler emits a single indexed load. For insert, it's the same: compute the index, load the pointer, and either descend or create a new child.
 
@@ -155,7 +155,7 @@ The 256-pointer array costs 2 KB, which is negligible for any dataset of meaning
 
 ### HEADER
 
-Every allocated node in the trie — compact leaves, split-top nodes, bot-internal nodes, bot-leaf-16 bitmap nodes — begins with the same 16-byte header. This uniformity is what allows generic code to inspect any node without knowing its type in advance.
+Every allocated node in the kntrie — compact leaves, split-top nodes, bot-internal nodes, bot-leaf-16 bitmap nodes — begins with the same 16-byte header. This uniformity is what allows generic code to inspect any node without knowing its type in advance.
 
 The header occupies 2 u64s (node[0] and node[1]):
 
@@ -366,7 +366,7 @@ This is parameterized by `BITS` (which determines the key type's size) and `VST`
 
 ### SENTINEL
 
-The trie uses a global sentinel node — a statically-allocated, zeroed block of 8 u64s — as the "not found" fallback:
+The kntrie uses a global sentinel node — a statically-allocated, zeroed block of 8 u64s — as the "not found" fallback:
 
 ```cpp
 alignas(64) inline constinit uint64_t SENTINEL_NODE[8] = {};
@@ -382,7 +382,7 @@ The sentinel is cache-line-aligned (64 bytes) and `constinit` — it exists at p
 
 ### TERMINAL NODES
 
-At BITS=16, the trie reaches its terminal level and the structure changes in several ways.
+At BITS=16, the kntrie reaches its terminal level and the structure changes in several ways.
 
 **Split nodes are always created.** A compact leaf at BITS=16 would hold 16-bit suffixes — up to 65536 possible values. But the split-top at BITS=16 only needs a top bitmap + bot-leaf-16 children, which is already an efficient structure. The code forces conversion to split at this level rather than allowing large compact leaves.
 
@@ -390,7 +390,7 @@ At BITS=16, the trie reaches its terminal level and the structure changes in sev
 
 **No bot-is-internal bitmap or slot 0.** At BITS=16, every child of the split-top is a bot-leaf-16. There are no bot-internal nodes at this level because there are no further levels to recurse into. The split-top layout drops the second bitmap and slot 0, saving 40 bytes per terminal split node. FAST_EXIT is used instead of BRANCHLESS since the simplified layout has no need for the branchless fallback.
 
-**No dup tombstones.** Bot-leaf-16 nodes have no sorted key array — the bitmap *is* the key storage — so there's no place to seed duplicate entries. However, allocations use the same quarter-step rounding as all other node types, and insert/erase use in-place paths when the current allocation has room. This gives the same reallocation hysteresis that other nodes enjoy without the dup machinery.
+**No dup tombstones.** Bot-leaf-16 nodes are too small for it to pay off. However, allocations use the same quarter-step rounding as all other node types, and insert/erase use in-place paths when the current allocation has room. This gives the same reallocation hysteresis that other nodes enjoy without the dup machinery.
 
 ---
 
@@ -408,7 +408,7 @@ The fundamental costs are:
 
 **Cache behavior.** Each comparison in a tree traversal follows a pointer to a separately-allocated node. These nodes are scattered across the heap in allocation order, not key order. At scale, nearly every level of the tree is a cache miss. A 20-level traversal in a million-entry map touches 20 random cache lines.
 
-**Sorted iteration.** The red-black tree provides naturally sorted in-order traversal, with O(1) amortized iterator increment and decrement. kntrie provides the same sorted iteration through its trie structure, but the constant factors differ — trie iteration must descend and ascend through multiple node types, while tree iteration follows parent/child pointers.
+**Sorted iteration.** The red-black tree provides naturally sorted in-order traversal, with O(1) amortized iterator increment and decrement. kntrie provides the same sorted iteration through its structure, but the constant factors differ — kntrie iteration must descend and ascend through multiple node types, while tree iteration follows parent/child pointers.
 
 ### KNTRIE
 
@@ -418,7 +418,7 @@ In practice, the effective depth is often less than the maximum because of two m
 
 **PREFIX capture** collapses levels where all keys in a subtree share a common prefix. If every key in a subtree has the same bytes at positions 2–3, those two BRANCH levels are replaced by a skip=1 prefix check — a single comparison instead of two bitmap lookups and two pointer chases.
 
-**Compact node absorption** catches entire subtrees in a flat sorted array. When a subtree has ≤ 4096 entries, it remains a compact node rather than being split into BRANCH nodes. The search within that compact node is a jump search — fast, cache-friendly, and often faster than descending further into the trie structure.
+**Compact node absorption** catches entire subtrees in a flat sorted array. When a subtree has ≤ 4096 entries, it remains a compact node rather than being split into BRANCH nodes. The search within that compact node is a jump search — fast, cache-friendly, and often faster than descending further into the kntrie structure.
 
 These two mechanisms create a dependency on N for the effective depth:
 
@@ -454,4 +454,4 @@ root[ti] → bot-internal → split-top → bot → split-top → bot → split-
 
 Seven levels of branch dispatch, reached only when subtrees are dense enough that compact nodes at every intermediate level have overflowed their 4096-entry limit. In practice, even a billion-entry dataset with random uint64_t keys rarely reaches full depth because the keys distribute across the 256 root slots and the 256 second-level slots, keeping individual subtree sizes manageable.
 
-The key insight: O(M) is the theoretical bound, but the compact node mechanism makes the practical behavior closer to O(1) with a jump search whose size grows slowly with N. The trie's depth only increases when the dataset is dense enough in a particular key range to overflow compact nodes — and even then, each additional level only adds two pointer dereferences (bitmap lookup + child load).
+The key insight: O(M) is the theoretical bound, but the compact node mechanism makes the practical behavior closer to O(1) with a jump search whose size grows slowly with N. The kntrie's depth only increases when the dataset is dense enough in a particular key range to overflow compact nodes — and even then, each additional level only adds two pointer dereferences (bitmap lookup + child load).
