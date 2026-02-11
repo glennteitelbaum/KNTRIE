@@ -187,7 +187,7 @@ public:
     // ==================================================================
 
     struct RootInfo {
-        uint16_t entries; uint16_t descendants; uint8_t skip;
+        uint16_t entries; uint8_t skip;
         bool is_leaf; uint64_t prefix;
     };
     RootInfo debug_root_info() const {
@@ -195,7 +195,6 @@ public:
         for (int i = 0; i < 256; ++i)
             if (root_[i] != SENTINEL_NODE) ++occupied;
         return {static_cast<uint16_t>(occupied),
-                static_cast<uint16_t>(std::min(size_, size_t{65535})),
                 0, false, 0};
     }
     uint64_t debug_key_to_internal(KEY k) const { return KO::to_internal(k); }
@@ -431,7 +430,6 @@ private:
             }
             if (r.new_bot != lk.bot)
                 BO::template set_top_child<BITS>(node, lk.slot, r.new_bot);
-            if (r.inserted) h->add_descendants(1);
             return {node, r.inserted};
         }
 
@@ -459,7 +457,6 @@ private:
                 blk.child, ik, value);
             if (nc != blk.child)
                 BO::set_bot_child(bot, blk.slot, nc);
-            if (ins) h->add_descendants(1);
             return {node, ins};
         }
 
@@ -478,7 +475,6 @@ private:
         auto* new_bot = BO::add_bot_child(bot, bi, child, alloc_);
         if (new_bot != bot)
             BO::template set_top_child<BITS>(node, ts, new_bot);
-        h->add_descendants(1);
         return {node, true};
     }
 
@@ -724,7 +720,6 @@ private:
 
         BO::template set_top_child<BITS>(node, ts, new_bot);
         BO::template mark_bot_internal<BITS>(node, ti);
-        h->add_descendants(1);
 
         BO::template dealloc_bot_leaf<BITS>(bot, count, alloc_);
         return {node, true};
@@ -840,7 +835,7 @@ private:
 
         return BO::template make_split_top<BITS>(
             top_indices, bot_ptrs, is_leaf_flags, n_tops,
-            0, 0, static_cast<uint32_t>(count), alloc_);
+            0, 0, alloc_);
     }
 
     template<int BITS>
@@ -925,8 +920,6 @@ private:
             nl = CO::template make_leaf<CB>(&ck, &value, 1, nls, nl_prefix, alloc_);
         }
 
-        uint32_t total_desc = static_cast<uint32_t>(h->descendants) + 1;
-
         if (nt == ot) {
             uint8_t nb = nc & 0xFF, ob = oc & 0xFF;
 
@@ -940,7 +933,7 @@ private:
             bool      il_arr[1] = {false};
             auto* sn = BO::template make_split_top<BITS>(
                 ti_arr, bp_arr, il_arr, 1, ss, split_prefix,
-                total_desc, alloc_);
+                alloc_);
             return {sn, true};
         } else {
             uint8_t ob = oc & 0xFF, nb = nc & 0xFF;
@@ -957,7 +950,7 @@ private:
 
             auto* sn = BO::template make_split_top<BITS>(
                 ti_arr, bp_arr, il_arr, 2, ss, split_prefix,
-                total_desc, alloc_);
+                alloc_);
             return {sn, true};
         }
     }
@@ -974,7 +967,7 @@ private:
         uint64_t* bp_arr[1] = {bot};
         bool      il_arr[1] = {true};
         return BO::template make_split_top<16>(
-            ti_arr, bp_arr, il_arr, 1, skip, prefix, 1, alloc_);
+            ti_arr, bp_arr, il_arr, 1, skip, prefix, alloc_);
     }
 
     uint64_t* make_split16_from_sorted_(const uint16_t* keys,
@@ -1004,7 +997,7 @@ private:
 
         return BO::template make_split_top<16>(
             top_indices, bot_ptrs, is_leaf_flags, n_tops,
-            0, 0, static_cast<uint32_t>(count), alloc_);
+            0, 0, alloc_);
     }
 
     // ==================================================================
@@ -1080,7 +1073,6 @@ private:
             if (new_bot) {
                 if (new_bot != lk.bot)
                     BO::template set_top_child<BITS>(node, lk.slot, new_bot);
-                h->sub_descendants(1);
                 return {node, true};
             }
             auto* nn = BO::template remove_top_slot<BITS>(
@@ -1110,7 +1102,6 @@ private:
 
         auto [nc, erased] = erase_impl<BITS - 16>(blk.child, ik);
         if (!erased) return {node, false};
-        h->sub_descendants(1);
 
         if (nc) {
             if (nc != blk.child)

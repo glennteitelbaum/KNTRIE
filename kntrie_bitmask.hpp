@@ -228,7 +228,6 @@ struct BitmaskOps {
                 if (!is_leaf) bot_is_internal_bm_(node).set_bit(ti);
             }
             h->entries = static_cast<uint16_t>(ntc);
-            h->add_descendants(1);
             return node;
         }
 
@@ -238,7 +237,6 @@ struct BitmaskOps {
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
         nh->entries = static_cast<uint16_t>(ntc);
-        nh->add_descendants(1);
         nh->alloc_u64 = static_cast<uint16_t>(au64);
         if (h->skip() > 0) set_prefix(nn, get_prefix(node));
 
@@ -283,7 +281,6 @@ struct BitmaskOps {
                 bot_is_internal_bm_(node).clear_bit(ti);
             }
             h->entries = static_cast<uint16_t>(ntc);
-            h->sub_descendants(1);
             return node;
         }
 
@@ -292,7 +289,6 @@ struct BitmaskOps {
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn); *nh = *h;
         nh->entries = static_cast<uint16_t>(ntc);
-        nh->sub_descendants(1);
         nh->alloc_u64 = static_cast<uint16_t>(au64);
         if (h->skip() > 0) set_prefix(nn, get_prefix(node));
 
@@ -350,7 +346,7 @@ struct BitmaskOps {
                                      uint64_t* const* bot_ptrs,
                                      const bool* is_leaf_flags,
                                      int n_tops, uint8_t skip, uint64_t prefix,
-                                     uint32_t total_descendants, ALLOC& alloc) {
+                                     ALLOC& alloc) {
         Bitmap256 tbm = Bitmap256::from_indices(top_indices, n_tops);
 
         size_t needed = split_top_size_u64<BITS>(n_tops);
@@ -358,8 +354,6 @@ struct BitmaskOps {
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         nh->entries = static_cast<uint16_t>(n_tops);
-        nh->descendants = total_descendants > NodeHeader::DESC_CAP
-            ? NodeHeader::DESC_CAP : static_cast<uint16_t>(total_descendants);
         nh->alloc_u64 = static_cast<uint16_t>(au64);
         nh->set_skip(skip);
         nh->set_bitmask();

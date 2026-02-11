@@ -80,7 +80,7 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 
 struct NodeHeader {
     uint16_t entries;      // compact: k/v count; bitmask: child count
-    uint16_t descendants;  // total k/v pairs in subtree, capped at DESC_CAP
+    uint16_t reserved_;    // was: descendants (removed, will be reclaimed)
     uint16_t alloc_u64;    // allocation size in u64s (may be padded)
     uint16_t flags_;
 
@@ -90,17 +90,6 @@ struct NodeHeader {
     uint8_t skip() const noexcept { return (flags_ >> 1) & 0x3; }
     void set_skip(uint8_t s) noexcept {
         flags_ = (flags_ & ~uint16_t(0x0006)) | (uint16_t(s & 0x3) << 1);
-    }
-
-    static constexpr uint16_t DESC_CAP = 65535;
-
-    void add_descendants(uint16_t n) noexcept {
-        uint32_t d = static_cast<uint32_t>(descendants) + n;
-        descendants = static_cast<uint16_t>(d < DESC_CAP ? d : DESC_CAP);
-    }
-    void sub_descendants(uint16_t n) noexcept {
-        if (descendants < DESC_CAP)
-            descendants = descendants >= n ? static_cast<uint16_t>(descendants - n) : 0;
     }
 };
 static_assert(sizeof(NodeHeader) == 8);

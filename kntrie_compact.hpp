@@ -99,7 +99,6 @@ struct CompactOps {
         uint64_t* node = alloc_node(alloc, au64);
         auto* h = get_header(node);
         h->entries = static_cast<uint16_t>(count);
-        h->descendants = static_cast<uint16_t>(count);
         h->alloc_u64 = static_cast<uint16_t>(au64);
         h->set_skip(skip);
         if (skip > 0) set_prefix(node, prefix);
@@ -215,7 +214,6 @@ struct CompactOps {
         if (dups > 0) {
             insert_consume_dup_<BITS>(kd, vd, total, ins, h->entries, suffix, value);
             h->entries++;
-            h->descendants++;
             return {node, true, false};
         }
 
@@ -229,7 +227,6 @@ struct CompactOps {
         auto* nh = get_header(nn);
         *nh = *h;
         nh->entries = old_entries + 1;
-        nh->descendants = old_entries + 1;
         nh->alloc_u64 = static_cast<uint16_t>(au64);
         if (h->skip() > 0) set_prefix(nn, get_prefix(node));
 
@@ -283,7 +280,6 @@ struct CompactOps {
             auto* nh = get_header(nn);
             *nh = *h;
             nh->entries = nc;
-            nh->descendants = nc;
             nh->alloc_u64 = static_cast<uint16_t>(au64);
             if (h->skip() > 0) set_prefix(nn, get_prefix(node));
 
@@ -300,7 +296,6 @@ struct CompactOps {
         // --- In-place O(1) erase: convert run to neighbor dups ---
         erase_create_dup_<BITS>(kd, vd, total, idx, suffix, alloc);
         h->entries = nc;
-        h->descendants = nc;
         return {node, true};
     }
 
