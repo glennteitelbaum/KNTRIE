@@ -64,7 +64,7 @@ public:
         const uint64_t* child = root_[ti];
         NodeHeader h = *get_header(child);
 
-        if (h.is_leaf())
+        if (h.is_leaf()) [[unlikely]]
             return CO::template find<ROOT_BITS>(child, h, ik);
 
         // bot_internal: extract next 8 bits, descend
@@ -283,7 +283,7 @@ private:
         if (h.skip() > 0) [[unlikely]] {
             uint64_t expected = KO::template extract_prefix<BITS>(ik, h.skip());
             if (expected != get_prefix(node)) [[unlikely]] return nullptr;
-            if constexpr (BITS >= 48) { if (h.skip() == 1) return find_dispatch_<32>(node, h, ik); }
+            if constexpr (BITS >= 48) { if (h.skip() == 1) [[unlikely]] return find_dispatch_<32>(node, h, ik); }
             return find_dispatch_<16>(node, h, ik);
         }
 
