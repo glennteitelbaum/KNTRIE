@@ -261,45 +261,46 @@ private:
 
     template<int BITS>
     const VALUE* find_impl(const uint64_t* node, uint64_t ik) const noexcept
-        requires (BITS > 16)
+        requires (BITS == 16)
     {
         NodeHeader h = *get_header(node);
-        int skip = h.skip();
 
-        if (skip > 0) [[unlikely]] {
-            uint64_t expected = KO::template extract_prefix<BITS>(ik, skip);
+        if (h.skip() > 0) [[unlikely]] {
+            uint64_t expected = KO::template extract_prefix<BITS>(ik, h.skip());
             if (expected != get_prefix(node)) [[unlikely]] return nullptr;
         }
 
-        return find_dispatch_<BITS>(node, h, ik, skip);
+        // At BITS=16 nodes are always split, never compact leaf
+        return find_in_split<16>(node, ik);
     }
 
     template<int BITS>
     const VALUE* find_impl(const uint64_t* node, uint64_t ik) const noexcept
-        requires (BITS == 16)
+        requires (BITS > 16)
     {
-        return find_in_split<16>(node, ik);
+        NodeHeader h = *get_header(node);
+
+        if (h.skip() > 0) [[unlikely]] {
+            uint64_t expected = KO::template extract_prefix<BITS>(ik, h.skip());
+            if (expected != get_prefix(node)) [[unlikely]] return nullptr;
+            if constexpr (BITS >= 48) { if (h.skip() == 1) return find_dispatch_<32>(node, h, ik); }
+            return find_dispatch_<16>(node, h, ik);
+        }
+
+        return find_dispatch_<BITS>(node, h, ik);
     }
 
     template<int BITS>
     const VALUE* find_dispatch_(const uint64_t* node, NodeHeader h,
-                                uint64_t ik, int skip) const noexcept
-        requires (BITS > 16)
-    {
-        if (skip > 0) [[unlikely]]
-            return find_dispatch_<BITS - 16>(node, h, ik, skip - 1);
-        if (h.is_leaf()) [[unlikely]]
-            return CO::template find<BITS>(node, h, ik);
-        return find_in_split<BITS>(node, ik);
-    }
-
-    template<int BITS>
-    const VALUE* find_dispatch_(const uint64_t* node, NodeHeader,
-                                uint64_t ik, int) const noexcept
-        requires (BITS == 16)
-    {
-        // At BITS=16 nodes are always split, never compact leaf
-        return find_in_split<16>(node, ik);
+                                uint64_t ik) const noexcept {
+        if constexpr (BITS == 16) {
+            // At BITS=16 nodes are always split, never compact leaf
+            return find_in_split<16>(node, ik);
+        } else {
+            if (h.is_leaf()) [[unlikely]]
+                return CO::template find<BITS>(node, h, ik);
+            return find_in_split<BITS>(node, ik);
+        }
     }
 
     // ==================================================================
