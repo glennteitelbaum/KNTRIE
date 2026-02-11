@@ -261,46 +261,45 @@ private:
 
     template<int BITS>
     const VALUE* find_impl(const uint64_t* node, uint64_t ik) const noexcept
-        requires (BITS == 16)
+        requires (BITS > 16)
     {
         NodeHeader h = *get_header(node);
+        int skip = h.skip();
 
-        if (h.skip() > 0) [[unlikely]] {
-            uint64_t expected = KO::template extract_prefix<BITS>(ik, h.skip());
+        if (skip > 0) [[unlikely]] {
+            uint64_t expected = KO::template extract_prefix<BITS>(ik, skip);
             if (expected != get_prefix(node)) [[unlikely]] return nullptr;
         }
 
-        // At BITS=16 nodes are always split, never compact leaf
-        return find_in_split<16>(node, ik);
+        return find_dispatch_<BITS>(node, h, ik, skip);
     }
 
     template<int BITS>
     const VALUE* find_impl(const uint64_t* node, uint64_t ik) const noexcept
-        requires (BITS > 16)
+        requires (BITS == 16)
     {
-        NodeHeader h = *get_header(node);
-
-        if (h.skip() > 0) [[unlikely]] {
-            uint64_t expected = KO::template extract_prefix<BITS>(ik, h.skip());
-            if (expected != get_prefix(node)) [[unlikely]] return nullptr;
-            if constexpr (BITS >= 48) { if (h.skip() == 1) return find_dispatch_<32>(node, h, ik); }
-            return find_dispatch_<16>(node, h, ik);
-        }
-
-        return find_dispatch_<BITS>(node, h, ik);
+        return find_in_split<16>(node, ik);
     }
 
     template<int BITS>
     const VALUE* find_dispatch_(const uint64_t* node, NodeHeader h,
-                                uint64_t ik) const noexcept {
-        if constexpr (BITS == 16) {
-            // At BITS=16 nodes are always split, never compact leaf
-            return find_in_split<16>(node, ik);
-        } else {
-            if (h.is_leaf()) [[unlikely]]
-                return CO::template find<BITS>(node, h, ik);
-            return find_in_split<BITS>(node, ik);
-        }
+                                uint64_t ik, int skip) const noexcept
+        requires (BITS > 16)
+    {
+        if (skip > 0) [[unlikely]]
+            return find_dispatch_<BITS - 16>(node, h, ik, skip - 1);
+        if (h.is_leaf()) [[unlikely]]
+            return CO::template find<BITS>(node, h, ik);
+        return find_in_split<BITS>(node, ik);
+    }
+
+    template<int BITS>
+    const VALUE* find_dispatch_(const uint64_t* node, NodeHeader,
+                                uint64_t ik, int) const noexcept
+        requires (BITS == 16)
+    {
+        // At BITS=16 nodes are always split, never compact leaf
+        return find_in_split<16>(node, ik);
     }
 
     // ==================================================================
@@ -344,19 +343,34 @@ private:
         requires (BITS > 0)
     {
         auto* h = get_header(node);
-        if (h->skip() > 0) [[unlikely]] {
-            uint64_t expected = KO::template extract_prefix<BITS>(ik, h->skip());
+        int skip = h->skip();
+        if (skip > 0) [[unlikely]] {
+            uint64_t expected = KO::template extract_prefix<BITS>(ik, skip);
             uint64_t actual   = get_prefix(node);
             if (expected != actual) {
                 if constexpr (!INSERT) return {node, false};
                 return split_on_prefix<BITS>(node, h, ik, value, expected);
             }
-            int ab = BITS - h->skip() * 16;
-            if (ab == 48) return insert_at_bits<48, INSERT, ASSIGN>(node, h, ik, value);
-            if (ab == 32) return insert_at_bits<32, INSERT, ASSIGN>(node, h, ik, value);
-            if (ab == 16) return insert_at_bits<16, INSERT, ASSIGN>(node, h, ik, value);
         }
+        return insert_dispatch_<BITS, INSERT, ASSIGN>(node, h, ik, value, skip);
+    }
+
+    template<int BITS, bool INSERT = true, bool ASSIGN = true>
+    InsertResult insert_dispatch_(uint64_t* node, NodeHeader* h,
+                                  uint64_t ik, VST value, int skip)
+        requires (BITS > 16)
+    {
+        if (skip > 0) [[unlikely]]
+            return insert_dispatch_<BITS - 16, INSERT, ASSIGN>(node, h, ik, value, skip - 1);
         return insert_at_bits<BITS, INSERT, ASSIGN>(node, h, ik, value);
+    }
+
+    template<int BITS, bool INSERT = true, bool ASSIGN = true>
+    InsertResult insert_dispatch_(uint64_t* node, NodeHeader* h,
+                                  uint64_t ik, VST value, int skip)
+        requires (BITS == 16)
+    {
+        return insert_at_bits<16, INSERT, ASSIGN>(node, h, ik, value);
     }
 
     template<int BITS, bool INSERT = true, bool ASSIGN = true>
@@ -1006,16 +1020,30 @@ private:
         requires (BITS > 0)
     {
         auto* h = get_header(node);
-        if (h->skip() > 0) [[unlikely]] {
-            uint64_t exp = KO::template extract_prefix<BITS>(ik, h->skip());
+        int skip = h->skip();
+        if (skip > 0) [[unlikely]] {
+            uint64_t exp = KO::template extract_prefix<BITS>(ik, skip);
             if (exp != get_prefix(node)) return {node, false};
-            int ab = BITS - h->skip() * 16;
-            if      (ab == 48) return erase_at_bits<48>(node, get_header(node), ik);
-            else if (ab == 32) return erase_at_bits<32>(node, get_header(node), ik);
-            else if (ab == 16) return erase_at_bits<16>(node, get_header(node), ik);
-            else               return {node, false};
         }
+        return erase_dispatch_<BITS>(node, h, ik, skip);
+    }
+
+    template<int BITS>
+    EraseResult erase_dispatch_(uint64_t* node, NodeHeader* h,
+                                uint64_t ik, int skip)
+        requires (BITS > 16)
+    {
+        if (skip > 0) [[unlikely]]
+            return erase_dispatch_<BITS - 16>(node, h, ik, skip - 1);
         return erase_at_bits<BITS>(node, h, ik);
+    }
+
+    template<int BITS>
+    EraseResult erase_dispatch_(uint64_t* node, NodeHeader* h,
+                                uint64_t ik, int skip)
+        requires (BITS == 16)
+    {
+        return erase_at_bits<16>(node, h, ik);
     }
 
     template<int BITS>
@@ -1134,15 +1162,27 @@ private:
         else {
             if (!node) return;
             auto* h = get_header(node);
-            if (h->skip() > 0) {
-                int ab = BITS - h->skip() * 16;
-                if (ab == 48) { remove_all_at_bits<48>(node); return; }
-                if (ab == 32) { remove_all_at_bits<32>(node); return; }
-                if (ab == 16) { remove_all_at_bits<16>(node); return; }
-                return;
-            }
-            remove_all_at_bits<BITS>(node);
+            int skip = h->skip();
+            remove_all_dispatch_<BITS>(node, skip);
         }
+    }
+
+    template<int BITS>
+    void remove_all_dispatch_(uint64_t* node, int skip) noexcept
+        requires (BITS > 16)
+    {
+        if (skip > 0) [[unlikely]] {
+            remove_all_dispatch_<BITS - 16>(node, skip - 1);
+            return;
+        }
+        remove_all_at_bits<BITS>(node);
+    }
+
+    template<int BITS>
+    void remove_all_dispatch_(uint64_t* node, int) noexcept
+        requires (BITS == 16)
+    {
+        remove_all_at_bits<16>(node);
     }
 
     template<int BITS>
@@ -1182,15 +1222,29 @@ private:
         else {
             if (!node) return;
             auto* h = get_header(node);
-            if (h->skip() > 0) {
-                int ab = BITS - h->skip() * 16;
-                if (ab == 48) { collect_stats_at_bits<48>(node, s, true); return; }
-                if (ab == 32) { collect_stats_at_bits<32>(node, s, true); return; }
-                if (ab == 16) { collect_stats_at_bits<16>(node, s, true); return; }
-                return;
-            }
-            collect_stats_at_bits<BITS>(node, s, false);
+            int skip = h->skip();
+            collect_stats_dispatch_<BITS>(node, s, skip > 0, skip);
         }
+    }
+
+    template<int BITS>
+    void collect_stats_dispatch_(const uint64_t* node, DebugStats& s,
+                                  bool compressed, int skip) const noexcept
+        requires (BITS > 16)
+    {
+        if (skip > 0) [[unlikely]] {
+            collect_stats_dispatch_<BITS - 16>(node, s, compressed, skip - 1);
+            return;
+        }
+        collect_stats_at_bits<BITS>(node, s, compressed);
+    }
+
+    template<int BITS>
+    void collect_stats_dispatch_(const uint64_t* node, DebugStats& s,
+                                  bool compressed, int) const noexcept
+        requires (BITS == 16)
+    {
+        collect_stats_at_bits<16>(node, s, compressed);
     }
 
     template<int BITS>
