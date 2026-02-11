@@ -390,7 +390,7 @@ At BITS=16, the trie reaches its terminal level and the structure changes in sev
 
 **No bot-is-internal bitmap or slot 0.** At BITS=16, every child of the split-top is a bot-leaf-16. There are no bot-internal nodes at this level because there are no further levels to recurse into. The split-top layout drops the second bitmap and slot 0, saving 40 bytes per terminal split node. FAST_EXIT is used instead of BRANCHLESS since the simplified layout has no need for the branchless fallback.
 
-**No dup tombstones.** Bot-leaf-16 nodes use exact-fit allocation — no padding, no dups. Insert and erase use memmove within the value array and set/clear bitmap bits directly. The allocation is `HEADER_U64 + BITMAP256_U64 + ceil(count * sizeof(VST) / 8)` — no quarter-step rounding.
+**No dup tombstones.** Bot-leaf-16 nodes have no sorted key array — the bitmap *is* the key storage — so there's no place to seed duplicate entries. However, allocations use the same quarter-step rounding as all other node types, and insert/erase use in-place paths when the current allocation has room. This gives the same reallocation hysteresis that other nodes enjoy without the dup machinery.
 
 ---
 

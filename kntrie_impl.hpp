@@ -1275,7 +1275,7 @@ private:
                             L.bot_leaf++;
                             uint32_t bc = BO::template bot_leaf_count<BITS>(bot);
                             L.entries += bc;
-                            L.bytes += BO::template bot_leaf_size_u64<BITS>(bc) * 8;
+                            L.bytes += static_cast<size_t>(get_header(bot)->alloc_u64) * 8;
                         } else {
                             if constexpr (BITS > 16) {
                                 L.bot_internal++;

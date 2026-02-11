@@ -460,7 +460,7 @@ struct BitmaskOps {
     template<int BITS>
     static uint64_t* make_single_bot_leaf(uint64_t ik, VST value, ALLOC& alloc) {
         if constexpr (BITS == 16) {
-            size_t sz = bot_leaf_size_u64<BITS>(1);
+            size_t sz = round_up_u64(bot_leaf_size_u64<BITS>(1));
             uint64_t* bot = alloc_node(alloc, sz);
             auto* bh = get_header(bot);
             bh->entries = 1;
@@ -486,7 +486,7 @@ struct BitmaskOps {
             const typename suffix_traits<(BITS > 16 ? BITS - 8 : 8)>::type* sorted_suffixes,
             const VST* values, uint32_t count, ALLOC& alloc) {
         if constexpr (BITS == 16) {
-            size_t sz = bot_leaf_size_u64<BITS>(count);
+            size_t sz = round_up_u64(bot_leaf_size_u64<BITS>(count));
             uint64_t* bot = alloc_node(alloc, sz);
             auto* bh = get_header(bot);
             bh->entries = static_cast<uint16_t>(count);
@@ -803,10 +803,11 @@ private:
             return {bot, true, false};
         }
 
-        uint64_t* nb = alloc_node(alloc, new_sz);
+        size_t au64 = round_up_u64(new_sz);
+        uint64_t* nb = alloc_node(alloc, au64);
         auto* nbh = get_header(nb);
         nbh->entries = static_cast<uint16_t>(nc);
-        nbh->alloc_u64 = static_cast<uint16_t>(new_sz);
+        nbh->alloc_u64 = static_cast<uint16_t>(au64);
         Bitmap256& nbm = bm_(nb);
         nbm = bm; nbm.set_bit(suffix);
         VST* nvd = bot_leaf_vals_16_(nb);
@@ -843,10 +844,11 @@ private:
             return {bot, true};
         }
 
-        uint64_t* nb = alloc_node(alloc, new_sz);
+        size_t au64 = round_up_u64(new_sz);
+        uint64_t* nb = alloc_node(alloc, au64);
         auto* nbh = get_header(nb);
         nbh->entries = static_cast<uint16_t>(nc);
-        nbh->alloc_u64 = static_cast<uint16_t>(new_sz);
+        nbh->alloc_u64 = static_cast<uint16_t>(au64);
         Bitmap256& nbm = bm_(nb);
         nbm = bm; nbm.clear_bit(suffix);
         const VST* ov = bot_leaf_vals_16_(bot);
