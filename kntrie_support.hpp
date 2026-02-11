@@ -20,7 +20,7 @@ namespace kn3 {
 inline constexpr size_t BITMAP256_U64 = 4;   // 32 bytes
 inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
-inline constexpr size_t HEADER_U64    = 2;   // header is always 2 u64s
+inline constexpr size_t HEADER_U64    = 1;   // header is 1 u64
 
 // ==========================================================================
 // Allocation size classes
@@ -65,49 +65,58 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 }
 
 // ==========================================================================
-// Node Header  (16 bytes = 2 u64s, always)
+// Prefix type — two 16-bit skip chunks
 //
-// node[0]: NodeHeader (8 bytes)
-// node[1]: prefix (uint64_t, 0 when skip==0)
+// prefix[0] = outer chunk (consumed first during descent)
+// prefix[1] = inner chunk
+// Unused slots = 0.
+// ==========================================================================
+
+using prefix_t = std::array<uint16_t, 2>;
+
+// ==========================================================================
+// Node Header  (8 bytes = 1 u64)
 //
-// flags_ layout:
-//   bit 0:      is_bitmask (0 = compact leaf, 1 = bitmask/split)
-//   bits 1-2:   skip (0-3)
-//   bits 3-15:  reserved
+// top_:    bit 15 = is_bitmask, bits 12..0 = entries (0-4096)
+// bottom_: bits 15..14 = skip (0-2), bits 13..0 = alloc_u64 (0-10240)
+// prefix_: two u16 skip chunks (0 when skip==0)
 //
 // Zeroed header -> compact leaf with entries=0 (sentinel-compatible)
 // ==========================================================================
 
-struct NodeHeader {
-    uint16_t entries;      // compact: k/v count; bitmask: child count
-    uint16_t reserved_;    // was: descendants (removed, will be reclaimed)
-    uint16_t alloc_u64;    // allocation size in u64s (may be padded)
-    uint16_t flags_;
+struct node_header {
+    uint16_t top_;
+    uint16_t bottom_;
+    uint16_t prefix_[2];
 
-    bool is_leaf() const noexcept { return !(flags_ & 1); }
-    void set_bitmask() noexcept { flags_ |= 1; }
+    bool is_leaf() const noexcept { return !(top_ & 0x8000); }
+    void set_bitmask() noexcept { top_ |= 0x8000; }
 
-    uint8_t skip() const noexcept { return (flags_ >> 1) & 0x3; }
-    void set_skip(uint8_t s) noexcept {
-        flags_ = (flags_ & ~uint16_t(0x0006)) | (uint16_t(s & 0x3) << 1);
-    }
+    uint16_t entries() const noexcept { return top_ & 0x1FFF; }
+    void set_entries(uint16_t n) noexcept { top_ = (top_ & 0xE000) | (n & 0x1FFF); }
+
+    uint16_t alloc_u64() const noexcept { return bottom_ & 0x3FFF; }
+    void set_alloc_u64(uint16_t n) noexcept { bottom_ = (bottom_ & 0xC000) | (n & 0x3FFF); }
+
+    uint8_t skip() const noexcept { return static_cast<uint8_t>(bottom_ >> 14); }
+    void set_skip(uint8_t s) noexcept { bottom_ = (bottom_ & 0x3FFF) | (uint16_t(s & 0x3) << 14); }
+
+    prefix_t prefix() const noexcept { return {prefix_[0], prefix_[1]}; }
+    void set_prefix(prefix_t p) noexcept { prefix_[0] = p[0]; prefix_[1] = p[1]; }
 };
-static_assert(sizeof(NodeHeader) == 8);
+static_assert(sizeof(node_header) == 8);
 
-inline NodeHeader*       get_header(uint64_t* n)       noexcept { return reinterpret_cast<NodeHeader*>(n); }
-inline const NodeHeader* get_header(const uint64_t* n) noexcept { return reinterpret_cast<const NodeHeader*>(n); }
-
-inline uint64_t  get_prefix(const uint64_t* n) noexcept { return n[1]; }
-inline void      set_prefix(uint64_t* n, uint64_t p)   noexcept { n[1] = p; }
+inline node_header*       get_header(uint64_t* n)       noexcept { return reinterpret_cast<node_header*>(n); }
+inline const node_header* get_header(const uint64_t* n) noexcept { return reinterpret_cast<const node_header*>(n); }
 
 // ==========================================================================
 // Global sentinel -- zeroed block, valid as:
-//   - Compact leaf (entries=0, flags_=0 -> is_leaf)
+//   - Compact leaf (entries=0, top_=0 -> is_leaf)
 //   - Bot-leaf BITS==16 (header entries=0, bitmap all zeros)
 // No allocation on construction; never deallocated.
 // ==========================================================================
 
-alignas(64) inline constinit uint64_t SENTINEL_NODE[8] = {};
+alignas(64) inline constinit uint64_t SENTINEL_NODE[4] = {};
 
 // ==========================================================================
 // Suffix traits
@@ -214,18 +223,17 @@ struct KeyOps {
     }
 
     template<int BITS>
-    static constexpr uint64_t extract_prefix(uint64_t ik, int skip) noexcept {
-        if constexpr (BITS > static_cast<int>(key_bits)) return 0;
+    static constexpr prefix_t extract_prefix(uint64_t ik, int skip) noexcept {
+        prefix_t p = {0, 0};
+        if constexpr (BITS > static_cast<int>(key_bits)) return p;
         else {
-            int prefix_bits = skip * 16;
-            int shift = 64 - static_cast<int>(key_bits) + BITS - prefix_bits;
-            uint64_t mask = (1ULL << prefix_bits) - 1;
-            return (ik >> shift) & mask;
+            for (int i = 0; i < skip; ++i) {
+                int chunk_bits = BITS + (skip - i) * 16;
+                int shift = 64 - static_cast<int>(key_bits) + chunk_bits - 16;
+                p[i] = static_cast<uint16_t>((ik >> shift) & 0xFFFF);
+            }
+            return p;
         }
-    }
-
-    static constexpr uint16_t get_skip_chunk(uint64_t prefix, int /*skip*/, int skip_left) noexcept {
-        return static_cast<uint16_t>((prefix >> ((skip_left - 1) * 16)) & 0xFFFF);
     }
 };
 

@@ -43,13 +43,12 @@ struct JumpSearch {
 // ==========================================================================
 // CompactOps  -- builds/searches/mutates compact leaf nodes
 //
-// Layout: [header (2 u64)][sorted_keys (aligned)][values (aligned)]
-//   flags_ bit 0 = 0 -> is_leaf (compact)
-//   node[0] = NodeHeader, node[1] = prefix (0 when skip==0)
+// Layout: [header (1 u64)][sorted_keys (aligned)][values (aligned)]
+//   top_ bit 15 = 0 -> is_leaf (compact)
 //
 // Keys and values arrays have `total` slots where
 //   total = SlotTable<BITS, VST>::max_slots(alloc_u64)
-// Real entries = header.entries.  Dups = total - entries.
+// Real entries = header.entries().  Dups = total - entries.
 // Dups are copies of adjacent entries, evenly distributed.
 //
 // Allocations are padded via round_up_u64 to enable in-place insert/erase
@@ -77,8 +76,8 @@ struct CompactOps {
     // --- total physical slots for a given alloc ---
 
     template<int BITS>
-    static uint16_t total_slots(const NodeHeader* h) noexcept {
-        return SlotTable<BITS, VST>::max_slots(h->alloc_u64);
+    static uint16_t total_slots(const node_header* h) noexcept {
+        return SlotTable<BITS, VST>::max_slots(h->alloc_u64());
     }
 
     template<int BITS>
@@ -93,15 +92,15 @@ struct CompactOps {
     template<int BITS>
     static uint64_t* make_leaf(const typename suffix_traits<BITS>::type* sorted_keys,
                                const VST* values, uint32_t count,
-                               uint8_t skip, uint64_t prefix, ALLOC& alloc) {
+                               uint8_t skip, prefix_t prefix, ALLOC& alloc) {
         size_t needed = size_u64<BITS>(count);
         size_t au64 = round_up_u64(needed);
         uint64_t* node = alloc_node(alloc, au64);
         auto* h = get_header(node);
-        h->entries = static_cast<uint16_t>(count);
-        h->alloc_u64 = static_cast<uint16_t>(au64);
+        h->set_entries(static_cast<uint16_t>(count));
+        h->set_alloc_u64(static_cast<uint16_t>(au64));
         h->set_skip(skip);
-        if (skip > 0) set_prefix(node, prefix);
+        if (skip > 0) h->set_prefix(prefix);
 
         uint16_t total = total_slots<BITS>(h);
         if (count > 0) {
@@ -123,7 +122,7 @@ struct CompactOps {
     // ==================================================================
 
     template<int BITS, typename Fn>
-    static void for_each(const uint64_t* node, const NodeHeader* h, Fn&& cb) {
+    static void for_each(const uint64_t* node, const node_header* h, Fn&& cb) {
         using K = typename suffix_traits<BITS>::type;
         uint16_t total = total_slots<BITS>(h);
         const K*   kd = keys_<BITS>(node);
@@ -150,7 +149,7 @@ struct CompactOps {
                 VT::destroy(vd[i], alloc);
             }
         }
-        dealloc_node(alloc, node, h->alloc_u64);
+        dealloc_node(alloc, node, h->alloc_u64());
     }
 
     // ==================================================================
@@ -158,7 +157,7 @@ struct CompactOps {
     // ==================================================================
 
     template<int BITS>
-    static const VALUE* find(const uint64_t* node, NodeHeader h,
+    static const VALUE* find(const uint64_t* node, node_header h,
                              uint64_t ik) noexcept {
         using K = typename suffix_traits<BITS>::type;
         K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
@@ -184,7 +183,7 @@ struct CompactOps {
 
     template<int BITS, bool INSERT = true, bool ASSIGN = true>
     requires (INSERT || ASSIGN)
-    static CompactInsertResult insert(uint64_t* node, NodeHeader* h,
+    static CompactInsertResult insert(uint64_t* node, node_header* h,
                                       uint64_t ik, VST value, ALLOC& alloc) {
         using K = typename suffix_traits<BITS>::type;
         K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
@@ -208,27 +207,27 @@ struct CompactOps {
         if constexpr (!INSERT) return {node, false, false};
 
         int ins = -(idx + 1);  // insertion point in total-sized array
-        uint16_t dups = total - h->entries;
+        uint16_t entries = h->entries();
+        uint16_t dups = total - entries;
 
         // --- Dups available: consume one in-place ---
         if (dups > 0) {
-            insert_consume_dup_<BITS>(kd, vd, total, ins, h->entries, suffix, value);
-            h->entries++;
+            insert_consume_dup_<BITS>(kd, vd, total, ins, entries, suffix, value);
+            h->set_entries(entries + 1);
             return {node, true, false};
         }
 
         // --- No dups: need realloc ---
-        if (h->entries >= COMPACT_MAX) return {node, false, true};  // needs_split
+        if (entries >= COMPACT_MAX) return {node, false, true};  // needs_split
 
-        uint16_t old_entries = h->entries;
+        uint16_t old_entries = entries;
         size_t needed = size_u64<BITS>(old_entries + 1);
         size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         *nh = *h;
-        nh->entries = old_entries + 1;
-        nh->alloc_u64 = static_cast<uint16_t>(au64);
-        if (h->skip() > 0) set_prefix(nn, get_prefix(node));
+        nh->set_entries(old_entries + 1);
+        nh->set_alloc_u64(static_cast<uint16_t>(au64));
 
         uint16_t new_total = total_slots<BITS>(nh);
 
@@ -237,7 +236,7 @@ struct CompactOps {
         seed_with_insert_<BITS>(nn, kd, vd, old_entries, suffix, value,
                                 old_entries + 1, new_total);
 
-        dealloc_node(alloc, node, h->alloc_u64);
+        dealloc_node(alloc, node, h->alloc_u64());
         return {nn, true, false};
     }
 
@@ -250,7 +249,7 @@ struct CompactOps {
     // ==================================================================
 
     template<int BITS>
-    static EraseResult erase(uint64_t* node, NodeHeader* h,
+    static EraseResult erase(uint64_t* node, node_header* h,
                              uint64_t ik, ALLOC& alloc) {
         using K = typename suffix_traits<BITS>::type;
         K suffix = static_cast<K>(KOps::template extract_suffix<BITS>(ik));
@@ -261,27 +260,26 @@ struct CompactOps {
         int idx = JumpSearch<K>::search(kd, static_cast<int>(total), suffix);
         if (idx < 0) return {node, false};
 
-        uint16_t nc = h->entries - 1;
+        uint16_t nc = h->entries() - 1;
 
         // --- Last real entry: destroy and dealloc ---
         if (nc == 0) {
             if constexpr (!VT::is_inline)
                 VT::destroy(vd[idx], alloc);
-            dealloc_node(alloc, node, h->alloc_u64);
+            dealloc_node(alloc, node, h->alloc_u64());
             return {nullptr, true};
         }
 
         size_t needed = size_u64<BITS>(nc);
 
         // --- Should shrink: realloc with dedup + skip + seed ---
-        if (should_shrink_u64(h->alloc_u64, needed)) {
+        if (should_shrink_u64(h->alloc_u64(), needed)) {
             size_t au64 = round_up_u64(needed);
             uint64_t* nn = alloc_node(alloc, au64);
             auto* nh = get_header(nn);
             *nh = *h;
-            nh->entries = nc;
-            nh->alloc_u64 = static_cast<uint16_t>(au64);
-            if (h->skip() > 0) set_prefix(nn, get_prefix(node));
+            nh->set_entries(nc);
+            nh->set_alloc_u64(static_cast<uint16_t>(au64));
 
             uint16_t new_total = total_slots<BITS>(nh);
 
@@ -289,19 +287,19 @@ struct CompactOps {
             // Handles T* destroy for the erased key.
             seed_with_skip_<BITS>(nn, kd, vd, total, suffix, nc, new_total, alloc);
 
-            dealloc_node(alloc, node, h->alloc_u64);
+            dealloc_node(alloc, node, h->alloc_u64());
             return {nn, true};
         }
 
         // --- In-place O(1) erase: convert run to neighbor dups ---
         erase_create_dup_<BITS>(kd, vd, total, idx, suffix, alloc);
-        h->entries = nc;
+        h->set_entries(nc);
         return {node, true};
     }
 
 private:
     // --- layout helpers (private) ---
-    // Layout: [header (2 u64)][keys...][padding to 8-byte][values...]
+    // Layout: [header (1 u64)][keys...][padding to 8-byte][values...]
     // Keys and values arrays have `total` physical slots.
 
     template<int BITS>
@@ -492,10 +490,6 @@ private:
 
     // ==================================================================
     // Seed with insert: dedup source, merge new entry, seed dups
-    //
-    // Source may have dups (old_total > old_entries when called from
-    // a node that had dups == 0 this won't happen, but handle generally).
-    // old_keys/old_vals have old_entries real entries (no dups in this path).
     // ==================================================================
 
     template<int BITS>
@@ -532,10 +526,6 @@ private:
 
     // ==================================================================
     // Seed with skip: dedup source, skip one erased key, seed dups
-    //
-    // Source has `src_total` physical slots (entries + dups).
-    // Collects unique entries, skips first match of skip_suffix,
-    // destroys the skipped entry's T*, seeds into new node.
     // ==================================================================
 
     template<int BITS>
