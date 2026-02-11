@@ -28,18 +28,18 @@ struct Result {
     const char* name;
     double find_ms;
     double insert_ms;
-    size_t mem_bytes;     // after insert
+    size_t mem_bytes;
     double erase_ms;
     double churn_ms;
     double find2_ms;
-    size_t mem2_bytes;    // after churn
+    size_t mem2_bytes;
 };
 
 static void fmt_vs(char* buf, size_t sz, double ratio) {
     if (ratio > 1.005)
-        std::snprintf(buf, sz, "**%.2fx**", ratio);
+        std::snprintf(buf, sz, "**%.3fx**", ratio);
     else
-        std::snprintf(buf, sz, "%.2fx", ratio);
+        std::snprintf(buf, sz, "%.3fx", ratio);
 }
 
 template<typename KEY>
@@ -251,7 +251,7 @@ static void md_header() {
 }
 
 static void md_row(const char* nlabel, const char* name, const Result& r, size_t n) {
-    std::printf("| %s | %s | %.2f | %.2f | %.1f | %.1f | %.2f | %.2f | %.2f | %.1f | %.1f |\n",
+    std::printf("| %s | %s | %.3f | %.3f | %.1f | %.1f | %.3f | %.3f | %.3f | %.1f | %.1f |\n",
                 nlabel, name, r.find_ms, r.insert_ms,
                 r.mem_bytes / 1024.0, double(r.mem_bytes) / n,
                 r.erase_ms, r.churn_ms, r.find2_ms,
