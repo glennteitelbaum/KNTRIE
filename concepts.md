@@ -10,7 +10,7 @@ The classic problems with TRIE's are well known. A naïve implementation that al
 
 ## KTRIE
 
-The KTRIE is a TRIE variant designed for fixed-width keys (integers for kntrie, strings for kstrie). It introduces three structural ideas that address the classic TRIE problems described above.
+The KTRIE is a TRIE variant designed for compact data and fast reads (implemented with integer keys for kntrie, and variable length strings as keys for kstrie). It introduces three structural ideas that address the classic TRIE problems described above.
 
 A key in the KTRIE is decomposed into three logical regions:
 
