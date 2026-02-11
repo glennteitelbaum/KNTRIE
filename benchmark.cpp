@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <chrono>
 #include <map>
 #include <unordered_map>
@@ -12,6 +13,8 @@
 #include <algorithm>
 #include <string>
 #include <set>
+
+static constexpr int RUNS = 3;
 
 static double now_ms() {
     using clk = std::chrono::high_resolution_clock;
@@ -33,13 +36,25 @@ struct Result {
     double churn_ms;
     double find2_ms;
     size_t mem2_bytes;
+
+    static Result best(const Result* runs, int n) {
+        Result b = runs[0];
+        for (int i = 1; i < n; ++i) {
+            if (runs[i].find_ms    < b.find_ms)    b.find_ms    = runs[i].find_ms;
+            if (runs[i].insert_ms  < b.insert_ms)  b.insert_ms  = runs[i].insert_ms;
+            if (runs[i].erase_ms   < b.erase_ms)   b.erase_ms   = runs[i].erase_ms;
+            if (runs[i].churn_ms   < b.churn_ms)   b.churn_ms   = runs[i].churn_ms;
+            if (runs[i].find2_ms   < b.find2_ms)   b.find2_ms   = runs[i].find2_ms;
+        }
+        return b;
+    }
 };
 
 static void fmt_vs(char* buf, size_t sz, double ratio) {
     if (ratio > 1.005)
-        std::snprintf(buf, sz, "**%.3fx**", ratio);
+        std::snprintf(buf, sz, "**%.2fx**", ratio);
     else
-        std::snprintf(buf, sz, "%.3fx", ratio);
+        std::snprintf(buf, sz, "%.2fx", ratio);
 }
 
 template<typename KEY>
@@ -61,10 +76,6 @@ static Workload<KEY> make_workload(size_t n, const std::string& pattern,
     std::vector<KEY> raw(n);
     if (pattern == "sequential") {
         for (size_t i = 0; i < n; ++i) raw[i] = static_cast<KEY>(i);
-    } else if (pattern == "dense16") {
-        constexpr uint64_t base = std::is_same_v<KEY, int32_t> ? 0x1234ULL : 0x123400000000ULL;
-        for (size_t i = 0; i < n; ++i)
-            raw[i] = static_cast<KEY>(base + (rng() % (n * 2)));
     } else {
         for (size_t i = 0; i < n; ++i) raw[i] = static_cast<KEY>(rng());
     }
@@ -251,7 +262,7 @@ static void md_header() {
 }
 
 static void md_row(const char* nlabel, const char* name, const Result& r, size_t n) {
-    std::printf("| %s | %s | %.3f | %.3f | %.1f | %.1f | %.3f | %.3f | %.3f | %.1f | %.1f |\n",
+    std::printf("| %s | %s | %.2f | %.2f | %.1f | %.1f | %.2f | %.2f | %.2f | %.1f | %.1f |\n",
                 nlabel, name, r.find_ms, r.insert_ms,
                 r.mem_bytes / 1024.0, double(r.mem_bytes) / n,
                 r.erase_ms, r.churn_ms, r.find2_ms,
@@ -284,17 +295,29 @@ static const char* fmt_n(size_t n, char* buf, size_t sz) {
     return buf;
 }
 
+struct RunResults {
+    Result trie, map, umap;
+    size_t n;
+};
+
 template<typename KEY>
-static void run_one(size_t n, const std::string& pattern, int find_iters,
-                    std::mt19937_64& rng, bool print_hdr) {
+static RunResults run_one(size_t n, const std::string& pattern, int find_iters,
+                          bool print_hdr) {
+    std::mt19937_64 rng(42);
     auto w = make_workload<KEY>(n, pattern, find_iters, rng);
     n = w.keys.size();
 
     if (print_hdr) md_header();
 
-    Result r_trie = bench_kntrie(w);
-    Result r_map  = bench_stdmap(w);
-    Result r_umap = bench_unorderedmap(w);
+    Result trie_runs[RUNS], map_runs[RUNS], umap_runs[RUNS];
+    for (int r = 0; r < RUNS; ++r) {
+        trie_runs[r] = bench_kntrie(w);
+        map_runs[r]  = bench_stdmap(w);
+        umap_runs[r] = bench_unorderedmap(w);
+    }
+    Result r_trie = Result::best(trie_runs, RUNS);
+    Result r_map  = Result::best(map_runs,  RUNS);
+    Result r_umap = Result::best(umap_runs, RUNS);
 
     char nlabel[32];
     fmt_n(n, nlabel, sizeof(nlabel));
@@ -304,6 +327,65 @@ static void run_one(size_t n, const std::string& pattern, int find_iters,
     md_vs_row("map vs", r_map, r_trie);
     md_row("", "umap", r_umap, n);
     md_vs_row("umap vs", r_umap, r_trie);
+
+    return {r_trie, r_map, r_umap, n};
+}
+
+// ==================================================================
+// Summary: conservative rounding for vs-map ratios
+// ==================================================================
+
+static const char* round_ratio(double v, char* buf, size_t sz) {
+    if (v >= 0.8 && v <= 1.3) { std::snprintf(buf, sz, "SAME"); return buf; }
+    if (v < 2.0) {
+        double r = std::floor(v * 4.0) / 4.0; // to nearest 0.25, round down
+        int frac = static_cast<int>(r * 4) % 4;
+        if (frac == 1)      std::snprintf(buf, sz, "%.2fx", r); // .25
+        else if (frac == 3) std::snprintf(buf, sz, "%.2fx", r); // .75
+        else                std::snprintf(buf, sz, "%.1fx", r); // .0 or .5
+    } else if (v < 10.0) {
+        double r = std::floor(v);
+        std::snprintf(buf, sz, "%.0fx", r);
+    } else {
+        double r = std::floor(v / 5.0) * 5.0;
+        std::snprintf(buf, sz, "%.0fx", r);
+    }
+    return buf;
+}
+
+static void fmt_range(double lo, double hi, char* buf, size_t sz) {
+    char lo_buf[32], hi_buf[32];
+    round_ratio(lo, lo_buf, sizeof(lo_buf));
+    round_ratio(hi, hi_buf, sizeof(hi_buf));
+    if (std::strcmp(lo_buf, hi_buf) == 0)
+        std::snprintf(buf, sz, "%s", lo_buf);
+    else
+        std::snprintf(buf, sz, "%s–%s", lo_buf, hi_buf);
+}
+
+struct SummaryEntry {
+    size_t n;
+    double find_lo, find_hi;
+    double ins_lo, ins_hi;
+    double erase_lo, erase_hi;
+    double bpe_lo, bpe_hi;
+};
+
+static void print_summary(const char* type_name,
+                           const std::vector<SummaryEntry>& entries) {
+    std::printf("## Summary: %s vs std::map\n\n", type_name);
+    std::printf("| N | Find | Insert | Erase | B/entry |\n");
+    std::printf("|---|------|--------|-------|--------|\n");
+    for (auto& e : entries) {
+        char nlabel[32], f[64], ins[64], er[64], bpe[64];
+        fmt_n(e.n, nlabel, sizeof(nlabel));
+        fmt_range(e.find_lo, e.find_hi, f, sizeof(f));
+        fmt_range(e.ins_lo, e.ins_hi, ins, sizeof(ins));
+        fmt_range(e.erase_lo, e.erase_hi, er, sizeof(er));
+        fmt_range(e.bpe_lo, e.bpe_hi, bpe, sizeof(bpe));
+        std::printf("| %s | %s | %s | %s | %s |\n", nlabel, f, ins, er, bpe);
+    }
+    std::printf("\n");
 }
 
 static int iters_for(size_t n) {
@@ -314,13 +396,24 @@ static int iters_for(size_t n) {
     else                   return 1;
 }
 
-int main() {
-    const size_t sizes[] = {1000, 10000, 100000, 1000000};
-    const char* patterns[] = {"random", "sequential", "dense16"};
+int main(int argc, char** argv) {
+    std::vector<size_t> sizes;
+    for (int i = 1; i < argc; ++i) {
+        char* end;
+        size_t v = std::strtoul(argv[i], &end, 10);
+        if (*end == 'k' || *end == 'K') v *= 1000;
+        else if (*end == 'm' || *end == 'M') v *= 1000000;
+        if (v > 0) sizes.push_back(v);
+    }
+    if (sizes.empty()) sizes = {1000, 10000, 100000};
+
+    const char* patterns[] = {"random", "sequential"};
+    constexpr int N_PATTERNS = 2;
 
     std::printf("# kntrie3 Benchmark Results\n\n");
     std::printf("Compiler: `g++ -std=c++23 -O2 -march=x86-64-v3`\n\n");
     std::printf("Workload: insert N, find N (all hit), erase N/2, churn N/4 old + N/4 new, find N (25%% miss)\n\n");
+    std::printf("Best of %d runs per configuration.\n\n", RUNS);
     std::printf("- N = number of entries\n");
     std::printf("- F = Find all N keys in ms (all hits)\n");
     std::printf("- I = Insert N keys in ms\n");
@@ -333,25 +426,75 @@ int main() {
     std::printf("- B2 = Bytes per entry after churn\n\n");
     std::printf("In _vs_ rows, >1x means kntrie is better. **Bold** = kntrie wins.\n\n");
 
-    for (auto* pat : patterns) {
-        std::printf("## uint64_t — %s\n\n", pat);
+    // Collect results: [pattern_idx][size_idx]
+    std::vector<std::vector<RunResults>> u64_results(N_PATTERNS);
+    std::vector<std::vector<RunResults>> i32_results(N_PATTERNS);
+
+    for (int pi = 0; pi < N_PATTERNS; ++pi) {
+        std::printf("## uint64_t — %s\n\n", patterns[pi]);
         bool first = true;
         for (auto n : sizes) {
-            std::mt19937_64 rng(42);
-            run_one<uint64_t>(n, pat, iters_for(n), rng, first);
+            auto rr = run_one<uint64_t>(n, patterns[pi], iters_for(n), first);
+            u64_results[pi].push_back(rr);
             first = false;
         }
         std::printf("\n");
 
-        std::printf("## int32_t — %s\n\n", pat);
+        std::printf("## int32_t — %s\n\n", patterns[pi]);
         first = true;
         for (auto n : sizes) {
-            std::mt19937_64 rng(42);
-            run_one<int32_t>(n, pat, iters_for(n), rng, first);
+            auto rr = run_one<int32_t>(n, patterns[pi], iters_for(n), first);
+            i32_results[pi].push_back(rr);
             first = false;
         }
         std::printf("\n");
     }
+
+    // Build summaries: for each size, range across patterns
+    auto build_summary = [&](const std::vector<std::vector<RunResults>>& all)
+            -> std::vector<SummaryEntry> {
+        std::vector<SummaryEntry> entries;
+        for (size_t si = 0; si < sizes.size(); ++si) {
+            SummaryEntry e{};
+            e.n = all[0][si].n;
+            e.find_lo = e.find_hi = 1e30;
+            e.ins_lo = e.ins_hi = 1e30;
+            e.erase_lo = e.erase_hi = 1e30;
+            e.bpe_lo = e.bpe_hi = 1e30;
+            bool first = true;
+            for (int pi = 0; pi < N_PATTERNS; ++pi) {
+                auto& rr = all[pi][si];
+                double f_ratio = rr.map.find_ms / rr.trie.find_ms;
+                double i_ratio = rr.map.insert_ms / rr.trie.insert_ms;
+                double e_ratio = rr.map.erase_ms / rr.trie.erase_ms;
+                double b_ratio = double(rr.map.mem_bytes) / rr.trie.mem_bytes;
+                if (first) {
+                    e.find_lo = e.find_hi = f_ratio;
+                    e.ins_lo = e.ins_hi = i_ratio;
+                    e.erase_lo = e.erase_hi = e_ratio;
+                    e.bpe_lo = e.bpe_hi = b_ratio;
+                    first = false;
+                } else {
+                    e.find_lo = std::min(e.find_lo, f_ratio);
+                    e.find_hi = std::max(e.find_hi, f_ratio);
+                    e.ins_lo = std::min(e.ins_lo, i_ratio);
+                    e.ins_hi = std::max(e.ins_hi, i_ratio);
+                    e.erase_lo = std::min(e.erase_lo, e_ratio);
+                    e.erase_hi = std::max(e.erase_hi, e_ratio);
+                    e.bpe_lo = std::min(e.bpe_lo, b_ratio);
+                    e.bpe_hi = std::max(e.bpe_hi, b_ratio);
+                }
+            }
+            entries.push_back(e);
+        }
+        return entries;
+    };
+
+    auto u64_summary = build_summary(u64_results);
+    auto i32_summary = build_summary(i32_results);
+
+    print_summary("uint64_t", u64_summary);
+    print_summary("int32_t", i32_summary);
 
     return 0;
 }
