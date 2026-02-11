@@ -294,7 +294,7 @@ A compact node at BITS-8 — the KTRIE's SUFFIX collection. Same layout as any c
 [Header: 2 u64] [Bitmap: 4 u64] [Values...]
 ```
 
-At the terminal level, the bottom 8 bits are the final key suffix. Since there are only 256 possible suffixes, a bitmap directly encodes presence/absence — no sorted key array needed. The bitmap itself *is* the key storage. Values are packed densely in bitmap order. Lookup is a single `find_slot<FAST_EXIT>`: check the bit, compute the popcount for the slot index, return the value.
+At the terminal level, the bottom 8 bits are the final key suffix. Since there are only 256 possible suffixes, a bitmap directly encodes presence/absence — no sorted key array needed. The bitmap itself *is* the key storage. Values are packed densely in bitmap order. Lookup is a single `find_slot<FAST_EXIT>`: check the bit, compute the popcount for the slot index, return the value. This is the tightest possible representation for the final level.
 
 ### COMPACT
 
@@ -455,3 +455,52 @@ root[ti] → bot-internal → split-top → bot → split-top → bot → split-
 Seven levels of branch dispatch, reached only when subtrees are dense enough that compact nodes at every intermediate level have overflowed their 4096-entry limit. In practice, even a billion-entry dataset with random uint64_t keys rarely reaches full depth because the keys distribute across the 256 root slots and the 256 second-level slots, keeping individual subtree sizes manageable.
 
 The key insight: O(M) is the theoretical bound, but the compact node mechanism makes the practical behavior closer to O(1) with a jump search whose size grows slowly with N. The kntrie's depth only increases when the dataset is dense enough in a particular key range to overflow compact nodes — and even then, each additional level only adds two pointer dereferences (bitmap lookup + child load).
+
+### BENCHMARKS
+
+#### Benchmark Summary vs std::map
+
+All ratios are conservative (rounded down). Range spans random and sequential workloads.
+
+**uint64_t**
+
+| N | Find | Insert | Erase | B/entry |
+|---|------|--------|-------|---------|
+| 1K | 1.5x–3x | SAME–1.25x | 1.75x–2x | 3x |
+| 10K | 1.5x–2x | SAME–1.5x | 2x | 4x–7x |
+| 100K | 2x–6x | 2x–3x | 4x | 4x–7x |
+
+**int32_t**
+
+| N | Find | Insert | Erase | B/entry |
+|---|------|--------|-------|---------|
+| 1K | 3x–8x | SAME | 1.75x | 4x–5x |
+| 10K | 3x–10x | 1.5x | 2x–3x | 5x–7x |
+| 100K | 7x–25x | 2x–4x | 5x–6x | 5x–7x |
+
+#### The Real Complexity: O(N) × O(M)
+
+Textbook complexity treats memory access as uniform cost. In practice, every pointer chase or array lookup pays a cost determined by where the data lives in the memory hierarchy — L1, L2, L3, or DRAM. The cost of a cache miss depends on the total memory footprint M, because M determines which cache level the working set occupies.
+
+This makes the true cost of N lookups closer to O(N × miss_cost(M)) for all three structures. The table below shows how per-lookup cost scales when N (and M) grow 10× from 10K to 100K entries:
+
+**Cost-per-lookup growth (10K → 100K, ~10× memory growth)**
+
+| | map (per hop, logN removed) | umap | kntrie |
+|---|---|---|---|
+| Theoretical | 1.0× | 1.0× | 1.0× |
+| Measured | 2.2–2.7× | 2.4–3.7× | 1.1–1.8× |
+
+Map's O(log N) is well known, but after factoring out the log N tree depth, each individual hop still gets 2–3× more expensive as N grows — pure memory hierarchy effect. The unordered_map, supposedly O(1), degrades just as badly: its hash-then-chase-pointer pattern scatters across the same oversized heap.
+
+The kntrie's advantage is twofold. First, 4–7× smaller memory footprint means the working set stays in faster cache levels longer — at 100K int32_t entries, the trie fits in ~1MB (L2/L3 boundary) while map and umap sit at 7MB (deep L3 or DRAM). Second, the trie's dense node layout gives spatial locality — adjacent keys share cache lines, so one fetch services multiple lookups. The sequential patterns barely degrade at all (1.1–1.2×) because the trie naturally groups nearby keys into the same nodes.
+
+In short: all three data structures pay an O(M) tax on every operation. The kntrie just has a much smaller M.
+
+### Summary
+
+- Real-world lookup cost is O(N) × O(miss_cost(M)), not O(N log N) or O(N)
+- std::map and std::unordered_map both degrade 2–4× per 10× memory growth
+- kntrie degrades only 1.1–1.8× over the same range
+- The difference comes from 4–7× smaller memory footprint and dense node layout
+- At 100K int32_t entries: kntrie ~1MB (L2/L3), map/umap ~7MB (L3/DRAM)
