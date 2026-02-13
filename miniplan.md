@@ -10,94 +10,60 @@
 
 ---
 
-## FILE 1: kntrie_support.hpp
+## FILE 1: kntrie_support.hpp ✅ COMPLETE
 
-### KEEP (copy from old, no changes)
+### KEEP
 - Constants: BITMAP256_U64, COMPACT_MAX, BOT_LEAF_MAX, HEADER_U64
 - round_up_u64, step_up_u64, should_shrink_u64
 - prefix_t (std::array<uint16_t, 2>)
 - SENTINEL_NODE (alignas(64) constinit)
-- value_traits<VALUE, ALLOC> (rename IS_INLINE from is_inline, otherwise identical)
+- value_traits<VALUE, ALLOC> (IS_INLINE, slot_type, store/as_ptr/destroy/write_slot)
 - alloc_node, dealloc_node helpers
-- erase_result_t (was EraseResult)
+- erase_result_t
+- node_header: suffix_type() / set_suffix_type() using bits 14-13
+- key_ops<KEY>: internal_key_t, IK_BITS, to_internal(), to_key()
+- suffix_type_for(int bits): returns 1/2/3
+- dispatch_suffix(uint8_t stype, Fn): nested bit test
+- slot_table<K, VST>: templated on K
 
-### TODO (new or rewritten)
-- node_header: add suffix_type() / set_suffix_type() using bits 14-13.
-  Rest unchanged (is_leaf, entries, alloc_u64, skip, prefix).
-- key_ops<KEY>: new. internal_key_t = u32 for KEY≤32bit, u64 otherwise.
-  to_internal(): left-align in internal_key_t. to_key(): reverse.
-- suffix_type_for(int bits): returns 1/2/3 (no 0). bits≤16→1, ≤32→2, else 3.
-- dispatch_suffix(uint8_t stype, Fn): nested bit test (0b10 then 0b01), u16 fallthrough.
-- slot_table<K, VST>: replaces SlotTable<BITS, VST>. Same logic, templated on K.
-
-### REMOVE
-- suffix_traits<BITS> — gone entirely
-- KeyOps<KEY> — replaced by key_ops<KEY>
-- InsertResult — gone (compact_ops has its own result type)
+### REMOVED
+- suffix_traits<BITS>
+- KeyOps<KEY>
+- InsertResult
 
 ---
 
-## FILE 2: kntrie_compact.hpp
+## FILE 2: kntrie_compact.hpp ✅ COMPLETE (already updated in prior session)
 
-### KEEP (copy from old, rename only)
-- jump_search<K> (was JumpSearch<K>) — identical logic
+### KEEP
+- jump_search<K> — identical logic
 - All compact leaf layout logic (header + sorted keys + aligned values + dups)
 - Dup seeding: seed_from_real, seed_with_insert, seed_with_skip
 - insert_consume_dup, erase_create_dup
 - for_each, destroy_and_dealloc
+- compact_ops<KEY,VALUE,ALLOC> templated on K (not BITS)
+- size_u64<K>, total_slots<K>, keys<K>, vals<K> (public)
+- make_leaf<K> with stype parameter
+- find<K>, insert<K>, erase<K> take K suffix directly
+- compact_insert_result_t: {node, inserted, needs_split}
 
-### TODO (re-template)
-- compact_ops<KEY, VALUE, ALLOC> methods: change template param from <int BITS> to <typename K>
-  - size_u64<K>, total_slots<K>, keys<K>, vals<K>
-  - make_leaf<K>: new param `uint8_t stype` to set in header via set_suffix_type()
-  - find<K>: takes K suffix directly (caller extracts from ik)
-  - insert<K>: takes K suffix directly
-  - erase<K>: takes K suffix directly
-  - compact_insert_result_t (was nested in old code): {node, inserted, needs_split}
-- Layout helpers keys<K>/vals<K>: make public (kntrie_impl needs them for convert)
-
-### REMOVE
-- All extract_suffix / extract_top8 calls inside compact_ops — caller provides K suffix
+### REMOVED
+- All extract_suffix / extract_top8 calls (caller provides K suffix)
 
 ---
 
-## FILE 3: kntrie_bitmask.hpp
+## FILE 3: kntrie_bitmask.hpp ✅ COMPLETE (already updated in prior session, overflow removed)
 
-### KEEP (copy from old)
-- bitmap256 struct entirely (was Bitmap256): rename, same logic
-  - has_bit, set_bit, clear_bit, popcount, find_slot<MODE>, find_next_set
-  - arr_fill_sorted, arr_insert, arr_remove, arr_copy_insert, arr_copy_remove
-  - from_indices
+### KEEP
+- bitmap256 struct entirely: has_bit, set_bit, clear_bit, popcount, find_slot<MODE>, find_next_set, arr_* helpers, from_indices
+- split_ops<KEY,VALUE,ALLOC>: layout 10+n, branchless_top_child→{child,is_leaf}, lookup_child, set_child, add_child_as_leaf/internal, remove_child, mark_internal, make_split, for_each_child, dealloc, child_count
+- fan_ops<KEY,VALUE,ALLOC>: layout 6+n, branchless_child→child only, lookup_child, set_child, add_child, remove_child, make_fan, for_each_child, dealloc, child_count
+- bitmap_leaf_ops<KEY,VALUE,ALLOC>: layout 5+ceil, find, insert (INSERT/ASSIGN), erase, make_single, make_from_sorted, for_each, destroy_and_dealloc, dealloc_only
+- insert_result_t: {node, inserted} — no overflow field
 
-### TODO (split BitmaskOps into 3 structs)
-
-#### split_ops<KEY, VALUE, ALLOC>
-- Layout: header(1) + main_bitmap(4) + is_internal_bitmap(4) + sentinel(1) + children[] = 10 + n
-- branchless_top_child → returns {child, is_leaf}
-- lookup_child, set_child, add_child_as_leaf, add_child_as_internal
-- remove_child, mark_internal
-- make_split, for_each_child, dealloc
-- child_count
-
-#### fan_ops<KEY, VALUE, ALLOC>
-- Layout: header(1) + main_bitmap(4) + sentinel(1) + children[] = 6 + n
-- branchless_child → returns child only (no is_leaf)
-- lookup_child, set_child, add_child, remove_child
-- make_fan, for_each_child, dealloc
-- child_count
-
-#### bitmap_leaf_ops<KEY, VALUE, ALLOC>
-- Layout: header(1) + bitmap256(4) + VST[] = 5 + ceil(n*sizeof(VST)/8)
-- Header: is_bitmask=1 (set_bitmask in make functions)
-- find, insert (no overflow field in result), erase
-- make_single, make_from_sorted, for_each
-- destroy_and_dealloc, dealloc_only
-- insert_result_t: {node, inserted} — no overflow
-
-### REMOVE
+### REMOVED
 - BitmaskOps monolith
-- All <int BITS> template params on bitmask operations
-- bot_leaf concept (split into bitmap_leaf_ops for 8-bit, compact_ops for wider)
+- overflow field from bitmap_leaf_ops::insert_result_t (bitmap256 never overflows)
 
 ---
 

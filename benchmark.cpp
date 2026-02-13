@@ -331,18 +331,14 @@ static RunResults run_one(size_t n, const std::string& pattern, int find_iters,
     return {r_trie, r_map, r_umap, n};
 }
 
-// ==================================================================
-// Summary: conservative rounding for vs-map ratios
-// ==================================================================
-
 static const char* round_ratio(double v, char* buf, size_t sz) {
     if (v >= 0.8 && v <= 1.3) { std::snprintf(buf, sz, "SAME"); return buf; }
     if (v < 2.0) {
-        double r = std::floor(v * 4.0) / 4.0; // to nearest 0.25, round down
+        double r = std::floor(v * 4.0) / 4.0;
         int frac = static_cast<int>(r * 4) % 4;
-        if (frac == 1)      std::snprintf(buf, sz, "%.2fx", r); // .25
-        else if (frac == 3) std::snprintf(buf, sz, "%.2fx", r); // .75
-        else                std::snprintf(buf, sz, "%.1fx", r); // .0 or .5
+        if (frac == 1)      std::snprintf(buf, sz, "%.2fx", r);
+        else if (frac == 3) std::snprintf(buf, sz, "%.2fx", r);
+        else                std::snprintf(buf, sz, "%.1fx", r);
     } else if (v < 10.0) {
         double r = std::floor(v);
         std::snprintf(buf, sz, "%.0fx", r);
@@ -360,7 +356,7 @@ static void fmt_range(double lo, double hi, char* buf, size_t sz) {
     if (std::strcmp(lo_buf, hi_buf) == 0)
         std::snprintf(buf, sz, "%s", lo_buf);
     else
-        std::snprintf(buf, sz, "%s–%s", lo_buf, hi_buf);
+        std::snprintf(buf, sz, "%s\xe2\x80\x93%s", lo_buf, hi_buf);
 }
 
 struct SummaryEntry {
@@ -426,12 +422,11 @@ int main(int argc, char** argv) {
     std::printf("- B2 = Bytes per entry after churn\n\n");
     std::printf("In _vs_ rows, >1x means kntrie is better. **Bold** = kntrie wins.\n\n");
 
-    // Collect results: [pattern_idx][size_idx]
     std::vector<std::vector<RunResults>> u64_results(N_PATTERNS);
     std::vector<std::vector<RunResults>> i32_results(N_PATTERNS);
 
     for (int pi = 0; pi < N_PATTERNS; ++pi) {
-        std::printf("## uint64_t — %s\n\n", patterns[pi]);
+        std::printf("## uint64_t \xe2\x80\x94 %s\n\n", patterns[pi]);
         bool first = true;
         for (auto n : sizes) {
             auto rr = run_one<uint64_t>(n, patterns[pi], iters_for(n), first);
@@ -440,7 +435,7 @@ int main(int argc, char** argv) {
         }
         std::printf("\n");
 
-        std::printf("## int32_t — %s\n\n", patterns[pi]);
+        std::printf("## int32_t \xe2\x80\x94 %s\n\n", patterns[pi]);
         first = true;
         for (auto n : sizes) {
             auto rr = run_one<int32_t>(n, patterns[pi], iters_for(n), first);
@@ -450,7 +445,6 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
-    // Build summaries: for each size, range across patterns
     auto build_summary = [&](const std::vector<std::vector<RunResults>>& all)
             -> std::vector<SummaryEntry> {
         std::vector<SummaryEntry> entries;

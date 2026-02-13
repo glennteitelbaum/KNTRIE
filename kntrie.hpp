@@ -130,7 +130,7 @@ public:
     auto   debug_root_info() const       { return impl_.debug_root_info(); }
 
 private:
-    kn3::kntrie3<KEY, VALUE, ALLOC> impl_;
+    kntrie_impl<KEY, VALUE, ALLOC> impl_;
 };
 
 } // namespace gteitelbaum
