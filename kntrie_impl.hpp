@@ -268,6 +268,9 @@ private:
             prefix_t expected = KO::template extract_prefix<BITS>(ik, h.skip());
             if (expected != h.prefix()) [[unlikely]] return nullptr;
         }
+
+        if (h.is_leaf()) [[likely]]
+            return CO::template find<16>(node, h, ik);
         return find_in_split<16>(node, ik);
     }
 
@@ -291,7 +294,8 @@ private:
     const VALUE* find_dispatch_(const uint64_t* node, node_header h,
                                 uint64_t ik) const noexcept {
         if constexpr (BITS == 16) {
-            // At BITS=16 nodes are always split, never compact leaf
+            if (h.is_leaf()) [[likely]]
+                return CO::template find<16>(node, h, ik);
             return find_in_split<16>(node, ik);
         } else {
             if (h.is_leaf()) [[unlikely]]
@@ -461,14 +465,9 @@ private:
         if constexpr (!INSERT) return {node, false};
 
         constexpr int CB = BITS - 16;
-        uint64_t* child;
-        if constexpr (CB == 16) {
-            child = make_single_split16_(ik, value);
-        } else {
-            using CK = typename suffix_traits<CB>::type;
-            CK ck = static_cast<CK>(KO::template extract_suffix<CB>(ik));
-            child = CO::template make_leaf<CB>(&ck, &value, 1, 0, prefix_t{0,0}, alloc_);
-        }
+        using CK = typename suffix_traits<CB>::type;
+        CK ck = static_cast<CK>(KO::template extract_suffix<CB>(ik));
+        uint64_t* child = CO::template make_leaf<CB>(&ck, &value, 1, 0, prefix_t{0,0}, alloc_);
 
         auto* new_bot = BO::add_bot_child(bot, bi, child, alloc_);
         if (new_bot != bot)
@@ -499,14 +498,9 @@ private:
 
         if constexpr (!INSERT) { inserted = false; return bot; }
 
-        uint64_t* child;
-        if constexpr (CB == 16) {
-            child = make_single_split16_(ik, value);
-        } else {
-            using CK = typename suffix_traits<CB>::type;
-            CK ck = static_cast<CK>(KO::template extract_suffix<CB>(ik));
-            child = CO::template make_leaf<CB>(&ck, &value, 1, 0, prefix_t{0,0}, alloc_);
-        }
+        using CK = typename suffix_traits<CB>::type;
+        CK ck = static_cast<CK>(KO::template extract_suffix<CB>(ik));
+        uint64_t* child = CO::template make_leaf<CB>(&ck, &value, 1, 0, prefix_t{0,0}, alloc_);
 
         auto* new_bot = BO::add_bot_child(bot, bi, child, alloc_);
         inserted = true;
@@ -703,14 +697,8 @@ private:
             for (size_t j = 0; j < cc; ++j)
                 ck[j] = static_cast<CK>(wk[start + j] & cmask);
 
-            uint64_t* child;
-            if constexpr (CB == 16) {
-                child = make_split16_from_sorted_(
-                    ck.get(), wv.get() + start, cc);
-            } else {
-                child = CO::template make_leaf<CB>(
+            uint64_t* child = CO::template make_leaf<CB>(
                     ck.get(), wv.get() + start, static_cast<uint32_t>(cc), 0, prefix_t{0,0}, alloc_);
-            }
 
             indices[n_children]    = bi;
             child_ptrs[n_children] = child;
@@ -734,10 +722,6 @@ private:
     uint64_t* build_node_from_arrays(uint64_t* suf, VST* vals, size_t count)
         requires (BITS > 0)
     {
-        if constexpr (BITS == 16) {
-            return build_split_from_arrays<16>(suf, vals, count);
-        }
-
         if (count <= COMPACT_MAX) {
             using K = typename suffix_traits<BITS>::type;
             auto tk = std::make_unique<K[]>(count);
@@ -921,9 +905,7 @@ private:
         uint8_t nls = static_cast<uint8_t>(rem);
 
         uint64_t* nl;
-        if constexpr (CB == 16) {
-            nl = make_single_split16_(ik, value, nls, nl_prefix);
-        } else {
+        {
             using CK = typename suffix_traits<CB>::type;
             CK ck = static_cast<CK>(KO::template extract_suffix<CB>(ik));
             nl = CO::template make_leaf<CB>(&ck, &value, 1, nls, nl_prefix, alloc_);
@@ -962,51 +944,6 @@ private:
                 alloc_);
             return {sn, true};
         }
-    }
-
-    // ==================================================================
-    // BITS=16 helpers
-    // ==================================================================
-
-    uint64_t* make_single_split16_(uint64_t ik, VST value,
-                                    uint8_t skip = 0, prefix_t prefix = {0,0}) {
-        uint8_t ti = KO::template extract_top8<16>(ik);
-        auto* bot = BO::template make_single_bot_leaf<16>(ik, value, alloc_);
-        uint8_t   ti_arr[1] = {ti};
-        uint64_t* bp_arr[1] = {bot};
-        bool      il_arr[1] = {true};
-        return BO::template make_split_top<16>(
-            ti_arr, bp_arr, il_arr, 1, skip, prefix, alloc_);
-    }
-
-    uint64_t* make_split16_from_sorted_(const uint16_t* keys,
-                                         const VST* vals, size_t count) {
-        uint8_t   top_indices[256];
-        uint64_t* bot_ptrs[256];
-        bool      is_leaf_flags[256];
-        int       n_tops = 0;
-
-        size_t i = 0;
-        while (i < count) {
-            uint8_t ti = keys[i] >> 8;
-            size_t start = i;
-            while (i < count && (keys[i] >> 8) == ti) ++i;
-            size_t bcount = i - start;
-
-            auto bk = std::make_unique<uint8_t[]>(bcount);
-            for (size_t j = 0; j < bcount; ++j)
-                bk[j] = static_cast<uint8_t>(keys[start + j] & 0xFF);
-
-            bot_ptrs[n_tops] = BO::template make_bot_leaf<16>(
-                bk.get(), vals + start, static_cast<uint32_t>(bcount), alloc_);
-            top_indices[n_tops] = ti;
-            is_leaf_flags[n_tops] = true;
-            n_tops++;
-        }
-
-        return BO::template make_split_top<16>(
-            top_indices, bot_ptrs, is_leaf_flags, n_tops,
-            0, prefix_t{0,0}, alloc_);
     }
 
     // ==================================================================
