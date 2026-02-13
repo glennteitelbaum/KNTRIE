@@ -101,7 +101,7 @@ public:
         // Leaf dispatch by suffix_type
         uint8_t st = hdr.suffix_type();
 
-        if (st <= 1) {
+        if (st <= 1) [[likely]] {
             if (st == 0)
                 return BO::bitmap_find(node, hdr,
                     static_cast<uint8_t>(ik >> (IK_BITS - 8)));
