@@ -434,6 +434,8 @@ private:
 
         // Dups available: consume one in-place
         if (dups > 0) {
+            if (entries >= COMPACT_MAX)
+                return {node, false, true};  // needs_split
             insert_consume_dup_(kd, vd, ts, ins, entries, suffix, value);
             h->set_entries(entries + 1);
             return {node, true, false};

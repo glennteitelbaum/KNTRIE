@@ -205,6 +205,8 @@ public:
         return {static_cast<uint16_t>(occupied), 0, false};
     }
 
+    const uint64_t* debug_root_child(int i) const noexcept { return root_[i]; }
+
 private:
     // ==================================================================
     // Insert dispatch (shared by insert / insert_or_assign / assign)
