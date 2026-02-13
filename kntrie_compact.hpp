@@ -475,15 +475,78 @@ private:
             nh->set_alloc_u64(static_cast<uint16_t>(au64));
             uint16_t new_ts = total_slots(nh);
 
-            seed_with_skip_(nn, kd, vd, ts, suffix, nc, new_ts, alloc);
+            if (nc < DUP_THRESHOLD) {
+                dedup_skip_contiguous_(nn, nc, kd, vd, ts, suffix, alloc);
+            } else {
+                seed_with_skip_(nn, kd, vd, ts, suffix, nc, new_ts, alloc);
+            }
             dealloc_node(alloc, node, h->alloc_u64());
             return {nn, true};
+        }
+
+        // Crossing threshold from dup→simple: dedup in-place
+        if (nc < DUP_THRESHOLD) {
+            dedup_skip_inplace_(kd, vd, ts, suffix, alloc);
+            h->set_entries(nc);
+            return {node, true};
         }
 
         // In-place O(1): convert run to neighbor dups
         erase_create_dup_(kd, vd, ts, idx, suffix, alloc);
         h->set_entries(nc);
         return {node, true};
+    }
+
+    // ==================================================================
+    // Dedup + skip in-place: compact entries to front (for dup→simple crossing)
+    // ==================================================================
+
+    static void dedup_skip_inplace_(K* kd, VST* vd, uint16_t total,
+                                     K skip_suffix, ALLOC& alloc) {
+        bool skipped = false;
+        int wi = 0;
+        for (int i = 0; i < total; ++i) {
+            if (i > 0 && kd[i] == kd[i - 1]) continue;  // skip dup
+            if (!skipped && kd[i] == skip_suffix) {
+                skipped = true;
+                if constexpr (!VT::IS_INLINE)
+                    VT::destroy(vd[i], alloc);
+                continue;
+            }
+            if (wi != i) {
+                kd[wi] = kd[i];
+                vd[wi] = vd[i];
+            }
+            wi++;
+        }
+    }
+
+    // ==================================================================
+    // Dedup + skip, write contiguously (for shrink realloc at threshold)
+    // ==================================================================
+
+    static void dedup_skip_contiguous_(uint64_t* node, uint16_t nc,
+                                        const K* src_keys, const VST* src_vals,
+                                        uint16_t src_total, K skip_suffix,
+                                        ALLOC& alloc) {
+        uint16_t new_ts = total_slots(get_header(node));
+        K*   dk = keys_(node);
+        VST* dv = vals_mut_(node, new_ts);
+
+        bool skipped = false;
+        int wi = 0;
+        for (int i = 0; i < src_total; ++i) {
+            if (i > 0 && src_keys[i] == src_keys[i - 1]) continue;  // skip dup
+            if (!skipped && src_keys[i] == skip_suffix) {
+                skipped = true;
+                if constexpr (!VT::IS_INLINE)
+                    VT::destroy(src_vals[i], alloc);
+                continue;
+            }
+            dk[wi] = src_keys[i];
+            dv[wi] = src_vals[i];
+            wi++;
+        }
     }
 
     // ==================================================================
