@@ -1,1117 +1,1257 @@
-# kntrie Refactor: Loop-Based Traversal + Native-Width Internal Keys
+# kntrie Refactor: Unified Node Design
 
 ## 1. Goals
 
-1. Replace recursive template dispatch with iterative loops using shift-based key consumption.
+1. Replace recursive template dispatch: **find = iterative loop**, **insert/erase = runtime recursion** (not template recursion).
 2. Use native-width internal keys: `uint32_t` for keys ≤32 bits, `uint64_t` for keys >32 bits.
-3. All three hot paths (find, insert, erase) get converted. No hybrid.
-4. compact_ops templated on suffix type (u8/u16/u32/u64) instead of every BITS value.
-5. Suffix type stored in node header — no `bits_remaining` tracking needed for leaf dispatch in find.
-6. Preserve all existing allocation strategies, dup seeding, skip compression.
+3. compact_ops templated on suffix type (u8/u16/u32/u64) instead of every BITS value.
+4. Suffix type stored in node header — nodes are fully self-describing.
+5. **One bitmask node type** — no split vs fan distinction, no internal_bitmap.
+6. **16-byte header** with plain fields — no bit-packing for skip/prefix.
+7. **u8 skip chunks** — skip up to 6 levels (48 bits), covers all key widths.
+8. Preserve allocation strategies. Below 256 entries: unused slots (no dups). Above 256: spread dups.
 
 ## 2. Naming Conventions
 
 - **Constants, enum values, macros:** ALL_CAPS (e.g., `HEADER_U64`, `COMPACT_MAX`, `SENTINEL_NODE`)
 - **Everything else:** lowercase with underscores (e.g., `find_value`, `node_header`, `branchless_child`)
-- **Class/struct member data:** ends with `_` (e.g., `top_`, `size_`, `alloc_`)
-- **Function names:** do NOT end with `_` (e.g., `keys()`, `vals()`, `main_bm()`)
-- **Data-only structs (return types, POD):** name ends with `_t` (e.g., `insert_result_t`, `erase_result_t`, `child_lookup_t`)
+- **Class/struct member data:** ends with `_` (e.g., `flags_`, `size_`, `alloc_`)
+- **Function names:** do NOT end with `_` (e.g., `keys()`, `vals()`)
+- **Data-only structs (return types, POD):** name ends with `_t` (e.g., `insert_result_t`, `erase_result_t`)
 - **Main class:** `kntrie` (was `kntrie3`)
 - **Namespace:** `gteitelbaum` (was `kn3`) — all implementation types live here
-- **No separate wrapper class.** The old two-class design (public `kntrie` wrapping `kntrie3`) is eliminated.
+- **No separate wrapper class.**
 
 ## 3. Internal Key Representation
 
 ### Type Selection
 ```cpp
-using internal_key_t = std::conditional_t<sizeof(KEY) <= 4, uint32_t, uint64_t>;
-static constexpr int IK_BITS = sizeof(internal_key_t) * 8;  // 32 or 64
+using IK = std::conditional_t<sizeof(KEY) <= 4, uint32_t, uint64_t>;
+static constexpr int IK_BITS = sizeof(IK) * 8;  // 32 or 64
 static constexpr int KEY_BITS = sizeof(KEY) * 8;
 ```
 
 ### Conversion (left-aligned in native type)
 ```cpp
-static constexpr internal_key_t to_internal(KEY k) noexcept {
-    internal_key_t r;
+static constexpr IK to_internal(KEY k) noexcept {
+    IK r;
     if constexpr (sizeof(KEY) == 1)      r = static_cast<uint8_t>(k);
     else if constexpr (sizeof(KEY) == 2) r = static_cast<uint16_t>(k);
     else if constexpr (sizeof(KEY) == 4) r = static_cast<uint32_t>(k);
     else                                 r = static_cast<uint64_t>(k);
-    if constexpr (IS_SIGNED) r ^= internal_key_t{1} << (KEY_BITS - 1);
-    r <<= (IK_BITS - KEY_BITS);  // left-align
+    if constexpr (IS_SIGNED) r ^= IK{1} << (KEY_BITS - 1);
+    r <<= (IK_BITS - KEY_BITS);
     return r;
 }
 ```
 
-Key is **left-aligned** in `internal_key_t`. Top bits consumed first via shift.
-
 ### Bit Extraction (always from top, then shift)
 ```cpp
-uint8_t  ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));   // top 8
-uint16_t pc = static_cast<uint16_t>(ik >> (IK_BITS - 16));  // top 16 (prefix)
+uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
 ik <<= 8;   // consume 8 bits
-ik <<= 16;  // consume 16 bits (skip chunk)
 ```
 
-### Root Index
-```cpp
-uint8_t ri = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-ik <<= 8;
-```
-
-## 4. Node Types
-
-### 4a. Compact Leaf
-- `[header (1 u64)][sorted K[] (aligned)][VST[] (aligned)]`
-- `is_leaf() == true` (bit 15 of top_ is 0)
-- K determined by `suffix_type()` in header (bits 14-13)
-- **Only u16/u32/u64 suffix types.** When ≤8 bits remain, bitmap256 is used instead.
-  - suffix_type 0 (u8) is dead/unused for compact leaves
-  - suffix_type 1 = u16, 2 = u32, 3 = u64
-- Can have skip/prefix for compression
-
-### 4b. Split Node (has is_internal_bitmap)
-- `[header (1 u64)][main_bitmap (4 u64)][is_internal_bitmap (4 u64)][sentinel (1 u64)][children[]]`
-- `is_leaf() == false` (bit 15 = 1)
-- `main_bitmap`: which children exist
-- `is_internal_bitmap`: bit set = child is fan; bit clear = child is leaf (compact or bitmap256)
-- `sentinel`: `children[0]` = SENTINEL_NODE for branchless miss
-- `children[]`: real child pointers at offset 10
-- Size: `10 + n_children` u64s
-- Can have skip/prefix
-
-### 4c. Fan Node (no is_internal_bitmap)
-- `[header (1 u64)][main_bitmap (4 u64)][sentinel (1 u64)][children[]]`
-- `is_leaf() == false` (bit 15 = 1)
-- All children go back to top of loop (compact leaf or split)
-- `sentinel`: `children[0]` = SENTINEL_NODE
-- `children[]`: real child pointers at offset 6
-- Size: `6 + n_children` u64s
-- No skip/prefix (always one level under a split or at root)
-
-### 4d. Bitmap256 Leaf
-- `[header (1 u64)][bitmap256 (4 u64)][VST[] (aligned)]`
-- `is_leaf() == false` (bit 15 = 1) — this is the key insight: bitmap256 uses is_bitmask=1
-- Distinguished from compact leaf by the child's own `is_leaf()` flag
-- Parent's `is_internal_bitmap` says `is_leaf=true` (it's a leaf child, not a fan child)
-- Direct O(1) lookup via popcount
-- 8-bit suffix space
-- Always terminal
-
-### 4e. Root Array
-- `root_[256]` indexed by top 8 bits of internal key
-- Each slot: SENTINEL_NODE, compact_leaf, or fan_node
-
-## 5. Node Type Identification
-
-### Key insight: no extra header bits needed
-
-The type of every node is determined by context + `is_leaf()`:
-
-| Context | `is_leaf()=true` | `is_leaf()=false` |
-|---------|-------------------|---------------------|
-| Root slot | Compact leaf | Fan node |
-| Fan child | Compact leaf | Split node |
-| Split leaf-child (`is_internal_bitmap`=0) | Compact leaf | Bitmap256 leaf |
-| Split internal-child (`is_internal_bitmap`=1) | — (never) | Fan node |
-
-The only "surprising" case: bitmap256 leaves have `is_leaf()=false` (is_bitmask=1 in header). The parent's `is_internal_bitmap` having bit=0 (leaf child) combined with child's `is_leaf()=false` uniquely identifies bitmap256.
-
-### For remove_all / stats
-
-Walk with context:
-- Root children: `is_leaf()` → compact, else fan
-- Fan children: `is_leaf()` → compact, else split
-- Split children: use `is_internal_bitmap`
-  - Leaf children: `child.is_leaf()` → compact, else bitmap256
-  - Internal children: always fan
-
-### For find loop
+## 4. Node Header (16 bytes = 2 u64)
 
 ```
-loop top → hdr.is_leaf() → compact leaf (break)
-         → split node:
-             branchless_top_child → is_leaf from is_internal_bitmap
-               is_leaf=true → read child hdr:
-                   child.is_leaf()=true → compact leaf (break)
-                   child.is_leaf()=false → bitmap256 (break)
-               is_leaf=false → fan node:
-                   branchless_child → next node
-                   back to loop top
+flags_:      uint16_t   [15] is_bitmask  [1:0] suffix_type
+entries_:    uint16_t
+alloc_u64_:  uint16_t
+skip_len_:   uint8_t    (0-6)
+prefix_[6]:  uint8_t    skip prefix bytes (u8 chunks)
+pad_[3]:     uint8_t    reserved
 ```
 
-## 6. Header Layout
-
-```
-top_ (uint16_t):
-  bit 15    = is_bitmask (0=compact leaf, 1=split/fan/bitmap256)
-  bit 14-13 = suffix_type (compact leaf only: 00=reserved/sentinel, 01=u16, 10=u32, 11=u64)
-  bit 12-0  = entries (0-8191)
-
-bottom_ (uint16_t):
-  bit 15-14 = skip (0-2)
-  bit 13-0  = alloc_u64 (0-16383)
-
-prefix_[2] (uint16_t each):
-  skip chunks
-```
-
-COMPACT_MAX = 4096, BOT_LEAF_MAX = 4096 (13-bit entries, unchanged from original).
-
-Sentinel (all zeros): `is_bitmask=0, suffix_type=0, entries=0` → compact leaf, 0 entries → find returns nullptr. suffix_type=0 is unused for real nodes but harmless for sentinel. ✓
+Total: 2+2+2+1+6+3 = 16 bytes. HEADER_U64 = 2.
 
 ```cpp
 struct node_header {
-    uint16_t top_;
-    uint16_t bottom_;
-    uint16_t prefix_[2];
+    uint16_t flags_;       // [15] is_bitmask, [1:0] suffix_type
+    uint16_t entries_;
+    uint16_t alloc_u64_;
+    uint8_t  skip_len_;    // 0-6 for real nodes
+    uint8_t  prefix_[6];   // u8 skip chunks
+    uint8_t  pad_[3];      // reserved
 
-    bool is_leaf() const noexcept { return !(top_ & 0x8000); }
-    void set_bitmask() noexcept { top_ |= 0x8000; }
+    bool is_leaf() const noexcept { return !(flags_ & 0x8000); }
+    void set_bitmask() noexcept { flags_ |= 0x8000; }
 
-    uint8_t suffix_type() const noexcept { return (top_ >> 13) & 0x3; }
-    void set_suffix_type(uint8_t t) noexcept { top_ = (top_ & ~0x6000) | ((t & 0x3) << 13); }
+    uint8_t suffix_type() const noexcept { return flags_ & 0x3; }
+    void set_suffix_type(uint8_t t) noexcept { flags_ = (flags_ & ~0x3) | (t & 0x3); }
 
-    uint16_t entries() const noexcept { return top_ & 0x1FFF; }
-    void set_entries(uint16_t n) noexcept { top_ = (top_ & 0xE000) | (n & 0x1FFF); }
+    uint16_t entries() const noexcept { return entries_; }
+    void set_entries(uint16_t n) noexcept { entries_ = n; }
 
-    uint16_t alloc_u64() const noexcept { return bottom_ & 0x3FFF; }
-    void set_alloc_u64(uint16_t n) noexcept { bottom_ = (bottom_ & 0xC000) | (n & 0x3FFF); }
+    uint16_t alloc_u64() const noexcept { return alloc_u64_; }
+    void set_alloc_u64(uint16_t n) noexcept { alloc_u64_ = n; }
 
-    uint8_t skip() const noexcept { return static_cast<uint8_t>(bottom_ >> 14); }
-    void set_skip(uint8_t s) noexcept { bottom_ = (bottom_ & 0x3FFF) | (uint16_t(s & 0x3) << 14); }
+    uint8_t skip() const noexcept { return skip_len_; }
+    void set_skip(uint8_t s) noexcept { skip_len_ = s; }
 
-    prefix_t prefix() const noexcept { return {prefix_[0], prefix_[1]}; }
-    void set_prefix(prefix_t p) noexcept { prefix_[0] = p[0]; prefix_[1] = p[1]; }
+    const uint8_t* prefix_bytes() const noexcept { return prefix_; }
+    void set_prefix(const uint8_t* p, uint8_t len) noexcept {
+        for (uint8_t i = 0; i < len; ++i) prefix_[i] = p[i];
+    }
 };
+static_assert(sizeof(node_header) == 16);
 ```
 
-Suffix type in header is set during `compact_ops::make_leaf`. Only meaningful for compact leaves.
+### Suffix type encoding
 
-## 7. Loop-Based Find
+| suffix_type | K type   | Used by        |
+|-------------|----------|----------------|
+| 0           | uint8_t  | Bitmap256 leaf |
+| 1           | uint16_t | Compact leaf   |
+| 2           | uint32_t | Compact leaf   |
+| 3           | uint64_t | Compact leaf   |
+
+### Sentinel
+
+Must be large enough for branchless_child to safely read bitmap at `node + 2`.
+Minimum: header(2) + bitmap(4) = 6 u64s.
+
+```cpp
+alignas(64) inline constinit uint64_t SENTINEL_NODE[6] = {};
+```
+
+Zeroed: is_bitmask=0, suffix_type=0, entries=0, bitmap all zeros.
+- As leaf: is_leaf()=true, suffix_type=0 → bitmap_find with empty bitmap → nullptr. ✓
+- As branchless miss target: bitmap all zeros → FAST_EXIT returns -1. ✓
+
+### Skip capacity
+
+| Key type  | Max levels after root | Max skip needed | Fits in prefix_[6]? |
+|-----------|-----------------------|-----------------|----------------------|
+| uint16_t  | 1                     | 0               | ✓                    |
+| int32_t   | 3                     | 2               | ✓                    |
+| uint64_t  | 7                     | 6               | ✓                    |
+
+## 5. Node Types
+
+### 5a. Compact Leaf (is_leaf=true, suffix_type=1/2/3)
+- `[header (2 u64)][sorted K[] (aligned)][VST[] (aligned)]`
+- K determined by suffix_type: 1=u16, 2=u32, 3=u64
+- Can have skip/prefix
+- Dup seeding for in-place insert/erase (unchanged)
+
+### 5b. Bitmask Node (is_leaf=false)
+- `[header (2 u64)][bitmap256 (4 u64)][sentinel (1 u64)][children[]]`
+- bitmap256: which children exist (up to 256)
+- sentinel: slot 0 = SENTINEL_NODE for branchless miss
+- children[]: real child pointers in bitmap order
+- Size: `7 + n_children` u64s
+- **No internal_bitmap.** Every child is self-describing via its own header.
+- **branchless_child returns just a pointer.** Caller reads child header.
+- Can have skip/prefix
+
+### 5c. Bitmap256 Leaf (is_leaf=true, suffix_type=0)
+- `[header (2 u64)][bitmap256 (4 u64)][VST[] (aligned)]`
+- 8-bit suffix space, O(1) lookup via popcount
+- Always terminal
+- Size: `6 + ceil(n_entries * sizeof(VST) / 8)` u64s
+
+### 5d. Root Array
+- `root_[256]` indexed by top 8 bits of internal key
+- Each slot: SENTINEL_NODE or any self-describing node
+
+## 6. Node Type Identification
+
+**Every node is self-describing from its own header alone.**
+
+| `is_leaf()` | `suffix_type()` | Node type        |
+|-------------|-----------------|------------------|
+| true        | 0               | Bitmap256 leaf   |
+| true        | 1               | Compact leaf u16 |
+| true        | 2               | Compact leaf u32 |
+| true        | 3               | Compact leaf u64 |
+| false       | —               | Bitmask node     |
+
+No parent context needed. Eliminates split/fan/bot-leaf distinction entirely.
+
+## 7. Trie Structure (u8 stride at every level)
+
+### u64 key (IK_BITS = 64)
+
+```
+root_[ri]   consumes 8 bits  → 56 remaining
+level 1     bitmask or leaf  → 48 remaining
+level 2     bitmask or leaf  → 40 remaining
+level 3     bitmask or leaf  → 32 remaining
+level 4     bitmask or leaf  → 24 remaining
+level 5     bitmask or leaf  → 16 remaining
+level 6     bitmask or leaf  → 8 remaining
+level 7     bitmap256 leaf   → 0 remaining
+```
+
+Compact leaves can appear at any level:
+- 48-56 bits → u64 (type 3)
+- 24-32 bits → u32 (type 2)
+- 16 bits    → u16 (type 1)
+- 8 bits     → bitmap256 (type 0)
+
+### i32 key (IK_BITS = 32)
+
+```
+root_[ri]   consumes 8 bits  → 24 remaining
+level 1     bitmask or leaf  → 16 remaining
+level 2     bitmask or leaf  → 8 remaining
+level 3     bitmap256 leaf   → 0 remaining
+```
+
+Compact leaves: 24 → u32, 16 → u16, 8 → bitmap256.
+
+## 8. Loop-Based Find
 
 ```cpp
 const VALUE* find_value(const KEY& key) const noexcept {
-    internal_key_t ik = key_ops::to_internal(key);
+    IK ik = KO::to_internal(key);
     uint8_t ri = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-    ik <<= 8;
+    ik <<= 8;  // consume root byte
 
     const uint64_t* node = root_[ri];
     node_header hdr = *get_header(node);
 
-    // Root: compact leaf → handle immediately
-    if (hdr.is_leaf()) [[unlikely]]
-        return compact_find(node, hdr, ik);
+    // First node after root never has skip — jump past skip check
+    goto noskip;
 
-    // Root is fan: descend one level
-    node = fan_ops::branchless_child(node, static_cast<uint8_t>(ik >> (IK_BITS - 8)));
-    ik <<= 8;
-    hdr = *get_header(node);
-
-    // Main descent loop
-    bool child_leaf = false;
     while (true) {
-        // Handle skip/prefix
-        if (hdr.skip()) [[unlikely]] {
-            prefix_t actual = hdr.prefix();
-            int skip = hdr.skip();
-            for (int i = 0; i < skip; ++i) {
-                uint16_t expected = static_cast<uint16_t>(ik >> (IK_BITS - 16));
-                if (expected != actual[i]) [[unlikely]] return nullptr;
-                ik <<= 16;
+        // Skip/prefix (u8 chunks) — ik already shifted past parent's byte
+        {
+            uint8_t skip = hdr.skip();
+            if (skip) [[unlikely]] {
+                const uint8_t* actual = hdr.prefix_bytes();
+                for (uint8_t i = 0; i < skip; ++i) {
+                    uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+                    if (expected != actual[i]) [[unlikely]] return nullptr;
+                    ik <<= 8;
+                }
             }
         }
 
-        // Compact leaf: exit (only reached once — termination)
-        if (hdr.is_leaf()) [[unlikely]] break;
+    noskip:
+        if (hdr.is_leaf()) break;
 
-        // Split node: top child + leaf check
+        // Bitmask node: extract next byte, descend
         uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        ik <<= 8;
-        auto [child, is_leaf] = split_ops::branchless_top_child(node, ti);
-        node = child;
-        hdr = *get_header(node);
-
-        if (is_leaf) [[unlikely]] {
-            child_leaf = true;
-            break;
-        }
-
-        // Child is fan: consume 8 more bits
-        node = fan_ops::branchless_child(node, static_cast<uint8_t>(ik >> (IK_BITS - 8)));
-        ik <<= 8;
+        ik <<= 8;  // consume this byte
+        node = BO::branchless_child(node, ti);
         hdr = *get_header(node);
     }
 
-    // Split's leaf children are always bitmap256
-    if (child_leaf)
-        return bitmap256_find(node, static_cast<uint8_t>(ik >> (IK_BITS - 8)));
+    // Leaf dispatch — suffix_type tells us width
+    // ik has been shifted so remaining suffix is at the top
+    uint8_t st = hdr.suffix_type();
 
-    // Exited via is_leaf() at top of loop: always compact
-    return compact_find(node, hdr, ik);
+    if (st == 0)
+        return BO::bitmap_find(node, hdr,
+            static_cast<uint8_t>(ik >> (IK_BITS - 8)));
+
+    if constexpr (KEY_BITS > 16) {
+        if (st & 0b10) {
+            if constexpr (KEY_BITS > 32) {
+                if (st & 0b01)
+                    return CO64::find(node, hdr,
+                        static_cast<uint64_t>(ik));
+            }
+            return CO32::find(node, hdr,
+                static_cast<uint32_t>(ik >> (IK_BITS - 32)));
+        }
+    }
+
+    return CO16::find(node, hdr,
+        static_cast<uint16_t>(ik >> (IK_BITS - 16)));
 }
 ```
 
-### split_ops::branchless_top_child
+**ik shifting convention:** `ik` is always shifted so the next byte to process
+is at position `(IK_BITS - 8)`. Each skip byte or bitmask descent shifts ik
+left by 8. The root caller shifts once for ri. Find doesn't track `bits`
+explicitly — suffix_type encodes the width.
 
-```cpp
-struct top_child_result_t {
-    const uint64_t* child;
-    bool is_leaf;
-};
+For insert/erase, `bits` tracks remaining bits alongside ik shifts.
 
-static top_child_result_t branchless_top_child(const uint64_t* node, uint8_t ti) noexcept {
-    const bitmap256& tbm = main_bm(node);
-    int slot = tbm.find_slot<BRANCHLESS>(ti);
-    auto* child = reinterpret_cast<const uint64_t*>(real_children(node)[slot]);
-    bool is_leaf = !internal_bm(node).has_bit(ti);
-    return {child, is_leaf};
-}
+## 9. Bitmask Node Layout
+
+```
+[header: 2 u64][bitmap256: 4 u64][sentinel: 1 u64][children: n u64]
 ```
 
-On miss (bit not set): slot=0 → sentinel. `is_leaf` from `internal_bm` is arbitrary. If `is_leaf=true`: break, `hdr.is_leaf()` on sentinel = true (zeroed) → compact_find returns nullptr. If `is_leaf=false`: fan branchless_child on sentinel → sentinel → zeroed header → `is_leaf()=true` → compact_find returns nullptr. Both paths safe.
+Offsets: bitmap at +2, sentinel at +6, real children at +7.
+Size: `7 + n_children` u64s.
 
-### fan_ops::branchless_child
-
+### branchless_child
 ```cpp
-static const uint64_t* branchless_child(const uint64_t* node, uint8_t bi) noexcept {
-    const bitmap256& bm = main_bm(node);
-    int slot = bm.find_slot<BRANCHLESS>(bi);
+static const uint64_t* branchless_child(const uint64_t* node, uint8_t idx) noexcept {
+    const bitmap256& bm = *reinterpret_cast<const bitmap256*>(node + 2);
+    int slot = bm.find_slot<BRANCHLESS>(idx);  // 0 on miss → sentinel
     return reinterpret_cast<const uint64_t*>(children(node)[slot]);
 }
+
+static uint64_t* children(uint64_t* node) { return node + 6; }       // includes sentinel
+static uint64_t* real_children(uint64_t* node) { return node + 7; }  // past sentinel
 ```
 
-### compact_find
+### Operations
+- **lookup(node, idx):** FAST_EXIT → {child, slot, found}
+- **branchless_child(node, idx):** BRANCHLESS → child ptr (sentinel on miss)
+- **add_child(node, idx, child_ptr, alloc):** in-place or realloc
+- **remove_child(node, slot, idx, alloc):** in-place or realloc
+- **make(indices, ptrs, count, skip, prefix, alloc):** create from arrays
+- **for_each_child(node, cb):** iterate → cb(idx, slot, child_ptr)
+- **dealloc(node, alloc):** free node only
 
-```cpp
-// Nested bit tests: u16 is most common (fallthrough), u32/u64 behind one branch.
-const VALUE* compact_find(const uint64_t* node, node_header hdr,
-                           internal_key_t ik) const noexcept {
-    uint8_t st = hdr.suffix_type();
-    if (st & 0b10) {
-        if (st & 0b01)
-            return compact_ops::find<uint64_t>(node, hdr, static_cast<uint64_t>(ik));
-        else
-            return compact_ops::find<uint32_t>(node, hdr,
-                       static_cast<uint32_t>(ik >> (IK_BITS - 32)));
-    }
-    return compact_ops::find<uint16_t>(node, hdr,
-               static_cast<uint16_t>(ik >> (IK_BITS - 16)));
-}
+## 10. Bitmap256 Leaf Layout
+
+```
+[header: 2 u64][bitmap256: 4 u64][values: ceil(n * sizeof(VST) / 8) u64]
 ```
 
-### bitmap256_find
+Offsets: bitmap at +2, values at +6.
+Size: `6 + ceil(n * sizeof(VST) / 8)` u64s.
+
+is_leaf()=true, suffix_type()=0. Self-describing.
+
+### Operations
+- **bitmap_find(node, hdr, suffix_u8):** bitmap FAST_EXIT → value slot
+- **bitmap_insert(node, suffix_u8, value, alloc):** in-place or realloc
+- **bitmap_erase(node, suffix_u8, alloc):** in-place or realloc
+- **make_bitmap_leaf(sorted_suffixes, values, count, alloc):** from arrays
+- **for_each_bitmap(node, cb):** iterate → cb(suffix_u8, value_slot)
+- **bitmap_destroy_and_dealloc(node, alloc):** destroy values + free
+
+## 11. Compact Leaf (unchanged except HEADER_U64=2)
+
+Layout: `[header: 2 u64][sorted K[] (8-aligned)][VST[] (8-aligned)]`
+
+Operations templated on K (u16/u32/u64):
+- **find<K>(node, hdr, suffix):** jump_search → value
+- **insert<K>(node, hdr, suffix, value, alloc):** use unused slot or realloc
+- **erase<K>(node, hdr, suffix, alloc):** shift left or realloc
+- **make_leaf<K>(keys, vals, count, skip, prefix, alloc):** from sorted arrays
+- **for_each<K>(node, hdr, cb):** iterate over entries (entries count only)
+- **destroy_and_dealloc<K>(node, alloc):** destroy values + free
+
+### Slot strategy
+
+`total_slots` = max entries that fit in `alloc_u64`. `entries` = actual count.
+`unused = total_slots - entries`.
+
+**Below 256 entries:** Unused slots are simply empty (no dups, no tombstones).
+Insert: `memmove` right into unused tail, write at insertion point.
+Erase: `memmove` left, decrement entries.
+When no unused slots available: realloc to next size class.
+
+**Above 256 entries:** Spread dups evenly (as current design).
+Bounds shift distance to O(n/dups). Insert consumes a dup. Erase creates a dup.
+
+## 12. Insert (Runtime Recursion)
+
+Find uses a loop (hot path). Insert and erase use runtime recursion — max depth
+is 8 for u64, 4 for i32. The call stack gives natural parent propagation: callee
+returns new pointer, caller updates its child slot. No parent_slot gymnastics.
 
 ```cpp
-const VALUE* bitmap256_find(const uint64_t* node, uint8_t suffix) const noexcept {
-    const bitmap256& bm = main_bm(node);  // bitmap at same offset as bitmask nodes
-    int slot = bm.find_slot<FAST_EXIT>(suffix);
-    if (slot < 0) [[unlikely]] return nullptr;
-    return value_traits::as_ptr(bitmap_leaf_vals(node)[slot]);
-}
-```
-
-## 8. Loop-Based Insert
-
-### Descent Stack
-
-```cpp
-enum class parent_type : uint8_t { ROOT, SPLIT, FAN };
-
-struct descent_entry_t {
-    uint64_t*   node;
-    parent_type type;
-    uint8_t     index;
-    int16_t     slot;
-};
-
-static constexpr int MAX_DEPTH = 10;
-```
-
-### bits tracking
-
-Insert/erase need `bits` for creating new leaves with correct suffix type:
-```cpp
-int bits = KEY_BITS - 8;
-// each ik <<= 8:  bits -= 8
-// each ik <<= 16: bits -= 16
-```
-
-### Suffix type helpers
-
-```cpp
-// Only for compact leaves. bits <= 8 uses bitmap256 instead.
-static uint8_t suffix_type_for(int bits) noexcept {
-    if (bits <= 16) return 1;  // u16
-    if (bits <= 32) return 2;  // u32
-    return 3;                  // u64
-}
-
-// Dispatch compact leaf operations. Only 3 types (no u8).
-template<typename Fn>
-static auto dispatch_suffix(uint8_t stype, Fn&& fn) {
-    if (stype & 0b10) {
-        if (stype & 0b01) return fn(uint64_t{});
-        else              return fn(uint32_t{});
-    }
-    return fn(uint16_t{});
-}
-```
-
-### Algorithm
-
-```cpp
-template<bool INSERT, bool ASSIGN>
-std::pair<bool, bool> insert_impl(const KEY& key, const VALUE& value) {
-    internal_key_t ik = key_ops::to_internal(key);
-    vst sv = value_traits::store(value, alloc_);
+std::pair<bool, bool> insert(const KEY& key, const VALUE& value) {
+    IK ik = KO::to_internal(key);
+    VST sv = VT::store(value, alloc_);
     uint8_t ri = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-    ik <<= 8;
-    int bits = KEY_BITS - 8;
+    ik <<= 8;  // consume root byte
 
     uint64_t* node = root_[ri];
-
-    // Empty root slot
     if (node == SENTINEL_NODE) {
-        if constexpr (!INSERT) { value_traits::destroy(sv, alloc_); return {true, false}; }
-        root_[ri] = make_single_leaf(ik, sv, bits);
+        root_[ri] = make_single_leaf(ik, sv, KEY_BITS - 8);
         ++size_;
         return {true, true};
     }
 
-    descent_entry_t stack[MAX_DEPTH];
-    int depth = 0;
-    node_header* hdr = get_header(node);
+    auto [new_node, inserted] = insert_node(node, ik, sv, KEY_BITS - 8);
+    if (new_node != node) root_[ri] = new_node;
+    if (inserted) { ++size_; return {true, true}; }
+    VT::destroy(sv, alloc_);
+    return {true, false};
+}
+```
 
-    // Root compact leaf
+### insert_node (recursive)
+
+```cpp
+// ik: shifted so next byte to process is at (IK_BITS - 8)
+// bits: how many bits of key remain at this node's level
+insert_result_t insert_node(uint64_t* node, IK ik, VST value, int bits) {
+    auto* hdr = get_header(node);
+
+    // Skip check
+    uint8_t skip = hdr->skip();
+    if (skip) [[unlikely]] {
+        const uint8_t* actual = hdr->prefix_bytes();
+        for (uint8_t i = 0; i < skip; ++i) {
+            uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+            if (expected != actual[i]) {
+                // Mismatch → split_on_prefix
+                return {split_on_prefix(node, hdr, ik, value,
+                                         actual, skip, i, bits), true};
+            }
+            ik <<= 8;
+            bits -= 8;
+        }
+    }
+
     if (hdr->is_leaf()) {
-        auto r = compact_insert<INSERT, ASSIGN>(node, hdr, ik, sv);
-        if (r.needs_split) {
-            if constexpr (!INSERT) { value_traits::destroy(sv, alloc_); return {true, false}; }
-            root_[ri] = convert_to_split(node, hdr, ik, sv, bits);
-            ++size_;
-            return {true, true};
+        auto result = leaf_insert(node, hdr, ik, value, bits);
+        if (result.needs_split) {
+            return {convert_to_bitmask(node, hdr, ik, value, bits), true};
         }
-        root_[ri] = r.node;
-        if (r.inserted) { ++size_; return {true, true}; }
-        value_traits::destroy(sv, alloc_);
-        return {true, false};
+        return {result.node, result.inserted};
     }
 
-    // Root is fan: descend
-    uint8_t bi = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-    auto blk = fan_ops::lookup_child(node, bi);
-    if (!blk.found) {
-        if constexpr (!INSERT) { value_traits::destroy(sv, alloc_); return {true, false}; }
-        ik <<= 8; bits -= 8;
-        auto* leaf = make_single_leaf(ik, sv, bits);
-        auto* new_fan = fan_ops::add_child(node, bi, leaf, alloc_);
-        if (new_fan != node) root_[ri] = new_fan;
-        ++size_;
-        return {true, true};
+    // Bitmask node: extract next byte, descend
+    uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+    auto [child, slot, found] = BO::lookup(node, ti);
+
+    if (!found) {
+        auto* leaf = make_single_leaf(ik << 8, value, bits - 8);
+        auto* nn = BO::add_child(node, hdr, ti, leaf, alloc_);
+        return {nn, true};
     }
-    stack[depth++] = {node, parent_type::FAN, bi, static_cast<int16_t>(blk.slot)};
-    ik <<= 8; bits -= 8;
-    node = blk.child;
-    hdr = get_header(node);
 
-    // Main descent loop
-    while (true) {
-        // Handle skip/prefix
-        int skip = hdr->skip();
-        if (skip > 0) {
-            prefix_t actual = hdr->prefix();
-            for (int i = 0; i < skip; ++i) {
-                uint16_t expected = static_cast<uint16_t>(ik >> (IK_BITS - 16));
-                if (expected != actual[i]) {
-                    if constexpr (!INSERT) { value_traits::destroy(sv, alloc_); return {true, false}; }
-                    auto* nn = split_on_prefix(node, hdr, ik, sv, bits, i, expected, actual);
-                    propagate(stack, depth, nn, node);
-                    ++size_;
-                    return {true, true};
-                }
-                ik <<= 16; bits -= 16;
-            }
-        }
-
-        // Compact leaf: insert here
-        if (hdr->is_leaf()) {
-            auto r = compact_insert<INSERT, ASSIGN>(node, hdr, ik, sv);
-            if (r.needs_split) {
-                if constexpr (!INSERT) { value_traits::destroy(sv, alloc_); return {true, false}; }
-                auto* nn = convert_to_split(node, hdr, ik, sv, bits);
-                propagate(stack, depth, nn, node);
-                ++size_;
-                return {true, true};
-            }
-            if (r.node != node) propagate(stack, depth, r.node, node);
-            if (r.inserted) { ++size_; return {true, true}; }
-            value_traits::destroy(sv, alloc_);
-            return {true, false};
-        }
-
-        // Split node: lookup top child
-        uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        auto lk = split_ops::lookup_child(node, ti);
-
-        if (!lk.found) {
-            if constexpr (!INSERT) { value_traits::destroy(sv, alloc_); return {true, false}; }
-            ik <<= 8; bits -= 8;
-            auto* leaf = make_single_bot_leaf(ik, sv, bits);
-            auto* nn = split_ops::add_child_as_leaf(node, ti, leaf, alloc_);
-            if (nn != node) propagate(stack, depth, nn, node);
-            ++size_;
-            return {true, true};
-        }
-
-        bool child_is_leaf = !split_ops::is_internal(node, ti);
-
-        if (child_is_leaf) {
-            ik <<= 8; bits -= 8;
-            auto r = bot_leaf_insert<INSERT, ASSIGN>(lk.child, ik, sv);
-            if (r.needs_split) {
-                if constexpr (!INSERT) { value_traits::destroy(sv, alloc_); return {true, false}; }
-                convert_bot_leaf_to_fan(node, ti, lk.slot, lk.child, ik, sv, bits);
-                ++size_;
-                return {true, true};
-            }
-            if (r.node != lk.child)
-                split_ops::set_child(node, lk.slot, r.node);
-            if (r.inserted) { ++size_; return {true, true}; }
-            value_traits::destroy(sv, alloc_);
-            return {true, false};
-        }
-
-        // Child is fan: descend
-        ik <<= 8; bits -= 8;
-        stack[depth++] = {node, parent_type::SPLIT, ti, static_cast<int16_t>(lk.slot)};
-        uint64_t* fan = lk.child;
-
-        bi = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        auto blk2 = fan_ops::lookup_child(fan, bi);
-
-        if (!blk2.found) {
-            if constexpr (!INSERT) { value_traits::destroy(sv, alloc_); return {true, false}; }
-            ik <<= 8; bits -= 8;
-            auto* leaf = make_single_leaf(ik, sv, bits);
-            auto* new_fan = fan_ops::add_child(fan, bi, leaf, alloc_);
-            if (new_fan != fan) split_ops::set_child(node, lk.slot, new_fan);
-            ++size_;
-            return {true, true};
-        }
-
-        stack[depth++] = {fan, parent_type::FAN, bi, static_cast<int16_t>(blk2.slot)};
-        ik <<= 8; bits -= 8;
-        node = blk2.child;
-        hdr = get_header(node);
-    }
+    // Recurse into child (shift ik past this byte)
+    auto [new_child, inserted] = insert_node(child, ik << 8, value, bits - 8);
+    if (new_child != child)
+        BO::set_child(node, slot, new_child);
+    return {node, inserted};
 }
 ```
 
-### Pointer Propagation
+Callee returns updated pointer; caller writes it into parent's child slot.
+Natural call-stack propagation — no frame array needed.
 
-```cpp
-void propagate(descent_entry_t* stack, int depth, uint64_t* new_node, uint64_t* old_node) {
-    if (new_node == old_node) return;
-    if (depth == 0) {
-        root_[stack[0].index] = new_node;
-        return;
-    }
-    auto& parent = stack[depth - 1];
-    switch (parent.type) {
-        case parent_type::ROOT:
-            root_[parent.index] = new_node; break;
-        case parent_type::SPLIT:
-            split_ops::set_child(parent.node, parent.slot, new_node); break;
-        case parent_type::FAN:
-            fan_ops::set_child(parent.node, parent.slot, new_node); break;
-    }
-}
-```
-
-### compact_insert dispatch
-
-```cpp
-// Same nested bit test pattern as compact_find. No u8 — only u16/u32/u64.
-template<bool INSERT, bool ASSIGN>
-compact_insert_result_t compact_insert(uint64_t* node, node_header* hdr,
-                                        internal_key_t ik, vst value) {
-    uint8_t st = hdr->suffix_type();
-    if (st & 0b10) {
-        if (st & 0b01)
-            return compact_ops::insert<uint64_t, INSERT, ASSIGN>(
-                node, hdr, static_cast<uint64_t>(ik), value, alloc_);
-        else
-            return compact_ops::insert<uint32_t, INSERT, ASSIGN>(
-                node, hdr, static_cast<uint32_t>(ik >> (IK_BITS - 32)), value, alloc_);
-    }
-    return compact_ops::insert<uint16_t, INSERT, ASSIGN>(
-        node, hdr, static_cast<uint16_t>(ik >> (IK_BITS - 16)), value, alloc_);
-}
-```
-
-### bot_leaf_insert dispatch
-
-Bot-leaf under a split is bitmap256 or compact. Bitmap256 never overflows
-(max 256 entries), so `needs_split` is only possible from compact leaves.
-```cpp
-template<bool INSERT, bool ASSIGN>
-compact_insert_result_t bot_leaf_insert(uint64_t* bot, internal_key_t ik,
-                                         vst value) {
-    auto* bh = get_header(bot);
-    if (!bh->is_leaf()) {
-        // Bitmap256 leaf — never overflows
-        auto r = bitmap_leaf_ops::insert<INSERT, ASSIGN>(
-            bot, static_cast<uint8_t>(ik >> (IK_BITS - 8)), value, alloc_);
-        return {r.node, r.inserted, false};  // needs_split always false
-    }
-    // Compact leaf — can trigger needs_split at COMPACT_MAX
-    return compact_insert<INSERT, ASSIGN>(bot, bh, ik, value);
-}
-```
-
-## 9. Loop-Based Erase
-
-Same descent structure as insert.
+## 13. Erase (Runtime Recursion)
 
 ```cpp
 bool erase(const KEY& key) {
-    internal_key_t ik = key_ops::to_internal(key);
+    IK ik = KO::to_internal(key);
     uint8_t ri = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-    ik <<= 8;
-    int bits = KEY_BITS - 8;
+    ik <<= 8;  // consume root byte
 
     uint64_t* node = root_[ri];
     if (node == SENTINEL_NODE) return false;
 
-    descent_entry_t stack[MAX_DEPTH];
-    int depth = 0;
-    node_header* hdr = get_header(node);
+    auto [new_node, erased] = erase_node(node, ik, KEY_BITS - 8);
+    if (!erased) return false;
 
-    // Root compact leaf
-    if (hdr->is_leaf()) {
-        auto r = compact_erase(node, hdr, ik);
-        if (!r.erased) return false;
-        root_[ri] = r.node ? r.node : SENTINEL_NODE;
-        --size_;
-        return true;
-    }
-
-    // Root is fan: descend
-    uint8_t bi = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-    auto blk = fan_ops::lookup_child(node, bi);
-    if (!blk.found) return false;
-    stack[depth++] = {node, parent_type::FAN, bi, static_cast<int16_t>(blk.slot)};
-    ik <<= 8; bits -= 8;
-    node = blk.child;
-    hdr = get_header(node);
-
-    // Main descent loop
-    while (true) {
-        int skip = hdr->skip();
-        if (skip > 0) {
-            prefix_t actual = hdr->prefix();
-            for (int i = 0; i < skip; ++i) {
-                uint16_t expected = static_cast<uint16_t>(ik >> (IK_BITS - 16));
-                if (expected != actual[i]) return false;
-                ik <<= 16; bits -= 16;
-            }
-        }
-
-        if (hdr->is_leaf()) {
-            auto r = compact_erase(node, hdr, ik);
-            if (!r.erased) return false;
-            if (r.node) {
-                if (r.node != node) propagate(stack, depth, r.node, node);
-            } else {
-                remove_from_parent(stack, depth);
-            }
-            --size_;
-            return true;
-        }
-
-        // Split node
-        uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        auto lk = split_ops::lookup_child(node, ti);
-        if (!lk.found) return false;
-
-        bool child_is_leaf = !split_ops::is_internal(node, ti);
-
-        if (child_is_leaf) {
-            ik <<= 8; bits -= 8;
-            auto r = bot_leaf_erase(lk.child, ik);
-            if (!r.erased) return false;
-            if (r.node) {
-                if (r.node != lk.child)
-                    split_ops::set_child(node, lk.slot, r.node);
-            } else {
-                auto* nn = split_ops::remove_child(node, lk.slot, ti, alloc_);
-                if (!nn) {
-                    remove_from_parent(stack, depth);
-                } else if (nn != node) {
-                    propagate(stack, depth, nn, node);
-                }
-            }
-            --size_;
-            return true;
-        }
-
-        // Fan child: descend
-        ik <<= 8; bits -= 8;
-        stack[depth++] = {node, parent_type::SPLIT, ti, static_cast<int16_t>(lk.slot)};
-        uint64_t* fan = lk.child;
-
-        bi = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        auto blk2 = fan_ops::lookup_child(fan, bi);
-        if (!blk2.found) return false;
-
-        stack[depth++] = {fan, parent_type::FAN, bi, static_cast<int16_t>(blk2.slot)};
-        ik <<= 8; bits -= 8;
-        node = blk2.child;
-        hdr = get_header(node);
-    }
+    root_[ri] = new_node ? new_node : SENTINEL_NODE;
+    --size_;
+    return true;
 }
 ```
 
-### compact_erase dispatch
+### erase_node (recursive)
 
 ```cpp
-// Same nested bit test pattern. No u8.
-erase_result_t compact_erase(uint64_t* node, node_header* hdr, internal_key_t ik) {
-    uint8_t st = hdr->suffix_type();
-    if (st & 0b10) {
-        if (st & 0b01)
-            return compact_ops::erase<uint64_t>(node, hdr, static_cast<uint64_t>(ik), alloc_);
-        else
-            return compact_ops::erase<uint32_t>(node, hdr,
-                       static_cast<uint32_t>(ik >> (IK_BITS - 32)), alloc_);
-    }
-    return compact_ops::erase<uint16_t>(node, hdr,
-               static_cast<uint16_t>(ik >> (IK_BITS - 16)), alloc_);
-}
-```
+// ik: shifted so next byte to process is at (IK_BITS - 8)
+// bits: how many bits of key remain at this node's level
+erase_result_t erase_node(uint64_t* node, IK ik, int bits) {
+    auto* hdr = get_header(node);
 
-### bot_leaf_erase dispatch
-
-```cpp
-erase_result_t bot_leaf_erase(uint64_t* bot, internal_key_t ik) {
-    auto* bh = get_header(bot);
-    if (!bh->is_leaf()) {
-        // Bitmap256 leaf
-        return bitmap_leaf_ops::erase(bot, static_cast<uint8_t>(ik >> (IK_BITS - 8)), alloc_);
-    }
-    return compact_erase(bot, bh, ik);
-}
-```
-
-### remove_from_parent
-
-```cpp
-void remove_from_parent(descent_entry_t* stack, int depth) {
-    while (depth > 0) {
-        auto& entry = stack[depth - 1];
-        if (entry.type == parent_type::ROOT) {
-            root_[entry.index] = SENTINEL_NODE;
-            return;
+    // Skip check
+    uint8_t skip = hdr->skip();
+    if (skip) [[unlikely]] {
+        const uint8_t* actual = hdr->prefix_bytes();
+        for (uint8_t i = 0; i < skip; ++i) {
+            uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+            if (expected != actual[i]) return {node, false};
+            ik <<= 8;
+            bits -= 8;
         }
-
-        uint64_t* parent = entry.node;
-        int cc;
-        uint64_t* nn;
-
-        if (entry.type == parent_type::SPLIT) {
-            cc = split_ops::child_count(parent);
-            if (cc > 1) {
-                nn = split_ops::remove_child(parent, entry.slot, entry.index, alloc_);
-                if (nn != parent) propagate(stack, depth - 1, nn, parent);
-                return;
-            }
-            split_ops::dealloc(parent, alloc_);
-        } else {
-            cc = fan_ops::child_count(parent);
-            if (cc > 1) {
-                nn = fan_ops::remove_child(parent, entry.slot, entry.index, alloc_);
-                if (nn != parent) propagate(stack, depth - 1, nn, parent);
-                return;
-            }
-            fan_ops::dealloc(parent, alloc_);
-        }
-        depth--;
     }
-    root_[stack[0].index] = SENTINEL_NODE;
+
+    if (hdr->is_leaf())
+        return leaf_erase(node, hdr, ik);
+
+    // Bitmask node: extract next byte, descend
+    uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+    auto [child, slot, found] = BO::lookup(node, ti);
+    if (!found) return {node, false};
+
+    // Recurse into child (shift ik past this byte)
+    auto [new_child, erased] = erase_node(child, ik << 8, bits - 8);
+    if (!erased) return {node, false};
+
+    if (new_child) {
+        // Child still exists — update pointer
+        if (new_child != child)
+            BO::set_child(node, slot, new_child);
+        return {node, true};
+    }
+
+    // Child fully erased — remove from bitmask
+    auto* nn = BO::remove_child(node, hdr, slot, ti, alloc_);
+    // nn is nullptr if bitmask is now empty → cascades up naturally
+    return {nn, true};
 }
 ```
 
-## 10. split_ops
-
-### Layout
-```
-[header (1 u64)]              offset 0
-[main_bitmap (4 u64)]         offset 1
-[is_internal_bitmap (4 u64)]  offset 5
-[sentinel (1 u64)]            offset 9
-[children[]]                  offset 10
-```
-
-Size: `10 + n_children` u64s.
-
-### API
-```cpp
-template<typename KEY, typename VALUE, typename ALLOC>
-struct split_ops {
-    struct child_lookup_t { uint64_t* child; int slot; bool found; };
-    static child_lookup_t lookup_child(const uint64_t* node, uint8_t index) noexcept;
-
-    struct top_child_result_t { const uint64_t* child; bool is_leaf; };
-    static top_child_result_t branchless_top_child(const uint64_t* node, uint8_t ti) noexcept;
-
-    static bool is_internal(const uint64_t* node, uint8_t index) noexcept;
-    static int child_count(const uint64_t* node) noexcept;
-
-    static void set_child(uint64_t* node, int slot, uint64_t* child) noexcept;
-    static uint64_t* add_child_as_leaf(uint64_t* node, uint8_t index, uint64_t* child, ALLOC& alloc);
-    static uint64_t* add_child_as_internal(uint64_t* node, uint8_t index, uint64_t* child, ALLOC& alloc);
-    static uint64_t* remove_child(uint64_t* node, int slot, uint8_t index, ALLOC& alloc);
-    static void mark_internal(uint64_t* node, uint8_t index) noexcept;
-
-    static uint64_t* make_split(const uint8_t* indices, uint64_t* const* children,
-                                 const bool* is_internal_flags, int n_children,
-                                 uint8_t skip, prefix_t prefix, ALLOC& alloc);
-
-    template<typename Fn>
-    static void for_each_child(const uint64_t* node, Fn&& cb);
-    // cb(uint8_t index, int slot, uint64_t* child, bool is_leaf)
-
-    static void dealloc(uint64_t* node, ALLOC& alloc) noexcept;
-};
-```
-
-## 11. fan_ops
-
-### Layout
-```
-[header (1 u64)]              offset 0
-[main_bitmap (4 u64)]         offset 1
-[sentinel (1 u64)]            offset 5
-[children[]]                  offset 6
-```
-
-Size: `6 + n_children` u64s.
-
-### API
-```cpp
-template<typename KEY, typename VALUE, typename ALLOC>
-struct fan_ops {
-    struct child_lookup_t { uint64_t* child; int slot; bool found; };
-    static child_lookup_t lookup_child(const uint64_t* node, uint8_t index) noexcept;
-
-    static const uint64_t* branchless_child(const uint64_t* node, uint8_t bi) noexcept;
-
-    static int child_count(const uint64_t* node) noexcept;
-
-    static void set_child(uint64_t* node, int slot, uint64_t* child) noexcept;
-    static uint64_t* add_child(uint64_t* node, uint8_t index, uint64_t* child, ALLOC& alloc);
-    static uint64_t* remove_child(uint64_t* node, int slot, uint8_t index, ALLOC& alloc);
-
-    static uint64_t* make_fan(const uint8_t* indices, uint64_t* const* children,
-                               int n_children, ALLOC& alloc);
-
-    template<typename Fn>
-    static void for_each_child(const uint64_t* node, Fn&& cb);
-    // cb(uint8_t index, int slot, uint64_t* child)
-
-    static void dealloc(uint64_t* node, ALLOC& alloc) noexcept;
-};
-```
-
-## 12. bitmap_leaf_ops
-
-### Layout
-```
-[header (1 u64)]              offset 0
-[bitmap256 (4 u64)]           offset 1
-[VST[]]                       offset 5
-```
-
-Header has `is_bitmask=1` set (so `is_leaf()` returns false). This distinguishes bitmap256 from compact leaves when checking a child's own header.
-
-### API
-```cpp
-template<typename KEY, typename VALUE, typename ALLOC>
-struct bitmap_leaf_ops {
-    using vst = typename value_traits<VALUE, ALLOC>::slot_type;
-
-    static const VALUE* find(const uint64_t* node, uint8_t suffix) noexcept;
-
-    // No overflow — bitmap256 has max 256 entries, always fits.
-    struct insert_result_t { uint64_t* node; bool inserted; };
-    template<bool INSERT, bool ASSIGN>
-    static insert_result_t insert(uint64_t* node, uint8_t suffix, vst value, ALLOC& alloc);
-
-    static erase_result_t erase(uint64_t* node, uint8_t suffix, ALLOC& alloc);
-
-    static uint64_t* make_single(uint8_t suffix, vst value, ALLOC& alloc);
-    static uint64_t* make_from_sorted(const uint8_t* suffixes, const vst* values,
-                                       uint32_t count, ALLOC& alloc);
-
-    template<typename Fn>
-    static void for_each(const uint64_t* node, Fn&& cb);
-    // cb(uint8_t suffix, vst value)
-
-    static void destroy_and_dealloc(uint64_t* node, ALLOC& alloc);
-    static uint32_t count(const uint64_t* node) noexcept;
-};
-```
-
-## 13. compact_ops
-
-### Template on K instead of BITS
-
-```cpp
-template<typename KEY, typename VALUE, typename ALLOC>
-struct compact_ops {
-    using vt = value_traits<VALUE, ALLOC>;
-    using vst = typename vt::slot_type;
-
-    template<typename K>
-    static const VALUE* find(const uint64_t* node, node_header h, K suffix) noexcept;
-
-    struct compact_insert_result_t { uint64_t* node; bool inserted; bool needs_split; };
-
-    template<typename K, bool INSERT, bool ASSIGN>
-    static compact_insert_result_t insert(uint64_t* node, node_header* h,
-                                           K suffix, vst value, ALLOC& alloc);
-
-    template<typename K>
-    static erase_result_t erase(uint64_t* node, node_header* h, K suffix, ALLOC& alloc);
-
-    template<typename K>
-    static uint64_t* make_leaf(const K* sorted_keys, const vst* values,
-                                uint32_t count, uint8_t skip, prefix_t prefix,
-                                uint8_t suffix_type, ALLOC& alloc);
-    // Sets suffix_type in header
-
-    template<typename K, typename Fn>
-    static void for_each(const uint64_t* node, const node_header* h, Fn&& cb);
-
-    template<typename K>
-    static void destroy_and_dealloc(uint64_t* node, ALLOC& alloc);
-
-    template<typename K> static K* keys(uint64_t* node) noexcept;
-    template<typename K> static vst* vals(uint64_t* node, size_t total) noexcept;
-    template<typename K> static uint16_t total_slots(uint16_t alloc_u64) noexcept;
-    template<typename K> static size_t size_u64(size_t count) noexcept;
-};
-```
-
-### slot_table<K, VST>
-
-```cpp
-template<typename K, typename VST>
-struct slot_table {
-    static constexpr size_t MAX_ALLOC = 10240;
-    static constexpr auto build() { /* same logic, sizeof(K) */ }
-    static constexpr auto table_ = build();
-    static constexpr uint16_t max_slots(size_t alloc_u64) noexcept {
-        return table_[alloc_u64];
-    }
-};
-```
-
-Remove `suffix_traits` entirely.
+Cascade removal happens naturally via the call stack: if remove_child returns
+nullptr (empty bitmask), the caller sees new_child=nullptr and removes that
+slot from its own parent. No explicit stack or cascade loop needed.
 
 ## 14. Build / Conversion Functions
 
-Called when compact leaf hits COMPACT_MAX. Take `bits` as runtime parameter.
+### suffix_type_for(int bits_remaining)
+```cpp
+static constexpr uint8_t suffix_type_for(int bits) noexcept {
+    if (bits <= 8)  return 0;  // bitmap256
+    if (bits <= 16) return 1;  // u16
+    if (bits <= 32) return 2;  // u32
+    return 3;                  // u64
+}
+```
 
-### build_node_from_arrays(uint64_t* suf, vst* vals, size_t count, int bits)
+### make_initial_leaf / make_single_leaf
+
+Create single-entry leaf at current bits_remaining. Routes to bitmap256
+(suffix_type=0) or compact leaf (suffix_type=1/2/3).
+
+### convert_to_bitmask(node, hdr, ik, value, bits_remaining)
+
+Compact leaf hit COMPACT_MAX. Collect all entries + new entry, group by top 8 bits,
+create child nodes at bits_remaining-8, create bitmask node.
+
+### build_node_from_arrays(suf, vals, count, bits)
 
 ```
 if count <= COMPACT_MAX:
-    dispatch_suffix(bits) → sort as K, create compact leaf with suffix_type_for(bits)
+    st = suffix_type_for(bits)
+    if st == 0 → build bitmap256 leaf
+    else → sort as K, create compact leaf with suffix_type=st
     return leaf
 
-if bits > 16:
-    check skip compression (all share top 16 bits)
+if bits > 8:
+    check skip compression (all share top 8 bits)
     if compressible:
-        strip top 16, recurse with bits-16, set skip/prefix on result
+        strip top 8, recurse with bits-8, set skip on result
         return child
 
-return build_split_from_arrays(suf, vals, count, bits)
+return build_bitmask_from_arrays(suf, vals, count, bits)
 ```
 
-### build_split_from_arrays(suf, vals, count, bits)
+Skip compression checks u8 chunks (finer granularity than old u16).
+
+### build_bitmask_from_arrays(suf, vals, count, bits)
 
 Group by top 8 bits. For each group:
-- If count ≤ BOT_LEAF_MAX:
-  - `bits - 8 <= 8` → bitmap256 leaf (is_internal_bitmap bit = 0, child is_leaf()=false)
-  - else → compact leaf at bits-8 (is_internal_bitmap bit = 0, child is_leaf()=true)
-- If count > BOT_LEAF_MAX:
-  - Build fan node (is_internal_bitmap bit = 1)
+- recurse with build_node_from_arrays(group_suf, group_vals, group_count, bits-8)
 
-Create split node.
-
-### convert_to_split
-
-Collect entries from compact leaf + new entry → `build_node_from_arrays`.
-
-### convert_bot_leaf_to_fan
-
-Collect entries from bot-leaf + new entry → group by 8 bits → children → `fan_ops::make_fan`. Update parent split's `is_internal_bitmap` to mark this child as internal.
+Create bitmask node with child pointers.
 
 ### split_on_prefix
 
-Create new split at divergence. Old node and new single-entry leaf as children.
+Create new bitmask node at divergence point. Old node (with reduced skip) and
+new single-entry leaf as children under diverging u8 indices.
 
 ## 15. Remove-All
 
-Walk with context:
+Self-describing — no context needed:
 
 ```cpp
 void remove_all() noexcept {
     for (int i = 0; i < 256; ++i) {
-        uint64_t* child = root_[i];
-        if (child == SENTINEL_NODE) continue;
-        auto* h = get_header(child);
-        if (h->is_leaf()) {
-            // Compact leaf at root
-            destroy_compact(child);
-        } else {
-            // Fan at root
-            remove_fan_children(child);
-            fan_ops::dealloc(child, alloc_);
+        if (root_[i] != SENTINEL_NODE) {
+            remove_node(root_[i]);
+            root_[i] = SENTINEL_NODE;
         }
-        root_[i] = SENTINEL_NODE;
     }
     size_ = 0;
 }
 
-void remove_fan_children(uint64_t* fan) noexcept {
-    fan_ops::for_each_child(fan, [&](uint8_t, int, uint64_t* child) {
-        auto* h = get_header(child);
-        if (h->is_leaf()) {
-            // Compact leaf
-            destroy_compact(child);
-        } else {
-            // Split node (fan children are compact or split)
-            remove_split_children(child);
-            split_ops::dealloc(child, alloc_);
-        }
-    });
-}
-
-void remove_split_children(uint64_t* split) noexcept {
-    split_ops::for_each_child(split, [&](uint8_t, int, uint64_t* child, bool is_leaf) {
-        if (is_leaf) {
-            auto* h = get_header(child);
-            if (h->is_leaf()) {
-                // Compact leaf
-                destroy_compact(child);
-            } else {
-                // Bitmap256 leaf
-                bitmap_leaf_ops::destroy_and_dealloc(child, alloc_);
-            }
-        } else {
-            // Fan node
-            remove_fan_children(child);
-            fan_ops::dealloc(child, alloc_);
-        }
-    });
-}
-
-void destroy_compact(uint64_t* node) noexcept {
-    auto* h = get_header(node);
-    uint8_t st = h->suffix_type();
-    if (st & 0b10) {
-        if (st & 0b01) compact_ops::destroy_and_dealloc<uint64_t>(node, alloc_);
-        else           compact_ops::destroy_and_dealloc<uint32_t>(node, alloc_);
+void remove_node(uint64_t* node) noexcept {
+    auto* hdr = get_header(node);
+    if (hdr->is_leaf()) {
+        destroy_leaf(node, hdr);
     } else {
-        compact_ops::destroy_and_dealloc<uint16_t>(node, alloc_);
+        BO::for_each_child(node, [&](uint8_t, int, uint64_t* child) {
+            remove_node(child);
+        });
+        BO::dealloc_bitmask(node, alloc_);
+    }
+}
+
+void destroy_leaf(uint64_t* node, node_header* hdr) noexcept {
+    switch (hdr->suffix_type()) {
+        case 0: BO::bitmap_destroy_and_dealloc(node, alloc_); break;
+        case 1: CO16::destroy_and_dealloc(node, alloc_); break;
+        case 2: CO32::destroy_and_dealloc(node, alloc_); break;
+        case 3: CO64::destroy_and_dealloc(node, alloc_); break;
     }
 }
 ```
 
-## 16. Stats Collection
-
-Same context-based walk:
+## 16. Stats / Memory
 
 ```cpp
 struct debug_stats_t {
-    size_t compact_leaves = 0;
-    size_t bitmap_leaves = 0;
-    size_t split_nodes = 0;
-    size_t fan_nodes = 0;
+    size_t compact_leaves = 0;   // suffix_type 1/2/3
+    size_t bitmap_leaves = 0;    // suffix_type 0
+    size_t bitmask_nodes = 0;    // is_leaf=false
     size_t total_entries = 0;
     size_t total_bytes = 0;
 };
 ```
 
-Follow same root → fan → split → (compact/bitmap256/fan) pattern.
+Self-describing walk — same structure as remove_all:
+
+```cpp
+debug_stats_t debug_stats() const noexcept {
+    debug_stats_t s{};
+    s.total_bytes = 256 * sizeof(uint64_t*);  // root_ array
+    for (int i = 0; i < 256; ++i) {
+        if (root_[i] != SENTINEL_NODE)
+            collect_stats(root_[i], s);
+    }
+    return s;
+}
+
+void collect_stats(const uint64_t* node, debug_stats_t& s) const noexcept {
+    auto* hdr = get_header(node);
+    s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
+
+    if (hdr->is_leaf()) {
+        s.total_entries += hdr->entries();
+        if (hdr->suffix_type() == 0)
+            s.bitmap_leaves++;
+        else
+            s.compact_leaves++;
+    } else {
+        s.bitmask_nodes++;
+        BO::for_each_child(node, [&](uint8_t, int, uint64_t* child) {
+            collect_stats(child, s);
+        });
+    }
+}
+
+size_t memory_usage() const noexcept { return debug_stats().total_bytes; }
+```
+
+debug_root_info() returns the count of occupied root slots.
 
 ## 17. File Organization
 
 ### kntrie_support.hpp
 - Namespace: `gteitelbaum`
-- `key_ops<KEY>` with `internal_key_t`, `to_internal`, `to_key`
-- `node_header` (8 bytes, unchanged size)
-- Constants: `HEADER_U64`, `BITMAP256_U64`, `COMPACT_MAX`, `BOT_LEAF_MAX`, `SENTINEL_NODE`
+- `key_ops<KEY>` with `IK`, `to_internal`, `to_key`
+- `node_header` (16 bytes)
+- Constants: `HEADER_U64=2`, `BITMAP256_U64=4`, `COMPACT_MAX`, `SENTINEL_NODE`
 - `slot_table<K, VST>`
 - `value_traits<VALUE, ALLOC>`
 - `alloc_node`, `dealloc_node`
 - `round_up_u64`, `step_up_u64`, `should_shrink_u64`
-- `suffix_type_for()`, `dispatch_suffix()`
-- Result types: `erase_result_t`, `prefix_t`
+- `suffix_type_for()`
+- Result types
 
 ### kntrie_compact.hpp
 - `jump_search<K>`
-- `compact_ops<KEY, VALUE, ALLOC>` templated on `<typename K>`
+- `compact_ops<K, VALUE, ALLOC>` — K is suffix type (uint16_t/uint32_t/uint64_t)
 
 ### kntrie_bitmask.hpp
 - `bitmap256`
-- `split_ops<KEY, VALUE, ALLOC>`
-- `fan_ops<KEY, VALUE, ALLOC>`
-- `bitmap_leaf_ops<KEY, VALUE, ALLOC>`
+- `bitmask_ops<VALUE, ALLOC>` — unified bitmask node + bitmap256 leaf ops
+  (not templated on KEY; works with raw pointers and byte indices)
 
-### kntrie.hpp
-- `gteitelbaum::kntrie<KEY, VALUE, ALLOC>` — single class
-- Loop-based find/insert/erase
+### kntrie_impl.hpp
+- `gteitelbaum::kntrie_impl<KEY, VALUE, ALLOC>` — implementation class
+- Loop-based find
+- Recursive insert/erase
 - Build/conversion functions
 - Remove-all, stats
-- Iterator stubs
 
-No `kntrie_impl.hpp`. Four headers total.
+### kntrie.hpp
+- `gteitelbaum::kntrie<KEY, VALUE, ALLOC>` — thin public map-like wrapper
+- Delegates to `kntrie_impl` for all operations
+- Iterator stubs, operator[], at(), count(), etc.
+- Unchanged from current design except includes new kntrie_impl.hpp
+
+Five headers total.
 
 ## 18. Key Depth Bounds
 
-| Key type | KEY_BITS | IK_BITS | Max split depth | Max fan depth | Max stack |
-|----------|----------|---------|-----------------|---------------|-----------|
-| uint16_t | 16       | 32      | 0               | 1 (root)      | 2         |
-| int32_t  | 32       | 32      | 1               | 2             | 4         |
-| uint64_t | 64       | 64      | 3               | 4             | 8         |
+`bits` progression per key type (each bitmask hop consumes 8 KEY bits):
 
-Fixed stack: 10 entries.
+| Key type  | KEY_BITS | IK_BITS | bits sequence (root→leaf) | Max bitmask nodes | Max stack |
+|-----------|----------|---------|--------------------------|-------------------|-----------|
+| uint16_t  | 16       | 32      | 8→bitmap                 | 0                 | 1         |
+| int16_t   | 16       | 32      | 8→bitmap                 | 0                 | 1         |
+| int32_t   | 32       | 32      | 24→16→8→bitmap           | 2                 | 3         |
+| uint32_t  | 32       | 32      | 24→16→8→bitmap           | 2                 | 3         |
+| int64_t   | 64       | 64      | 56→48→40→32→24→16→8→bm   | 6                 | 7         |
+| uint64_t  | 64       | 64      | 56→48→40→32→24→16→8→bm   | 6                 | 7         |
 
-## 19. Implementation Order
+Max recursion depth for insert_node/erase_node: 7 (uint64_t worst case).
+Skip compression typically reduces effective depth to 2-3 for random data.
 
-1. Header changes (suffix_type bits 14-13, entries 13-bit unchanged)
-2. key_ops refactor (internal_key_t, left-aligned)
-3. slot_table + compact_ops (re-template on K, make_leaf sets suffix_type)
-4. bitmap256 + bitmap_leaf_ops
-5. split_ops
-6. fan_ops
-7. Loop-based find
-8. Loop-based insert with descent stack
-9. Loop-based erase with descent stack
-10. Build/conversion functions (runtime bits + dispatch_suffix)
-11. Remove-all + stats
-12. Cleanup
+**Suffix type at each level:**
+- bits=56..33: st=3 (u64 suffix)
+- bits=32..17: st=2 (u32 suffix)
+- bits=16..9:  st=1 (u16 suffix)
+- bits=8..1:   st=0 (bitmap256 leaf)
 
-## 20. Risk Areas
+## 19. Changes from Old Design
 
-1. **Suffix extraction with shift:** `static_cast<K>(ik >> (IK_BITS - sizeof(K)*8))`. Verify all K/IK combinations.
-2. **Sentinel path:** Zeroed header → `is_leaf()=true`, suffix_type=0, entries=0 → compact_find dispatches to u16 (fallthrough), 0 entries → search returns nullptr. ✓
-3. **Bitmap256 identification:** Parent's `is_internal_bitmap=0` + child's `is_leaf()=false` = bitmap256. Parent's `is_internal_bitmap=1` + child's `is_leaf()=false` = fan. Verify no confusion.
-4. **Split vs fan layout:** Different children offsets (10 vs 6). Must use correct ops everywhere.
-5. **Stack propagation:** All realloc paths propagate through descent stack.
-6. **Skip + shift:** Each prefix chunk: check, then `ik <<= 16`. Verify alignment.
-7. **Bitmap256 header:** Must have `is_bitmask=1` set. `set_bitmask()` in `bitmap_leaf_ops::make_*`.
+### Removed
+- **Split node type** — replaced by unified bitmask node
+- **Fan node type** — replaced by same bitmask node
+- **is_internal_bitmap** — children are self-describing
+- **branchless_top_child returning (ptr, is_leaf)** — returns just pointer
+- **bot_leaf concept** — bitmap256 leaf is self-describing (suffix_type=0)
+- **u16 prefix chunks** — replaced by u8 chunks
+- **Bit-packed skip/alloc fields** — plain struct members
+- **prefix_t = array<uint16_t, 2>** — replaced by uint8_t prefix_[8]
+- **Template recursion on BITS** — replaced by loop (find) / runtime recursion (insert/erase)
+- **suffix_traits<BITS>** — replaced by direct K template parameter
+- **kntrie_impl.hpp** — merged into kntrie.hpp
+
+### Added
+- **Self-describing nodes** — suffix_type in header identifies node fully
+- **16-byte header** — plain fields, no bit packing for skip/prefix
+- **u8 skip chunks** — finer granularity, max skip=6
+- **Unified bitmask node** — one layout for all internal nodes (7+n u64s)
+- **Single find loop** — no pre-loop special cases, single exit
+- **Runtime recursion** for insert/erase — natural parent propagation via call stack
+
+### Changed
+- HEADER_U64: 1 → 2 (+8 bytes per node)
+- Skip granularity: 16 bits → 8 bits (more compression opportunities)
+- Bitmask node size: was 10+n (split) or 6+n (fan) → now 7+n (unified)
+- Max trie depth for u64: ~4 (split+fan) → 7 (uniform u8 stride)
+  - But skip compression keeps effective depth similar or better
+
+## 20. kntrie_impl Implementation Details
+
+### Type aliases
+
+```cpp
+using KO  = key_ops<KEY>;
+using IK   = typename KO::IK;
+using VT   = value_traits<VALUE, ALLOC>;
+using VST  = typename VT::slot_type;
+using BO   = bitmask_ops<VALUE, ALLOC>;
+using CO16 = compact_ops<uint16_t, VALUE, ALLOC>;
+using CO32 = compact_ops<uint32_t, VALUE, ALLOC>;
+using CO64 = compact_ops<uint64_t, VALUE, ALLOC>;
+
+static constexpr int IK_BITS  = KO::IK_BITS;   // always 32 or 64
+static constexpr int KEY_BITS = KO::KEY_BITS;
+```
+
+Note: bitmask_ops is templated on VALUE, ALLOC only (not KEY) since it doesn't
+need key operations — it just stores child pointers and bitmap values.
+
+### CRITICAL: `bits` tracks KEY_BITS remaining, not IK_BITS
+
+Throughout insert_node and erase_node, the `bits` parameter tracks how many
+**KEY bits** remain to be resolved, NOT how many IK bits remain. This matters
+because IK may be wider than KEY (e.g. uint16_t key → uint32_t IK).
+
+```
+bits = KEY_BITS - (number of key bits consumed by root + bitmask hops + skip)
+```
+
+suffix_type_for(bits) maps remaining key bits to suffix type:
+- bits ≤ 8  → st=0 (bitmap256)
+- bits ≤ 16 → st=1 (u16)
+- bits ≤ 32 → st=2 (u32)
+- bits > 32 → st=3 (u64)
+
+Suffix extraction always uses: `ik >> (IK_BITS - suffix_width)`
+where suffix_width = 8/16/32/64 depending on st.
+
+This works because ik is left-aligned: after consuming N key bits via
+shifts, the remaining key bits sit at positions [IK_BITS-1 .. IK_BITS-bits]
+and positions [IK_BITS-bits-1 .. 0] are all zero. Extracting more bits than
+remaining (e.g. u32 from 24 remaining) just includes trailing zeros, which
+are consistent across all entries.
+
+### Worked Example: uint16_t key = 0x1234
+
+```
+KEY_BITS = 16, IK_BITS = 32
+
+to_internal(0x1234):
+  ik = 0x1234 << 16 = 0x12340000
+
+insert():
+  ri = ik >> 24 = 0x12
+  ik <<= 8  → ik = 0x34000000
+  bits = KEY_BITS - 8 = 8
+
+  root_[0x12] empty → make_single_leaf(ik=0x34000000, sv, bits=8)
+    suffix_type_for(8) = 0 (bitmap256)
+    suffix = uint8_t(ik >> 24) = 0x34
+    → bitmap leaf with bit 0x34 set
+
+find_value(0x1234):
+  ik = 0x12340000
+  ri = 0x12
+  ik <<= 8  → ik = 0x34000000
+
+  node = root_[0x12], hdr.is_leaf() = true
+  st = 0 → bitmap_find(node, suffix = uint8_t(ik >> 24) = 0x34)  ✓
+```
+
+### Worked Example: uint64_t key = 0xAABBCCDD11223344
+
+```
+KEY_BITS = 64, IK_BITS = 64
+
+to_internal(0xAABBCCDD11223344):
+  ik = 0xAABBCCDD11223344 (unsigned, no flip)
+
+insert():
+  ri = ik >> 56 = 0xAA
+  ik <<= 8  → ik = 0xBBCCDD1122334400
+  bits = 64 - 8 = 56
+
+  Suppose root_[0xAA] has a bitmask node:
+
+insert_node(node, ik=0xBBCCDD1122334400, value, bits=56):
+  hdr is bitmask → ti = ik >> 56 = 0xBB
+  ik <<= 8  → ik = 0xCCDD112233440000
+  Recurse: insert_node(child, ik, value, bits=48)
+
+  ... eventually reaches a leaf with bits=16, suffix_type=1:
+    suffix = uint16_t(ik >> 48)  ← extracts the 16 remaining key bits
+```
+
+### Suffix extraction in find leaf dispatch
+
+After the find loop breaks on is_leaf(), `ik` has been shifted left so that
+the remaining suffix bits are at the top. The suffix_type tells us how wide:
+
+```cpp
+uint8_t st = hdr.suffix_type();
+if (st == 0)
+    return BO::bitmap_find(node, hdr,
+        static_cast<uint8_t>(ik >> (IK_BITS - 8)));
+
+if constexpr (KEY_BITS > 16) {
+    if (st & 0b10) {   // st==2 or st==3
+        if constexpr (KEY_BITS > 32) {
+            if (st & 0b01)   // st==3 → u64
+                return CO64::find(node, hdr, static_cast<uint64_t>(ik));
+        }
+        // st==2 → u32
+        return CO32::find(node, hdr,
+            static_cast<uint32_t>(ik >> (IK_BITS - 32)));
+    }
+}
+// st==1 → u16
+return CO16::find(node, hdr,
+    static_cast<uint16_t>(ik >> (IK_BITS - 16)));
+```
+
+The `if constexpr` guards prevent generating u32/u64 paths for small key types
+where those suffix types can never occur.
+
+### leaf_insert dispatch
+
+Same suffix_type switch, but returns insert_result_t:
+
+```cpp
+insert_result_t leaf_insert(uint64_t* node, node_header* hdr,
+                            IK ik, VST value, int bits) {
+    uint8_t st = hdr->suffix_type();
+    if (st == 0) {
+        auto r = BO::bitmap_insert<INSERT, ASSIGN>(
+            node, static_cast<uint8_t>(ik >> (IK_BITS - 8)), value, alloc_);
+        return r;   // bitmap never needs_split (max 256 entries)
+    }
+    if constexpr (KEY_BITS > 16) {
+        if (st & 0b10) {
+            if constexpr (KEY_BITS > 32) {
+                if (st & 0b01)
+                    return CO64::insert<INSERT, ASSIGN>(
+                        node, hdr, static_cast<uint64_t>(ik), value, alloc_);
+            }
+            return CO32::insert<INSERT, ASSIGN>(
+                node, hdr, static_cast<uint32_t>(ik >> (IK_BITS - 32)),
+                value, alloc_);
+        }
+    }
+    return CO16::insert<INSERT, ASSIGN>(
+        node, hdr, static_cast<uint16_t>(ik >> (IK_BITS - 16)),
+        value, alloc_);
+}
+```
+
+### leaf_erase dispatch
+
+Same pattern, returns erase_result_t:
+
+```cpp
+erase_result_t leaf_erase(uint64_t* node, node_header* hdr, IK ik) {
+    uint8_t st = hdr->suffix_type();
+    if (st == 0)
+        return BO::bitmap_erase(node,
+            static_cast<uint8_t>(ik >> (IK_BITS - 8)), alloc_);
+    if constexpr (KEY_BITS > 16) {
+        if (st & 0b10) {
+            if constexpr (KEY_BITS > 32) {
+                if (st & 0b01)
+                    return CO64::erase(node, hdr,
+                        static_cast<uint64_t>(ik), alloc_);
+            }
+            return CO32::erase(node, hdr,
+                static_cast<uint32_t>(ik >> (IK_BITS - 32)), alloc_);
+        }
+    }
+    return CO16::erase(node, hdr,
+        static_cast<uint16_t>(ik >> (IK_BITS - 16)), alloc_);
+}
+```
+
+### INSERT/ASSIGN through runtime recursion
+
+insert_node is templated on INSERT and ASSIGN:
+
+```cpp
+template<bool INSERT, bool ASSIGN>
+insert_result_t insert_node(uint64_t* node, IK ik, VST value, int bits);
+```
+
+The three public methods dispatch:
+- `insert()` → `insert_node<true, false>`
+- `insert_or_assign()` → `insert_node<true, true>`
+- `assign()` → `insert_node<false, true>`
+
+This generates 2-3 specializations but keeps the code clean. leaf_insert is
+also templated on INSERT/ASSIGN and forwards to CO/BO which already have them.
+
+### make_single_leaf(ik, value, bits)
+
+Creates a 1-entry leaf at the given bits_remaining. `ik` is IK-typed,
+left-aligned to IK_BITS:
+
+```cpp
+uint64_t* make_single_leaf(IK ik, VST value, int bits) {
+    uint8_t st = suffix_type_for(bits);
+    if (st == 0) {
+        uint8_t s = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+        return BO::make_single_bitmap(s, value, alloc_);
+    }
+    if (st == 1) {
+        uint16_t s = static_cast<uint16_t>(ik >> (IK_BITS - 16));
+        return CO16::make_leaf(&s, &value, 1, 0, nullptr, alloc_);
+    }
+    if (st == 2) {
+        uint32_t s = static_cast<uint32_t>(ik >> (IK_BITS - 32));
+        return CO32::make_leaf(&s, &value, 1, 0, nullptr, alloc_);
+    }
+    // st == 3
+    uint64_t s = static_cast<uint64_t>(ik);
+    return CO64::make_leaf(&s, &value, 1, 0, nullptr, alloc_);
+}
+```
+
+Note: suffix extraction uses `ik >> (IK_BITS - W)` where W = 8/16/32/64.
+This is the same formula used in find and leaf_insert dispatch.
+
+### make_initial_leaf(ik, value)
+
+Same as make_single_leaf with bits = KEY_BITS - 8 (after root index consumed).
+Can just call make_single_leaf(ik, value, KEY_BITS - 8).
+
+### convert_to_bitmask(node, hdr, ik, value, bits)
+
+Compact leaf hit COMPACT_MAX. Collect all entries + new entry into working
+arrays (uint64_t, bit-63-aligned), then call build_node_from_arrays.
+The old node's skip/prefix must be prepended to the result.
+
+```cpp
+uint64_t* convert_to_bitmask(uint64_t* node, node_header* hdr,
+                              IK ik, VST value, int bits) {
+    uint16_t old_count = hdr->entries();
+    size_t total = old_count + 1;
+    auto wk = std::make_unique<uint64_t[]>(total);
+    auto wv = std::make_unique<VST[]>(total);
+
+    // ik is IK-aligned; promote to bit-63-aligned uint64_t
+    uint64_t new_suf = uint64_t(ik) << (64 - IK_BITS);
+    size_t wi = 0;
+    bool ins = false;
+    // leaf_for_each_u64 emits bit-63-aligned uint64_t
+    leaf_for_each_u64(node, hdr, [&](uint64_t s, VST v) {
+        if (!ins && new_suf < s) {
+            wk[wi] = new_suf; wv[wi] = value; wi++; ins = true;
+        }
+        wk[wi] = s; wv[wi] = v; wi++;
+    });
+    if (!ins) { wk[wi] = new_suf; wv[wi] = value; }
+
+    auto* child = build_node_from_arrays(wk.get(), wv.get(), total, bits);
+
+    // Propagate old skip/prefix to new child
+    if (hdr->skip() > 0) {
+        auto* ch = get_header(child);
+        uint8_t os = ch->skip();
+        uint8_t ps = hdr->skip();
+        uint8_t ns = ps + os;
+        uint8_t combined[6] = {};
+        std::memcpy(combined, hdr->prefix_bytes(), ps);
+        std::memcpy(combined + ps, ch->prefix_bytes(), os);
+        ch->set_skip(ns);
+        ch->set_prefix(combined, ns);
+    }
+
+    dealloc_node(alloc_, node, hdr->alloc_u64());
+    return child;
+}
+```
+
+### Working Array Convention: Bit-63-Aligned
+
+All working arrays (suf[] in build_node_from_arrays, convert_to_bitmask,
+etc.) use **uint64_t values left-aligned to bit 63**. This matches the ik
+shift convention:
+
+```
+Byte extraction:  top_byte = suf >> 56           (always bit 56)
+Strip top byte:   child_suf = suf << 8           (always shift left 8)
+Extract for CO:   K = narrow_cast<K>(suf >> (64 - W))  where W = suffix width
+```
+
+No masks needed. Partitioning and skip compression use the same `>> 56` and
+`<< 8` regardless of bits remaining.
+
+### leaf_for_each_u64
+
+Iterates leaf entries, emitting bit-63-aligned uint64_t values:
+
+```cpp
+template<typename Fn>
+void leaf_for_each_u64(const uint64_t* node, const node_header* hdr, Fn&& cb) {
+    uint8_t st = hdr->suffix_type();
+    if (st == 0) {
+        BO::for_each_bitmap(node, [&](uint8_t s, VST v) {
+            cb(uint64_t(s) << 56, v);
+        });
+    } else if (st == 1) {
+        CO16::for_each(node, hdr, [&](uint16_t s, VST v) {
+            cb(uint64_t(s) << 48, v);
+        });
+    } else if (st == 2) {
+        CO32::for_each(node, hdr, [&](uint32_t s, VST v) {
+            cb(uint64_t(s) << 32, v);
+        });
+    } else {
+        CO64::for_each(node, hdr, [&](uint64_t s, VST v) {
+            cb(s, v);
+        });
+    }
+}
+```
+
+The bit shifts (56/48/32/0) are independent of bits_remaining. This works
+because stored K values are always left-aligned within their type width —
+zero-extending to uint64_t and shifting to bit 63 produces consistent values.
+
+### build_node_from_arrays(suf, vals, count, bits)
+
+Suffixes are uint64_t, bit-63-aligned. `bits` tracks remaining KEY bits.
+
+```cpp
+uint64_t* build_node_from_arrays(uint64_t* suf, VST* vals,
+                                  size_t count, int bits) {
+    // Leaf case
+    if (count <= COMPACT_MAX) {
+        uint8_t st = suffix_type_for(bits);
+        if (st == 0) {
+            auto bk = std::make_unique<uint8_t[]>(count);
+            for (size_t i = 0; i < count; ++i)
+                bk[i] = static_cast<uint8_t>(suf[i] >> 56);
+            return BO::make_bitmap_leaf(bk.get(), vals, count, alloc_);
+        }
+        if (st == 1) {
+            auto tk = std::make_unique<uint16_t[]>(count);
+            for (size_t i = 0; i < count; ++i)
+                tk[i] = static_cast<uint16_t>(suf[i] >> 48);
+            return CO16::make_leaf(tk.get(), vals, count, 0, nullptr, alloc_);
+        }
+        if (st == 2) {
+            auto tk = std::make_unique<uint32_t[]>(count);
+            for (size_t i = 0; i < count; ++i)
+                tk[i] = static_cast<uint32_t>(suf[i] >> 32);
+            return CO32::make_leaf(tk.get(), vals, count, 0, nullptr, alloc_);
+        }
+        // st == 3
+        return CO64::make_leaf(suf, vals, count, 0, nullptr, alloc_);
+    }
+
+    // Skip compression: check if all entries share same top byte
+    if (bits > 8) {
+        uint8_t first_top = static_cast<uint8_t>(suf[0] >> 56);
+        bool all_same = true;
+        for (size_t i = 1; i < count; ++i)
+            if (static_cast<uint8_t>(suf[i] >> 56) != first_top)
+                { all_same = false; break; }
+
+        if (all_same) {
+            for (size_t i = 0; i < count; ++i) suf[i] <<= 8;  // strip top byte
+
+            uint64_t* child = build_node_from_arrays(suf, vals, count, bits - 8);
+
+            auto* ch = get_header(child);
+            uint8_t os = ch->skip();
+            uint8_t ns = os + 1;
+            uint8_t combined[6] = {};
+            combined[0] = first_top;
+            std::memcpy(combined + 1, ch->prefix_bytes(), os);
+            ch->set_skip(ns);
+            ch->set_prefix(combined, ns);
+            return child;
+        }
+    }
+
+    return build_bitmask_from_arrays(suf, vals, count, bits);
+}
+```
+
+### build_bitmask_from_arrays(suf, vals, count, bits)
+
+```cpp
+uint64_t* build_bitmask_from_arrays(uint64_t* suf, VST* vals,
+                                     size_t count, int bits) {
+    uint8_t   indices[256];
+    uint64_t* child_ptrs[256];
+    int       n_children = 0;
+
+    size_t i = 0;
+    while (i < count) {
+        uint8_t ti = static_cast<uint8_t>(suf[i] >> 56);
+        size_t start = i;
+        while (i < count && static_cast<uint8_t>(suf[i] >> 56) == ti) ++i;
+        size_t cc = i - start;
+
+        // Strip top byte for children (shift left 8)
+        auto cs = std::make_unique<uint64_t[]>(cc);
+        for (size_t j = 0; j < cc; ++j)
+            cs[j] = suf[start + j] << 8;
+
+        indices[n_children]    = ti;
+        child_ptrs[n_children] = build_node_from_arrays(
+            cs.get(), vals + start, cc, bits - 8);
+        n_children++;
+    }
+
+    return BO::make_bitmask(indices, child_ptrs, n_children,
+                             0, nullptr, alloc_);
+}
+```
+
+### split_on_prefix
+
+With u8 chunks this is simpler than the old u16 version. Divergence is at
+a single byte index `common`. At entry, ik has been shifted past `common`
+matching prefix bytes; bits has been decremented by 8 for each.
+
+```cpp
+uint64_t* split_on_prefix(uint64_t* node, node_header* hdr,
+                           IK ik, VST value,
+                           const uint8_t* actual, uint8_t skip,
+                           uint8_t common, int bits) {
+    // ik >> (IK_BITS - 8) = diverging expected byte
+    // actual[common] = diverging actual byte
+
+    uint8_t new_idx = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+    uint8_t old_idx = actual[common];
+    uint8_t old_rem = skip - 1 - common;
+
+    // Update old node: strip consumed prefix, keep remainder
+    hdr->set_skip(old_rem);
+    if (old_rem > 0) {
+        uint8_t rem[6] = {};
+        std::memcpy(rem, actual + common + 1, old_rem);
+        hdr->set_prefix(rem, old_rem);
+    }
+
+    // Advance ik and bits past divergence byte + remaining prefix
+    IK leaf_ik = ik << 8;
+    int leaf_bits = bits - 8;
+    uint8_t new_prefix[6] = {};
+    for (uint8_t j = 0; j < old_rem; ++j) {
+        new_prefix[j] = static_cast<uint8_t>(leaf_ik >> (IK_BITS - 8));
+        leaf_ik <<= 8;
+        leaf_bits -= 8;
+    }
+
+    // Build new leaf at same depth as old node
+    uint64_t* new_leaf = make_single_leaf(leaf_ik, value, leaf_bits);
+    if (old_rem > 0) {
+        auto* nlh = get_header(new_leaf);
+        nlh->set_skip(old_rem);
+        nlh->set_prefix(new_prefix, old_rem);
+    }
+
+    // Create parent bitmask with 2 children
+    uint8_t   bi[2];
+    uint64_t* cp[2];
+    if (new_idx < old_idx) {
+        bi[0] = new_idx; cp[0] = new_leaf;
+        bi[1] = old_idx; cp[1] = node;
+    } else {
+        bi[0] = old_idx; cp[0] = node;
+        bi[1] = new_idx; cp[1] = new_leaf;
+    }
+
+    return BO::make_bitmask(bi, cp, 2, common,
+                             common > 0 ? actual : nullptr, alloc_);
+}
+```
+
+**Invariant:** Both children (old node and new leaf) have the same skip value
+(`old_rem`) and sit at the same effective depth. The parent bitmask has
+skip=`common` with the shared prefix bytes.
+
+## 21. Implementation Order
+
+1. kntrie_support.hpp — new 16-byte header, key_ops, constants
+2. kntrie_compact.hpp — compact_ops with HEADER_U64=2, templated on K
+3. kntrie_bitmask.hpp — bitmap256, unified bitmask_ops + bitmap leaf ops
+4. kntrie_impl.hpp — implementation class: find loop, recursive insert/erase, build, remove_all, stats
+5. kntrie.hpp — update thin wrapper to use new kntrie_impl
+6. Benchmark verification
+
+## 22. Risk Areas
+
+1. **HEADER_U64=2 slot_table impact:** +8 bytes per node overhead. Verify
+   bytes-per-entry at small N doesn't regress badly. The old design used
+   HEADER_U64=1. For a 10-entry compact leaf, this is ~5% overhead.
+
+2. **Sentinel:** 6 u64s, all zeros → is_leaf=true (flags_==0), suffix_type=0,
+   entries=0, bitmap all zeros. bitmap_find → nullptr. branchless_child miss
+   → sentinel. ✓
+
+3. **Max depth u64:** 7 bitmask hops vs old ~4. Skip compression should keep
+   effective depth at 2-4 for typical data. Must benchmark.
+
+4. **Suffix extraction consistency:** All paths (find, insert, erase,
+   make_single_leaf, leaf_for_each_u64, build_node_from_arrays) must use
+   consistent formulas:
+   - IK→K: `K(ik >> (IK_BITS - W))` where W = suffix_width
+   - K→u64: `uint64_t(K) << (64 - W)` in leaf_for_each_u64
+   - u64→K: `K(suf >> (64 - W))` in build_node_from_arrays
+   Must verify round-trip: K→u64→K preserves value for all K types.
+
+5. **bits tracks KEY_BITS not IK_BITS:** Insert/erase pass `KEY_BITS - 8`
+   to first insert_node/erase_node call. Each bitmask hop decrements by 8.
+   Each skip byte decrements by 8. suffix_type_for(bits) must always match
+   what the node was created with. Critical invariant.
+
+6. **Recursion depth:** Max 7 for uint64_t. Stack frame ~64 bytes (node ptr,
+   ik, value, bits, hdr ptr + locals). 7 × 64 = 448 bytes. Well within limits.
+
+7. **IK promotion in convert_to_bitmask:** `uint64_t(ik) << (64 - IK_BITS)`
+   correctly promotes IK=uint32_t to bit-63-aligned uint64_t. For IK=uint64_t,
+   shift is 0. Verify no UB for shift-by-0.
+
+8. **Bitmap leaf at bits=8:** Only possible for uint16_t keys (KEY_BITS=16,
+   root consumes 8). For larger keys, bitmap leafs appear only after enough
+   bitmask hops. Verify bitmap path is reachable and correct for all key types.

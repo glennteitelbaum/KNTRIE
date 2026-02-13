@@ -20,7 +20,7 @@ namespace gteitelbaum {
 inline constexpr size_t BITMAP256_U64 = 4;   // 32 bytes
 inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
-inline constexpr size_t HEADER_U64    = 1;   // header is 1 u64
+inline constexpr size_t HEADER_U64    = 2;   // header is 2 u64 (16 bytes)
 
 // ==========================================================================
 // Allocation size classes
@@ -65,70 +65,66 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 }
 
 // ==========================================================================
-// Prefix type — two 16-bit skip chunks
+// Node Header  (16 bytes = 2 u64)
 //
-// prefix[0] = outer chunk (consumed first during descent)
-// prefix[1] = inner chunk
-// Unused slots = 0.
-// ==========================================================================
-
-using prefix_t = std::array<uint16_t, 2>;
-
-// ==========================================================================
-// Node Header  (8 bytes = 1 u64)
+// flags_:      [15] is_bitmask (0=leaf, 1=bitmask node)
+//              [1:0] suffix_type (leaf only: 0=bitmap256, 1=u16, 2=u32, 3=u64)
+// entries_:    entry count
+// alloc_u64_:  allocation size in u64s
+// skip_len_:   number of u8 prefix chunks (0-6)
+// prefix_[6]:  u8 skip chunks (outer first)
+// pad_[3]:     reserved (zeroed)
 //
-// top_:    bit 15 = is_bitmask (0=compact leaf, 1=split/fan/bitmap256)
-//          bit 14-13 = suffix_type (compact leaf only: 00=reserved, 01=u16, 10=u32, 11=u64)
-//          bit 12-0  = entries (0-8191)
-// bottom_: bit 15-14 = skip (0-2)
-//          bit 13-0  = alloc_u64 (0-16383)
-// prefix_: two u16 skip chunks (0 when skip==0)
-//
-// Zeroed header → compact leaf, suffix_type=0, entries=0. Sentinel-safe.
+// Zeroed header -> is_leaf=true, suffix_type=0, entries=0. Sentinel-safe.
 // ==========================================================================
 
 struct node_header {
-    uint16_t top_;
-    uint16_t bottom_;
-    uint16_t prefix_[2];
+    uint16_t flags_;
+    uint16_t entries_;
+    uint16_t alloc_u64_;
+    uint8_t  skip_len_;
+    uint8_t  prefix_[6];
+    uint8_t  pad_[3];
 
-    bool is_leaf() const noexcept { return !(top_ & 0x8000); }
-    void set_bitmask() noexcept { top_ |= 0x8000; }
+    bool is_leaf() const noexcept { return !(flags_ & 0x8000); }
+    void set_bitmask() noexcept { flags_ |= 0x8000; }
 
-    uint8_t suffix_type() const noexcept { return (top_ >> 13) & 0x3; }
-    void set_suffix_type(uint8_t t) noexcept { top_ = (top_ & ~0x6000) | ((t & 0x3) << 13); }
+    uint8_t suffix_type() const noexcept { return flags_ & 0x3; }
+    void set_suffix_type(uint8_t t) noexcept { flags_ = (flags_ & ~0x3) | (t & 0x3); }
 
-    uint16_t entries() const noexcept { return top_ & 0x1FFF; }
-    void set_entries(uint16_t n) noexcept { top_ = (top_ & 0xE000) | (n & 0x1FFF); }
+    uint16_t entries() const noexcept { return entries_; }
+    void set_entries(uint16_t n) noexcept { entries_ = n; }
 
-    uint16_t alloc_u64() const noexcept { return bottom_ & 0x3FFF; }
-    void set_alloc_u64(uint16_t n) noexcept { bottom_ = (bottom_ & 0xC000) | (n & 0x3FFF); }
+    uint16_t alloc_u64() const noexcept { return alloc_u64_; }
+    void set_alloc_u64(uint16_t n) noexcept { alloc_u64_ = n; }
 
-    uint8_t skip() const noexcept { return static_cast<uint8_t>(bottom_ >> 14); }
-    void set_skip(uint8_t s) noexcept { bottom_ = (bottom_ & 0x3FFF) | (uint16_t(s & 0x3) << 14); }
+    uint8_t skip() const noexcept { return skip_len_; }
+    void set_skip(uint8_t s) noexcept { skip_len_ = s; }
 
-    prefix_t prefix() const noexcept { return {prefix_[0], prefix_[1]}; }
-    void set_prefix(prefix_t p) noexcept { prefix_[0] = p[0]; prefix_[1] = p[1]; }
+    const uint8_t* prefix_bytes() const noexcept { return prefix_; }
+    void set_prefix(const uint8_t* p, uint8_t len) noexcept {
+        for (uint8_t i = 0; i < len; ++i) prefix_[i] = p[i];
+    }
 };
-static_assert(sizeof(node_header) == 8);
+static_assert(sizeof(node_header) == 16);
 
 inline node_header*       get_header(uint64_t* n)       noexcept { return reinterpret_cast<node_header*>(n); }
 inline const node_header* get_header(const uint64_t* n) noexcept { return reinterpret_cast<const node_header*>(n); }
 
 // ==========================================================================
 // Global sentinel -- zeroed block, valid as:
-//   - Compact leaf (entries=0, top_=0 → is_leaf, suffix_type=0)
-//   - Bitmap256 leaf (entries=0, bitmap all zeros)
-// No allocation on construction; never deallocated.
+//   - Leaf with suffix_type=0, entries=0 -> bitmap_find returns nullptr
+//   - Branchless miss target -> bitmap all zeros -> FAST_EXIT returns -1
+// Must be large enough for safe bitmap read: header(2) + bitmap(4) = 6 u64s.
 // ==========================================================================
 
-alignas(64) inline constinit uint64_t SENTINEL_NODE[4] = {};
+alignas(64) inline constinit uint64_t SENTINEL_NODE[6] = {};
 
 // ==========================================================================
-// key_ops<KEY> — internal key representation
+// key_ops<KEY> -- internal key representation
 //
-// internal_key_t: uint32_t for KEY ≤ 32 bits, uint64_t otherwise.
-// Key is left-aligned in internal_key_t. Top bits consumed first via shift.
+// IK: uint32_t for KEY <= 32 bits, uint64_t otherwise.
+// Key is left-aligned in IK. Top bits consumed first via shift.
 // ==========================================================================
 
 template<typename KEY>
@@ -136,25 +132,25 @@ struct key_ops {
     static_assert(std::is_integral_v<KEY>);
 
     static constexpr bool   IS_SIGNED = std::is_signed_v<KEY>;
-    static constexpr size_t KEY_BITS  = sizeof(KEY) * 8;
+    static constexpr int    KEY_BITS  = static_cast<int>(sizeof(KEY) * 8);
 
-    using internal_key_t = std::conditional_t<sizeof(KEY) <= 4, uint32_t, uint64_t>;
-    static constexpr int IK_BITS = sizeof(internal_key_t) * 8;
+    using IK = std::conditional_t<sizeof(KEY) <= 4, uint32_t, uint64_t>;
+    static constexpr int IK_BITS = static_cast<int>(sizeof(IK) * 8);
 
-    static constexpr internal_key_t to_internal(KEY k) noexcept {
-        internal_key_t r;
+    static constexpr IK to_internal(KEY k) noexcept {
+        IK r;
         if constexpr (sizeof(KEY) == 1)      r = static_cast<uint8_t>(k);
         else if constexpr (sizeof(KEY) == 2) r = static_cast<uint16_t>(k);
         else if constexpr (sizeof(KEY) == 4) r = static_cast<uint32_t>(k);
         else                                 r = static_cast<uint64_t>(k);
-        if constexpr (IS_SIGNED) r ^= internal_key_t{1} << (KEY_BITS - 1);
+        if constexpr (IS_SIGNED) r ^= IK{1} << (KEY_BITS - 1);
         r <<= (IK_BITS - KEY_BITS);
         return r;
     }
 
-    static constexpr KEY to_key(internal_key_t ik) noexcept {
+    static constexpr KEY to_key(IK ik) noexcept {
         ik >>= (IK_BITS - KEY_BITS);
-        if constexpr (IS_SIGNED) ik ^= internal_key_t{1} << (KEY_BITS - 1);
+        if constexpr (IS_SIGNED) ik ^= IK{1} << (KEY_BITS - 1);
         return static_cast<KEY>(ik);
     }
 };
@@ -162,32 +158,21 @@ struct key_ops {
 // ==========================================================================
 // Suffix type helpers
 //
-// Only for compact leaves. When ≤8 bits remain, bitmap256 is used instead.
-// suffix_type: 1=u16, 2=u32, 3=u64. 0 is reserved (sentinel only).
+// suffix_type: 0=bitmap256 (<=8 bits), 1=u16, 2=u32, 3=u64.
 // ==========================================================================
 
 inline constexpr uint8_t suffix_type_for(int bits) noexcept {
+    if (bits <= 8)  return 0;  // bitmap256
     if (bits <= 16) return 1;  // u16
     if (bits <= 32) return 2;  // u32
     return 3;                  // u64
-}
-
-// Dispatch on suffix_type via nested bit tests. u16 is most common (fallthrough).
-template<typename Fn>
-inline auto dispatch_suffix(uint8_t stype, Fn&& fn) {
-    if (stype & 0b10) {
-        if (stype & 0b01) return fn(uint64_t{});
-        else              return fn(uint32_t{});
-    }
-    return fn(uint16_t{});
 }
 
 // ==========================================================================
 // slot_table -- constexpr lookup: max total slots for a given alloc_u64
 //
 // Templated on K (suffix type) and VST (value slot type).
-// Indexed directly by alloc_u64. table[0] = table[1] = 0.
-// Total slots = entries + dups. Dups are derived: total - entries.
+// Indexed directly by alloc_u64. table[0..HEADER_U64] = 0.
 // ==========================================================================
 
 template<typename K, typename VST>
@@ -196,8 +181,8 @@ struct slot_table {
 
     static constexpr auto build() {
         std::array<uint16_t, MAX_ALLOC + 1> tbl{};
-        tbl[0] = 0; tbl[1] = 0;
-        for (size_t au64 = 2; au64 <= MAX_ALLOC; ++au64) {
+        for (size_t i = 0; i <= HEADER_U64; ++i) tbl[i] = 0;
+        for (size_t au64 = HEADER_U64 + 1; au64 <= MAX_ALLOC; ++au64) {
             size_t avail = (au64 - HEADER_U64) * 8;
             size_t total = avail / (sizeof(K) + sizeof(VST));
             while (total > 0) {
@@ -277,8 +262,14 @@ inline void dealloc_node(ALLOC& a, uint64_t* p, size_t u64_count) noexcept {
 }
 
 // ==========================================================================
-// Erase result type
+// Result types
 // ==========================================================================
+
+struct insert_result_t {
+    uint64_t* node;
+    bool inserted;
+    bool needs_split;
+};
 
 struct erase_result_t {
     uint64_t* node;
