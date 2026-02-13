@@ -296,7 +296,7 @@ const LINES = [
   { key: "map_uint64", color: "#fca5a5", dash: "6 3", label: "map u64" },
   { key: "umap_int32", color: "#22c55e", dash: "", label: "umap i32" },
   { key: "umap_uint64", color: "#86efac", dash: "6 3", label: "umap u64" },
-  { key: "raw_int32", color: "#888", dash: "3 3", label: "raw i32", memOnly: true },
+  { key: "raw_int32", color: "#888", dash: "", label: "raw i32", memOnly: true },
   { key: "raw_uint64", color: "#555", dash: "3 3", label: "raw u64", memOnly: true },
 ];
 
@@ -397,8 +397,11 @@ export default function App() {
       <div style={{ display: "flex", justifyContent: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
         {LINES.map((l) => (
           <div key={l.key} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11 }}>
-            <div style={{ width: 20, height: l.dash ? 0 : 2.5, background: l.color, borderRadius: 1,
-              borderTop: l.dash ? `2px dashed ${l.color}` : "none" }} />
+            {l.dash ? (
+              <svg width={22} height={4}><line x1={0} y1={2} x2={22} y2={2} stroke={l.color} strokeWidth={2} strokeDasharray={l.dash} /></svg>
+            ) : (
+              <div style={{ width: 22, height: 2.5, background: l.color, borderRadius: 1 }} />
+            )}
             <span style={{ color: "#bbb" }}>{l.label}</span>
           </div>
         ))}
