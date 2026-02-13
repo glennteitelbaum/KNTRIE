@@ -87,7 +87,7 @@ public:
             }
 
         noskip:
-            if (hdr.is_leaf()) break;
+            if (hdr.is_leaf()) [[unlikely]] break;
 
             // Bitmask node: extract next byte, branchless descend
             {
@@ -101,24 +101,23 @@ public:
         // Leaf dispatch by suffix_type
         uint8_t st = hdr.suffix_type();
 
-        if (st == 0)
-            return BO::bitmap_find(node, hdr,
-                static_cast<uint8_t>(ik >> (IK_BITS - 8)));
-
-        if constexpr (KEY_BITS > 16) {
-            if (st & 0b10) {
-                if constexpr (KEY_BITS > 32) {
-                    if (st & 0b01)
-                        return CO64::find(node, hdr,
-                            static_cast<uint64_t>(ik));
-                }
-                return CO32::find(node, hdr,
-                    static_cast<uint32_t>(ik >> (IK_BITS - 32)));
-            }
+        if (st <= 1) {
+            if (st == 0)
+                return BO::bitmap_find(node, hdr,
+                    static_cast<uint8_t>(ik >> (IK_BITS - 8)));
+            return CO16::find(node, hdr,
+                static_cast<uint16_t>(ik >> (IK_BITS - 16)));
         }
 
-        return CO16::find(node, hdr,
-            static_cast<uint16_t>(ik >> (IK_BITS - 16)));
+        if constexpr (KEY_BITS > 16) {
+            if constexpr (KEY_BITS > 32) {
+                if (st & 0b01)
+                    return CO64::find(node, hdr,
+                        static_cast<uint64_t>(ik));
+            }
+            return CO32::find(node, hdr,
+                static_cast<uint32_t>(ik >> (IK_BITS - 32)));
+        }
     }
 
     bool contains(const KEY& key) const noexcept {

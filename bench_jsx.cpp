@@ -432,6 +432,20 @@ int main() {
     for (double n = 100; n < 6000000; n *= 1.5)
         sizes.push_back(static_cast<size_t>(n));
 
+    auto capped_sizes = [&](auto key_tag) {
+        using KEY = decltype(key_tag);
+        size_t max_n = static_cast<size_t>(std::numeric_limits<KEY>::max());
+        std::vector<size_t> result;
+        for (auto n : sizes) {
+            if (n >= max_n) {
+                result.push_back(max_n);
+                break;
+            }
+            result.push_back(n);
+        }
+        return result;
+    };
+
     const char* patterns[] = {"random", "sequential"};
     std::vector<Row> rows;
 
@@ -440,7 +454,7 @@ int main() {
             std::fprintf(stderr, "u64 %s N=%zu...\n", pat, n);
             bench_all<uint64_t>(n, pat, "uint64_t", rows);
         }
-        for (auto n : sizes) {
+        for (auto n : capped_sizes(int32_t{})) {
             std::fprintf(stderr, "i32 %s N=%zu...\n", pat, n);
             bench_all<int32_t>(n, pat, "int32_t", rows);
         }
