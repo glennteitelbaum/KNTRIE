@@ -67,7 +67,7 @@
 
 ---
 
-## FILE 4: kntrie_impl.hpp — CODE WRITTEN, BUG: segfault on sequential data
+## FILE 4: kntrie_impl.hpp ✅ COMPLETE
 
 ### KEEP
 - Class shell: kntrie_impl<KEY, VALUE, ALLOC>
@@ -91,9 +91,11 @@
 - remove_all, remove_fan_children, remove_split_children
 - debug_stats_t, stats_compact, stats_bitmap_leaf, stats_fan, stats_split, memory_usage
 
-### BUG
-- Segfault on sequential uint64_t data during benchmark erase/churn phase (~10K entries)
-- Random data passes all tests (50K entries, all key types)
+- convert_root_to_fan: root overflow always produces fan (not split)
+
+### BUGS FIXED
+- make_split polarity: is_internal_flags → is_leaf_flags (inverted check)
+- Root compact overflow: was calling convert_to_split which can return split node; root expects compact or fan only (split has different layout than fan due to internal_bitmap)
 
 ### REMOVED
 - All recursive template dispatch (find_impl<BITS>, insert_impl<BITS>, erase_impl<BITS>)

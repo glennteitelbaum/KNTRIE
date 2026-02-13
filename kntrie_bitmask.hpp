@@ -289,7 +289,7 @@ struct split_ops {
     // ==================================================================
 
     static uint64_t* make_split(const uint8_t* indices, uint64_t* const* children,
-                                 const bool* is_internal_flags, int n_children,
+                                 const bool* is_leaf_flags, int n_children,
                                  uint8_t skip, prefix_t prefix, ALLOC& alloc) {
         bitmap256 tbm = bitmap256::from_indices(indices, n_children);
 
@@ -307,7 +307,7 @@ struct split_ops {
 
         bitmap256 iibm{};
         for (int i = 0; i < n_children; ++i)
-            if (is_internal_flags[i]) iibm.set_bit(indices[i]);
+            if (!is_leaf_flags[i]) iibm.set_bit(indices[i]);
         internal_bm(nn) = iibm;
         children_base(nn)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
 

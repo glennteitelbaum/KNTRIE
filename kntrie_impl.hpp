@@ -539,7 +539,7 @@ private:
             auto r = compact_insert<INSERT, ASSIGN>(node, hdr, ik, sv);
             if (r.needs_split) {
                 if constexpr (!INSERT) { VT::destroy(sv, alloc_); return {true, false}; }
-                root_[ri] = convert_to_split(node, hdr, ik, sv, bits);
+                root_[ri] = convert_root_to_fan(node, hdr, ik, sv, bits);
                 ++size_;
                 return {true, true};
             }
@@ -819,6 +819,50 @@ private:
                 tk.get(), vals, static_cast<uint32_t>(count),
                 0, prefix_t{0,0}, stype, alloc_);
         });
+    }
+
+    // ==================================================================
+    // convert_root_to_fan: root compact leaf overflow → fan node
+    //
+    // Root must always be compact leaf or fan (never split), because
+    // find/insert/erase root paths use FO::branchless_child which
+    // expects fan layout. Split nodes have internal_bm and different
+    // offsets.
+    // ==================================================================
+
+    uint64_t* convert_root_to_fan(uint64_t* node, node_header* hdr,
+                                   IK ik, VST value, int bits) {
+        uint16_t old_count = hdr->entries();
+        size_t total = old_count + 1;
+        auto wk = std::make_unique<uint64_t[]>(total);
+        auto wv = std::make_unique<VST[]>(total);
+
+        // Collect existing entries + new entry, sorted, left-aligned in u64
+        uint8_t st = hdr->suffix_type();
+        size_t wi = 0;
+
+        dispatch_suffix(st, [&](auto k_tag) {
+            using K = decltype(k_tag);
+            constexpr int K_BITS = static_cast<int>(sizeof(K)) * 8;
+            K new_suffix = extract_suffix<K>(ik);
+            uint64_t new_suf64 = static_cast<uint64_t>(new_suffix) << (64 - K_BITS);
+
+            bool ins = false;
+            CO::template for_each<K>(node, hdr, [&](K s, VST v) {
+                uint64_t s64 = static_cast<uint64_t>(s) << (64 - K_BITS);
+                if (!ins && new_suf64 < s64) {
+                    wk[wi] = new_suf64; wv[wi] = value; wi++; ins = true;
+                }
+                wk[wi] = s64; wv[wi] = v; wi++;
+            });
+            if (!ins) { wk[wi] = new_suf64; wv[wi] = value; }
+        });
+
+        // Build fan node by grouping by top 8 bits
+        uint64_t* fan = build_fan_from_range(wk.get(), wv.get(), total, bits);
+
+        dealloc_node(alloc_, node, hdr->alloc_u64());
+        return fan;
     }
 
     // ==================================================================
