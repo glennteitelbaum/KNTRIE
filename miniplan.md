@@ -67,89 +67,66 @@
 
 ---
 
-## FILE 4: kntrie_impl.hpp
+## FILE 4: kntrie_impl.hpp — CODE WRITTEN, BUG: segfault on sequential data
 
-### KEEP (structural shape only)
-- Class shell: kntrie_impl<KEY, VALUE, ALLOC> (was kntrie3)
+### KEEP
+- Class shell: kntrie_impl<KEY, VALUE, ALLOC>
 - root_[256], size_, alloc_ members
 - Constructor (fill root_ with SENTINEL_NODE), destructor calls remove_all
 - empty(), size(), clear()
-
-### TODO — Find
 - Loop-based find_value: root index → root fan descend → main loop
 - compact_find: nested bit test dispatch (0b10/0b01), u16 fallthrough
-- Main loop: skip/prefix check → is_leaf [[unlikely]] break → split branchless → is_leaf [[unlikely]] break → fan branchless → repeat
-- child_leaf path: always bitmap256_find
-- Sentinel miss flows: safe through all paths
-
-### TODO — Insert
+- extract_suffix<K> helper (guards negative shifts when K wider than IK)
+- compact_insert, compact_erase dispatch: nested bit tests
+- bot_leaf_insert, bot_leaf_erase dispatch: bitmap256 or compact
+- destroy_compact dispatch
 - descent_entry_t stack[10], parent_type enum
 - propagate helper
-- insert_dispatch<INSERT, ASSIGN>: root compact, root fan, main loop
-- compact_insert dispatch: nested bit tests, no u8
-- bot_leaf_insert dispatch: bitmap256 (never overflows) or compact
-- make_single_leaf(ik, sv, bits): dispatch_suffix → compact make_leaf
-- make_single_bot_leaf(ik, sv, bits): bits≤8 → bitmap_leaf_ops::make_single, else make_single_leaf
+- insert_impl_<INSERT, ASSIGN>: root compact, root fan, main loop
+- erase: root compact, root fan, main loop
+- remove_from_parent: cascade upward
+- make_single_leaf, make_single_bot_leaf
+- build_node_from_arrays, build_split_from_arrays, build_fan_from_range, build_compact_from_range
+- convert_to_split, convert_bot_leaf_to_fan, split_on_prefix
+- remove_all, remove_fan_children, remove_split_children
+- debug_stats_t, stats_compact, stats_bitmap_leaf, stats_fan, stats_split, memory_usage
 
-### TODO — Erase
-- Same descent as insert, simpler (no conversion)
-- compact_erase dispatch: nested bit tests
-- bot_leaf_erase dispatch: bitmap256 or compact
-- remove_from_parent: cascade upward when child fully erased
+### BUG
+- Segfault on sequential uint64_t data during benchmark erase/churn phase (~10K entries)
+- Random data passes all tests (50K entries, all key types)
 
-### TODO — Build/Convert (runtime bits)
-- build_node_from_arrays(suf, vals, count, bits): compact or skip-compress or split
-- build_split_from_arrays: group by top 8, bitmap256 for ≤8 bits, compact or fan otherwise
-- build_fan_from_range: group by 8 bits → children → fan_ops::make_fan
-- convert_to_bitmask: compact leaf overflow → collect + build_node_from_arrays
-- convert_bot_leaf_to_fan: bot-leaf overflow → collect + group + fan
-- split_on_prefix: prefix mismatch → new split with old + new leaf
-
-### TODO — Remove-All
-- Context-based walk: root → compact or fan
-- remove_fan_children: child is compact or split
-- remove_split_children: leaf child is compact(is_leaf=true) or bitmap256(is_leaf=false), internal child is fan
-- destroy_compact: nested bit test dispatch
-
-### TODO — Stats
-- Same context walk as remove_all
-- debug_stats_t: compact_leaves, bitmap_leaves, split_nodes, fan_nodes, total_entries/nodes/bytes
-- memory_usage() → debug_stats().total_bytes
+### REMOVED
+- All recursive template dispatch (find_impl<BITS>, insert_impl<BITS>, erase_impl<BITS>)
+- kntrie3 class, kn3 namespace
 
 ---
 
-## FILE 5: kntrie.hpp
+## FILE 5: kntrie.hpp ✅ COMPLETE
 
-### KEEP (mostly unchanged)
+### KEEP
 - Public API: insert, insert_or_assign, assign, erase, find_value, contains, count, operator[], at
 - Iterator stubs
 - value_type, key_type, etc. type aliases
 - debug_stats, debug_root_info forwarding
-
-### TODO (minor)
-- Change namespace from gteitelbaum to gteitelbaum (already correct)
-- Change impl type from kn3::kntrie3 to gteitelbaum::kntrie_impl (or inline)
-- Forward find_value, insert, erase to impl
+- Namespace: gteitelbaum
+- impl type: gteitelbaum::kntrie_impl
 - memory_usage, debug_stats forward to impl
+
+### REMOVED
+- kn3::kntrie3 reference
 
 ---
 
-## FILE 6: benchmark.cpp
+## FILE 6: benchmark.cpp ✅ COMPLETE (no changes needed)
 
 ### KEEP
 - All benchmark logic, timing, workload generation, markdown output
-
-### TODO
-- Update namespace/class references if kntrie.hpp public API changed
-- Verify it compiles against new headers
+- Compiles against new headers without changes
 
 ---
 
-## FILE 7: bench_jsx.cpp
+## FILE 7: bench_jsx.cpp ✅ COMPLETE (no changes needed)
 
 ### KEEP
 - All benchmark logic, JSX output, tracking allocator, workload generation
-
-### TODO
-- Update namespace/class references if kntrie.hpp public API changed
-- Verify it compiles against new headers
+- Compiles against new headers without changes
