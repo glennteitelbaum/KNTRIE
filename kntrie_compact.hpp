@@ -273,6 +273,23 @@ private:
 
         // Check if we have unused slots
         if (entries < ts) {
+            if (entries + 1 >= DUP_THRESHOLD) {
+                // Crossing into dup mode: insert then seed dups in-place
+                int tail = static_cast<int>(entries) - ins;
+                if (tail > 0) {
+                    std::memmove(kd + ins + 1, kd + ins, tail * sizeof(K));
+                    std::memmove(vd + ins + 1, vd + ins, tail * sizeof(VST));
+                }
+                kd[ins] = suffix;
+                VT::write_slot(&vd[ins], value);
+                uint16_t ne = entries + 1;
+                h->set_entries(ne);
+                // Now ne contiguous entries at front, ts-ne empty slots at end.
+                // Spread dups backwards so we don't overwrite unread data.
+                spread_dups_backward_(kd, vd, ne, ts);
+                return {node, true, false};
+            }
+            // memmove right to make room
             // memmove right to make room
             int tail = static_cast<int>(entries) - ins;
             if (tail > 0) {
@@ -495,6 +512,46 @@ private:
         erase_create_dup_(kd, vd, ts, idx, suffix, alloc);
         h->set_entries(nc);
         return {node, true};
+    }
+
+    // ==================================================================
+    // Spread dups backward: ne entries at front, total slots available.
+    // Works right-to-left so we never overwrite unread source data.
+    // ==================================================================
+
+    static void spread_dups_backward_(K* kd, VST* vd,
+                                       uint16_t ne, uint16_t total) {
+        uint16_t n_dups = total - ne;
+        if (n_dups == 0) return;
+        uint16_t stride = ne / (n_dups + 1);
+        uint16_t remainder = ne % (n_dups + 1);
+        // Last (n_dups+1-remainder) groups get `stride` entries,
+        // first `remainder` groups get `stride+1`.
+        // Work backward: place last group first.
+        int src = ne - 1;
+        int dst = total - 1;
+        int placed = 0;  // dups placed so far (from the right)
+        int groups_from_right = 0;
+        while (placed < n_dups) {
+            // Group size: last groups get `stride`, first get `stride+1`
+            // Groups from right: groups_from_right counts 0,1,...
+            // Total groups = n_dups+1. Group index from left = n_dups - groups_from_right
+            int group_idx_from_left = n_dups - groups_from_right;
+            int chunk = stride + (group_idx_from_left < remainder ? 1 : 0);
+            // Copy chunk entries right-to-left
+            for (int j = 0; j < chunk; ++j) {
+                kd[dst] = kd[src];
+                vd[dst] = vd[src];
+                dst--; src--;
+            }
+            // Place dup (copy of entry just written, which is at dst+1)
+            kd[dst] = kd[dst + 1];
+            vd[dst] = vd[dst + 1];
+            dst--;
+            placed++;
+            groups_from_right++;
+        }
+        // Remaining entries at front are already in place (src == dst)
     }
 
     // ==================================================================
