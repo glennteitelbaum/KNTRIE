@@ -90,7 +90,8 @@ struct compact_ops {
     // ==================================================================
 
     static uint64_t* make_leaf(const K* sorted_keys, const VST* values,
-                               uint32_t count, ALLOC& alloc) {
+                               uint32_t count, uint8_t skip,
+                               const uint8_t* prefix, ALLOC& alloc) {
         uint16_t ts = slots_for(static_cast<uint16_t>(count));
         size_t au64 = size_u64(ts);
         uint64_t* node = alloc_node(alloc, au64);
@@ -98,6 +99,8 @@ struct compact_ops {
         h->set_entries(static_cast<uint16_t>(count));
         h->set_alloc_u64(static_cast<uint16_t>(au64));
         h->set_suffix_type(STYPE);
+        h->set_skip(skip);
+        if (skip > 0) h->set_prefix(prefix, skip);
 
         if (count > 0)
             seed_from_real_(node, sorted_keys, values,

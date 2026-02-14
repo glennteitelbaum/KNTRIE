@@ -66,6 +66,19 @@ public:
         node_header hdr = *get_header(node);
 
         while (true) {
+            // Skip / prefix check (u8 chunks)
+            {
+                uint8_t skip = hdr.skip();
+                if (skip) [[unlikely]] {
+                    const uint8_t* actual = hdr.prefix_bytes();
+                    for (uint8_t i = 0; i < skip; ++i) {
+                        uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+                        if (expected != actual[i]) [[unlikely]] return nullptr;
+                        ik = static_cast<IK>(ik << 8);
+                    }
+                }
+            }
+
             if (hdr.is_leaf()) [[unlikely]] break;
 
             // Bitmask node: extract next byte, branchless descend
@@ -167,14 +180,14 @@ public:
     size_t memory_usage() const noexcept { return debug_stats().total_bytes; }
 
     struct root_info_t {
-        uint16_t entries;
+        uint16_t entries; uint8_t skip;
         bool is_leaf;
     };
 
     root_info_t debug_root_info() const {
-        if (root_ == SENTINEL_NODE) return {0, false};
+        if (root_ == SENTINEL_NODE) return {0, 0, false};
         auto* hdr = get_header(root_);
-        return {hdr->entries(), hdr->is_leaf()};
+        return {hdr->entries(), hdr->skip(), hdr->is_leaf()};
     }
 
     const uint64_t* debug_root() const noexcept { return root_; }
@@ -214,6 +227,22 @@ private:
     template<bool INSERT, bool ASSIGN>
     insert_result_t insert_node_(uint64_t* node, IK ik, VST value, int bits) {
         auto* hdr = get_header(node);
+
+        // Skip check
+        uint8_t skip = hdr->skip();
+        if (skip) [[unlikely]] {
+            const uint8_t* actual = hdr->prefix_bytes();
+            for (uint8_t i = 0; i < skip; ++i) {
+                uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+                if (expected != actual[i]) {
+                    if constexpr (!INSERT) return {node, false, false};
+                    return {split_on_prefix_(node, hdr, ik, value,
+                                              actual, skip, i, bits), true, false};
+                }
+                ik = static_cast<IK>(ik << 8);
+                bits -= 8;
+            }
+        }
 
         if (hdr->is_leaf()) {
             auto result = leaf_insert_<INSERT, ASSIGN>(node, hdr, ik, value, bits);
@@ -282,6 +311,18 @@ private:
     erase_result_t erase_node_(uint64_t* node, IK ik, int bits) {
         auto* hdr = get_header(node);
 
+        // Skip check
+        uint8_t skip = hdr->skip();
+        if (skip) [[unlikely]] {
+            const uint8_t* actual = hdr->prefix_bytes();
+            for (uint8_t i = 0; i < skip; ++i) {
+                uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+                if (expected != actual[i]) return {node, false};
+                ik = static_cast<IK>(ik << 8);
+                bits -= 8;
+            }
+        }
+
         if (hdr->is_leaf())
             return leaf_erase_(node, hdr, ik);
 
@@ -345,17 +386,17 @@ private:
         }
         if (st == 1) {
             uint16_t s = static_cast<uint16_t>(ik >> (IK_BITS - 16));
-            return CO16::make_leaf(&s, &value, 1, alloc_);
+            return CO16::make_leaf(&s, &value, 1, 0, nullptr, alloc_);
         }
         if constexpr (KEY_BITS > 16) {
             if (st == 2) {
                 uint32_t s = static_cast<uint32_t>(ik >> (IK_BITS - 32));
-                return CO32::make_leaf(&s, &value, 1, alloc_);
+                return CO32::make_leaf(&s, &value, 1, 0, nullptr, alloc_);
             }
         }
         if constexpr (KEY_BITS > 32) {
             uint64_t s = static_cast<uint64_t>(ik);
-            return CO64::make_leaf(&s, &value, 1, alloc_);
+            return CO64::make_leaf(&s, &value, 1, 0, nullptr, alloc_);
         }
         __builtin_unreachable();
     }
@@ -387,6 +428,19 @@ private:
         if (!ins) { wk[wi] = new_suf; wv[wi] = value; }
 
         auto* child = build_node_from_arrays_(wk.get(), wv.get(), total, bits);
+
+        // Propagate old skip/prefix to new child
+        uint8_t ps = hdr->skip();
+        if (ps > 0) {
+            auto* ch = get_header(child);
+            uint8_t os = ch->skip();
+            uint8_t ns = ps + os;
+            uint8_t combined[6] = {};
+            std::memcpy(combined, hdr->prefix_bytes(), ps);
+            if (os > 0) std::memcpy(combined + ps, ch->prefix_bytes(), os);
+            ch->set_skip(ns);
+            ch->set_prefix(combined, ns);
+        }
 
         dealloc_node(alloc_, node, hdr->alloc_u64());
         return child;
@@ -446,7 +500,7 @@ private:
                 for (size_t i = 0; i < count; ++i)
                     tk[i] = static_cast<uint16_t>(suf[i] >> 48);
                 return CO16::make_leaf(tk.get(), vals,
-                    static_cast<uint32_t>(count), alloc_);
+                    static_cast<uint32_t>(count), 0, nullptr, alloc_);
             }
             if constexpr (KEY_BITS > 16) {
                 if (st == 2) {
@@ -454,15 +508,42 @@ private:
                     for (size_t i = 0; i < count; ++i)
                         tk[i] = static_cast<uint32_t>(suf[i] >> 32);
                     return CO32::make_leaf(tk.get(), vals,
-                        static_cast<uint32_t>(count), alloc_);
+                        static_cast<uint32_t>(count), 0, nullptr, alloc_);
                 }
             }
             if constexpr (KEY_BITS > 32) {
                 // st == 3
                 return CO64::make_leaf(suf, vals,
-                    static_cast<uint32_t>(count), alloc_);
+                    static_cast<uint32_t>(count), 0, nullptr, alloc_);
             }
             __builtin_unreachable();
+        }
+
+        // Skip compression: all entries share same top byte?
+        if (bits > 8) {
+            uint8_t first_top = static_cast<uint8_t>(suf[0] >> 56);
+            bool all_same = true;
+            for (size_t i = 1; i < count; ++i)
+                if (static_cast<uint8_t>(suf[i] >> 56) != first_top)
+                    { all_same = false; break; }
+
+            if (all_same) {
+                // Strip top byte: shift left by 8
+                for (size_t i = 0; i < count; ++i) suf[i] <<= 8;
+
+                uint64_t* child = build_node_from_arrays_(suf, vals, count, bits - 8);
+
+                // Prepend skip byte to child's prefix
+                auto* ch = get_header(child);
+                uint8_t os = ch->skip();
+                uint8_t ns = os + 1;
+                uint8_t combined[6] = {};
+                combined[0] = first_top;
+                if (os > 0) std::memcpy(combined + 1, ch->prefix_bytes(), os);
+                ch->set_skip(ns);
+                ch->set_prefix(combined, ns);
+                return child;
+            }
         }
 
         return build_bitmask_from_arrays_(suf, vals, count, bits);
@@ -498,10 +579,68 @@ private:
             n_children++;
         }
 
-        return BO::make_bitmask(indices, child_ptrs, n_children, alloc_);
+        return BO::make_bitmask(indices, child_ptrs, n_children,
+                                 0, nullptr, alloc_);
     }
 
     // ==================================================================
+    // split_on_prefix
+    //
+    // At entry: ik has been shifted past `common` matching prefix bytes.
+    // ik >> (IK_BITS-8) = diverging expected byte.
+    // actual[common] = diverging actual byte.
+    // bits = original_bits_at_node - 8*common.
+    // ==================================================================
+
+    uint64_t* split_on_prefix_(uint64_t* node, node_header* hdr,
+                                IK ik, VST value,
+                                const uint8_t* actual, uint8_t skip,
+                                uint8_t common, int bits) {
+        uint8_t new_idx = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+        uint8_t old_idx = actual[common];
+        uint8_t old_rem = skip - 1 - common;
+
+        // Update old node: strip consumed prefix, keep remainder
+        hdr->set_skip(old_rem);
+        if (old_rem > 0) {
+            uint8_t rem[6] = {};
+            std::memcpy(rem, actual + common + 1, old_rem);
+            hdr->set_prefix(rem, old_rem);
+        }
+
+        // Advance ik and bits past divergence byte + remaining prefix
+        IK leaf_ik = static_cast<IK>(ik << 8);
+        int leaf_bits = bits - 8;
+        uint8_t new_prefix[6] = {};
+        for (uint8_t j = 0; j < old_rem; ++j) {
+            new_prefix[j] = static_cast<uint8_t>(leaf_ik >> (IK_BITS - 8));
+            leaf_ik = static_cast<IK>(leaf_ik << 8);
+            leaf_bits -= 8;
+        }
+
+        // Build new leaf at same depth as old node
+        uint64_t* new_leaf = make_single_leaf_(leaf_ik, value, leaf_bits);
+        if (old_rem > 0) {
+            auto* nlh = get_header(new_leaf);
+            nlh->set_skip(old_rem);
+            nlh->set_prefix(new_prefix, old_rem);
+        }
+
+        // Create parent bitmask with 2 children
+        uint8_t   bi[2];
+        uint64_t* cp[2];
+        if (new_idx < old_idx) {
+            bi[0] = new_idx; cp[0] = new_leaf;
+            bi[1] = old_idx; cp[1] = node;
+        } else {
+            bi[0] = old_idx; cp[0] = node;
+            bi[1] = new_idx; cp[1] = new_leaf;
+        }
+
+        return BO::make_bitmask(bi, cp, 2, common,
+                                 common > 0 ? actual : nullptr, alloc_);
+    }
+
     // ==================================================================
     // Remove all
     // ==================================================================
