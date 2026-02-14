@@ -69,9 +69,6 @@ public:
         const uint64_t* node = root_[ri];
         node_header hdr = *get_header(node);
 
-        // First node after root never has skip
-        goto noskip;
-
         while (true) {
             // Skip / prefix check (u8 chunks)
             {
@@ -86,7 +83,6 @@ public:
                 }
             }
 
-        noskip:
             if (hdr.is_leaf()) [[unlikely]] break;
 
             // Bitmask node: extract next byte, branchless descend
