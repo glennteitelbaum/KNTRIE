@@ -31,7 +31,7 @@ private:
     static constexpr int IK_BITS  = KO::IK_BITS;
     static constexpr int KEY_BITS = KO::KEY_BITS;
 
-    uint64_t* root_[256];
+    uint64_t* root_;
     size_t    size_;
     [[no_unique_address]] ALLOC alloc_;
 
@@ -40,9 +40,7 @@ public:
     // Constructor / Destructor
     // ==================================================================
 
-    kntrie_impl() : size_(0), alloc_() {
-        for (int i = 0; i < 256; ++i) root_[i] = SENTINEL_NODE;
-    }
+    kntrie_impl() : root_(SENTINEL_NODE), size_(0), alloc_() {}
 
     ~kntrie_impl() { remove_all_(); }
 
@@ -63,10 +61,9 @@ public:
 
     const VALUE* find_value(const KEY& key) const noexcept {
         IK ik = KO::to_internal(key);
-        uint8_t ri = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        ik = static_cast<IK>(ik << 8);  // consume root byte
 
-        const uint64_t* node = root_[ri];
+        const uint64_t* node = root_;
+        if (node == SENTINEL_NODE) [[unlikely]] return nullptr;
         node_header hdr = *get_header(node);
 
         while (true) {
@@ -150,16 +147,13 @@ public:
 
     bool erase(const KEY& key) {
         IK ik = KO::to_internal(key);
-        uint8_t ri = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        ik = static_cast<IK>(ik << 8);
 
-        uint64_t* node = root_[ri];
-        if (node == SENTINEL_NODE) return false;
+        if (root_ == SENTINEL_NODE) return false;
 
-        auto [new_node, erased] = erase_node_(node, ik, KEY_BITS - 8);
+        auto [new_node, erased] = erase_node_(root_, ik, KEY_BITS);
         if (!erased) return false;
 
-        root_[ri] = new_node ? new_node : SENTINEL_NODE;
+        root_ = new_node ? new_node : SENTINEL_NODE;
         --size_;
         return true;
     }
@@ -178,11 +172,9 @@ public:
 
     debug_stats_t debug_stats() const noexcept {
         debug_stats_t s{};
-        s.total_bytes = 256 * sizeof(uint64_t*);
-        for (int i = 0; i < 256; ++i) {
-            if (root_[i] != SENTINEL_NODE)
-                collect_stats_(root_[i], s);
-        }
+        s.total_bytes = sizeof(uint64_t*);
+        if (root_ != SENTINEL_NODE)
+            collect_stats_(root_, s);
         return s;
     }
 
@@ -194,13 +186,12 @@ public:
     };
 
     root_info_t debug_root_info() const {
-        int occupied = 0;
-        for (int i = 0; i < 256; ++i)
-            if (root_[i] != SENTINEL_NODE) ++occupied;
-        return {static_cast<uint16_t>(occupied), 0, false};
+        if (root_ == SENTINEL_NODE) return {0, 0, false};
+        auto* hdr = get_header(root_);
+        return {hdr->entries(), hdr->skip(), hdr->is_leaf()};
     }
 
-    const uint64_t* debug_root_child(int i) const noexcept { return root_[i]; }
+    const uint64_t* debug_root() const noexcept { return root_; }
 
 private:
     // ==================================================================
@@ -211,21 +202,17 @@ private:
     std::pair<bool, bool> insert_dispatch_(const KEY& key, const VALUE& value) {
         IK ik = KO::to_internal(key);
         VST sv = VT::store(value, alloc_);
-        uint8_t ri = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        ik = static_cast<IK>(ik << 8);
 
-        uint64_t* node = root_[ri];
-
-        // Empty root slot: create single-entry leaf
-        if (node == SENTINEL_NODE) {
+        // Empty trie: create single-entry leaf
+        if (root_ == SENTINEL_NODE) {
             if constexpr (!INSERT) { VT::destroy(sv, alloc_); return {true, false}; }
-            root_[ri] = make_single_leaf_(ik, sv, KEY_BITS - 8);
+            root_ = make_single_leaf_(ik, sv, KEY_BITS);
             ++size_;
             return {true, true};
         }
 
-        auto r = insert_node_<INSERT, ASSIGN>(node, ik, sv, KEY_BITS - 8);
-        if (r.node != node) root_[ri] = r.node;
+        auto r = insert_node_<INSERT, ASSIGN>(root_, ik, sv, KEY_BITS);
+        if (r.node != root_) root_ = r.node;
         if (r.inserted) { ++size_; return {true, true}; }
         VT::destroy(sv, alloc_);
         return {true, false};
@@ -659,11 +646,9 @@ private:
     // ==================================================================
 
     void remove_all_() noexcept {
-        for (int i = 0; i < 256; ++i) {
-            if (root_[i] != SENTINEL_NODE) {
-                remove_node_(root_[i]);
-                root_[i] = SENTINEL_NODE;
-            }
+        if (root_ != SENTINEL_NODE) {
+            remove_node_(root_);
+            root_ = SENTINEL_NODE;
         }
         size_ = 0;
     }
