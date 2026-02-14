@@ -68,9 +68,9 @@ public:
         while (true) {
             // Skip / prefix check (u8 chunks)
             {
-                uint8_t skip = hdr.skip();
-                if (skip) [[unlikely]] {
-                    const uint8_t* actual = hdr.prefix_bytes();
+                if (hdr.is_skip()) [[unlikely]] {
+                    uint8_t skip = reinterpret_cast<const uint8_t*>(&node[1])[7];
+                    const uint8_t* actual = reinterpret_cast<const uint8_t*>(&node[1]);
                     for (uint8_t i = 0; i < skip; ++i) {
                         uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
                         if (expected != actual[i]) [[unlikely]] return nullptr;
@@ -375,6 +375,45 @@ private:
     }
 
     // ==================================================================
+    // prepend_skip_: add or extend skip prefix on an existing node
+    //
+    // If node has no skip: realloc with +1 u64, shift data right.
+    // If node already has skip: update prefix bytes in place.
+    // Returns (possibly new) node pointer.
+    // ==================================================================
+
+    uint64_t* prepend_skip_(uint64_t* node, uint8_t new_len,
+                             const uint8_t* new_bytes) {
+        auto* h = get_header(node);
+        uint8_t os = h->skip();
+        uint8_t ns = os + new_len;
+
+        uint8_t combined[6] = {};
+        std::memcpy(combined, new_bytes, new_len);
+        if (os > 0) std::memcpy(combined + new_len, h->prefix_bytes(), os);
+
+        if (os > 0) {
+            // Already has skip u64 -- update in place
+            h->set_skip(ns);
+            h->set_prefix(combined, ns);
+            return node;
+        }
+
+        // No skip u64 -- realloc with extra u64 and shift data right
+        size_t old_au64 = h->alloc_u64();
+        size_t new_au64 = old_au64 + 1;
+        uint64_t* nn = alloc_node(alloc_, new_au64);
+        nn[0] = node[0];  // copy header
+        std::memcpy(nn + 2, node + 1, (old_au64 - 1) * 8);  // shift data
+        auto* nh = get_header(nn);
+        nh->set_alloc_u64(static_cast<uint16_t>(new_au64));
+        nh->set_skip(ns);
+        nh->set_prefix(combined, ns);
+        dealloc_node(alloc_, node, old_au64);
+        return nn;
+    }
+
+    // ==================================================================
     // make_single_leaf: create 1-entry leaf at given bits
     // ==================================================================
 
@@ -431,16 +470,8 @@ private:
 
         // Propagate old skip/prefix to new child
         uint8_t ps = hdr->skip();
-        if (ps > 0) {
-            auto* ch = get_header(child);
-            uint8_t os = ch->skip();
-            uint8_t ns = ps + os;
-            uint8_t combined[6] = {};
-            std::memcpy(combined, hdr->prefix_bytes(), ps);
-            if (os > 0) std::memcpy(combined + ps, ch->prefix_bytes(), os);
-            ch->set_skip(ns);
-            ch->set_prefix(combined, ns);
-        }
+        if (ps > 0)
+            child = prepend_skip_(child, ps, hdr->prefix_bytes());
 
         dealloc_node(alloc_, node, hdr->alloc_u64());
         return child;
@@ -533,15 +564,8 @@ private:
                 uint64_t* child = build_node_from_arrays_(suf, vals, count, bits - 8);
 
                 // Prepend skip byte to child's prefix
-                auto* ch = get_header(child);
-                uint8_t os = ch->skip();
-                uint8_t ns = os + 1;
-                uint8_t combined[6] = {};
-                combined[0] = first_top;
-                if (os > 0) std::memcpy(combined + 1, ch->prefix_bytes(), os);
-                ch->set_skip(ns);
-                ch->set_prefix(combined, ns);
-                return child;
+                uint8_t byte_arr[1] = {first_top};
+                return prepend_skip_(child, 1, byte_arr);
             }
         }
 
@@ -619,11 +643,8 @@ private:
 
         // Build new leaf at same depth as old node
         uint64_t* new_leaf = make_single_leaf_(leaf_ik, value, leaf_bits);
-        if (old_rem > 0) {
-            auto* nlh = get_header(new_leaf);
-            nlh->set_skip(old_rem);
-            nlh->set_prefix(new_prefix, old_rem);
-        }
+        if (old_rem > 0)
+            new_leaf = prepend_skip_(new_leaf, old_rem, new_prefix);
 
         // Create parent bitmask with 2 children
         uint8_t   bi[2];

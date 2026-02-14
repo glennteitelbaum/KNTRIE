@@ -59,12 +59,12 @@ struct compact_ops {
 
     // --- exact u64 size for a given slot count ---
 
-    static constexpr size_t size_u64(size_t slots) noexcept {
+    static constexpr size_t size_u64(size_t slots, size_t hu = HEADER_U64) noexcept {
         size_t kb = slots * sizeof(K);
         kb = (kb + 7) & ~size_t{7};
         size_t vb = slots * sizeof(VST);
         vb = (vb + 7) & ~size_t{7};
-        return HEADER_U64 + (kb + vb) / 8;
+        return hu + (kb + vb) / 8;
     }
 
     // ==================================================================
@@ -89,7 +89,8 @@ struct compact_ops {
                                uint32_t count, uint8_t skip,
                                const uint8_t* prefix, ALLOC& alloc) {
         uint16_t ts = slots_for(static_cast<uint16_t>(count));
-        size_t au64 = size_u64(ts);
+        size_t hu = 1 + (skip > 0);
+        size_t au64 = size_u64(ts, hu);
         uint64_t* node = alloc_node(alloc, au64);
         auto* h = get_header(node);
         h->set_entries(static_cast<uint16_t>(count));
@@ -192,10 +193,12 @@ struct compact_ops {
         // No dups: realloc to next power-of-2 slot count
         uint16_t new_entries = entries + 1;
         uint16_t new_ts = slots_for(new_entries);
-        size_t au64 = size_u64(new_ts);
+        size_t hu = hdr_u64(node);
+        size_t au64 = size_u64(new_ts, hu);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         *nh = *h;
+        if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(new_entries);
         nh->set_alloc_u64(static_cast<uint16_t>(au64));
 
@@ -237,10 +240,12 @@ struct compact_ops {
         uint16_t new_ts = slots_for(nc);
         if (new_ts < ts) {
             // Realloc + re-seed at smaller power-of-2
-            size_t au64 = size_u64(new_ts);
+            size_t hu = hdr_u64(node);
+            size_t au64 = size_u64(new_ts, hu);
             uint64_t* nn = alloc_node(alloc, au64);
             auto* nh = get_header(nn);
             *nh = *h;
+            if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
             nh->set_entries(nc);
             nh->set_alloc_u64(static_cast<uint16_t>(au64));
 
@@ -266,23 +271,23 @@ private:
     // ==================================================================
 
     static K* keys_(uint64_t* node) noexcept {
-        return reinterpret_cast<K*>(node + HEADER_U64);
+        return reinterpret_cast<K*>(node + hdr_u64(node));
     }
     static const K* keys_(const uint64_t* node) noexcept {
-        return reinterpret_cast<const K*>(node + HEADER_U64);
+        return reinterpret_cast<const K*>(node + hdr_u64(node));
     }
 
     static VST* vals_mut_(uint64_t* node, size_t total) noexcept {
         size_t kb = total * sizeof(K);
         kb = (kb + 7) & ~size_t{7};
         return reinterpret_cast<VST*>(
-            reinterpret_cast<char*>(node + HEADER_U64) + kb);
+            reinterpret_cast<char*>(node + hdr_u64(node)) + kb);
     }
     static const VST* vals_(const uint64_t* node, size_t total) noexcept {
         size_t kb = total * sizeof(K);
         kb = (kb + 7) & ~size_t{7};
         return reinterpret_cast<const VST*>(
-            reinterpret_cast<const char*>(node + HEADER_U64) + kb);
+            reinterpret_cast<const char*>(node + hdr_u64(node)) + kb);
     }
 
     // ==================================================================

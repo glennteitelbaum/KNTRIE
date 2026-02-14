@@ -130,14 +130,14 @@ struct bitmask_ops {
     // Size calculations
     // ==================================================================
 
-    static constexpr size_t bitmask_size_u64(size_t n_children) noexcept {
-        return HEADER_U64 + BITMAP256_U64 + 1 + n_children;  // 7 + n
+    static constexpr size_t bitmask_size_u64(size_t n_children, size_t hu = HEADER_U64) noexcept {
+        return hu + BITMAP256_U64 + 1 + n_children;
     }
 
-    static constexpr size_t bitmap_leaf_size_u64(size_t count) noexcept {
+    static constexpr size_t bitmap_leaf_size_u64(size_t count, size_t hu = HEADER_U64) noexcept {
         size_t vb = count * sizeof(VST);
         vb = (vb + 7) & ~size_t{7};
-        return HEADER_U64 + BITMAP256_U64 + vb / 8;  // 6 + ceil(n*VST/8)
+        return hu + BITMAP256_U64 + vb / 8;
     }
 
     // ==================================================================
@@ -185,7 +185,8 @@ struct bitmask_ops {
         bitmap256& bm = bm_mut_(node);
         int oc = h->entries();
         int nc = oc + 1;
-        size_t needed = bitmask_size_u64(nc);
+        size_t hu = hdr_u64(node);
+        size_t needed = bitmask_size_u64(nc, hu);
 
         // In-place
         if (needed <= h->alloc_u64()) {
@@ -201,6 +202,7 @@ struct bitmask_ops {
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         *nh = *h;
+        if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(static_cast<uint16_t>(nc));
         nh->set_alloc_u64(static_cast<uint16_t>(au64));
 
@@ -230,7 +232,8 @@ struct bitmask_ops {
             return nullptr;
         }
 
-        size_t needed = bitmask_size_u64(nc);
+        size_t hu = hdr_u64(node);
+        size_t needed = bitmask_size_u64(nc, hu);
 
         // In-place
         if (!should_shrink_u64(h->alloc_u64(), needed)) {
@@ -245,6 +248,7 @@ struct bitmask_ops {
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         *nh = *h;
+        if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(static_cast<uint16_t>(nc));
         nh->set_alloc_u64(static_cast<uint16_t>(au64));
 
@@ -269,7 +273,8 @@ struct bitmask_ops {
                                    const uint8_t* prefix, ALLOC& alloc) {
         bitmap256 bm = bitmap256::from_indices(indices, n_children);
 
-        size_t needed = bitmask_size_u64(n_children);
+        size_t hu = 1 + (skip > 0);
+        size_t needed = bitmask_size_u64(n_children, hu);
         size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
@@ -357,7 +362,7 @@ struct bitmask_ops {
         if constexpr (!INSERT) return {node, false, false};
 
         uint16_t nc = count + 1;
-        size_t new_sz = bitmap_leaf_size_u64(nc);
+        size_t new_sz = bitmap_leaf_size_u64(nc, hdr_u64(node));
 
         // In-place
         if (new_sz <= h->alloc_u64()) {
@@ -374,6 +379,7 @@ struct bitmask_ops {
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         *nh = *h;
+        if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(nc);
         nh->set_alloc_u64(static_cast<uint16_t>(au64));
         bitmap256& nbm = bm_mut_(nn);
@@ -409,7 +415,7 @@ struct bitmask_ops {
             return {nullptr, true};
         }
 
-        size_t new_sz = bitmap_leaf_size_u64(nc);
+        size_t new_sz = bitmap_leaf_size_u64(nc, hdr_u64(node));
 
         // In-place
         if (!should_shrink_u64(h->alloc_u64(), new_sz)) {
@@ -425,6 +431,7 @@ struct bitmask_ops {
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         *nh = *h;
+        if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(nc);
         nh->set_alloc_u64(static_cast<uint16_t>(au64));
         bm_mut_(nn) = bm;
@@ -513,36 +520,36 @@ struct bitmask_ops {
     }
 
 private:
-    // --- Shared: bitmap is always at HEADER_U64 offset ---
+    // --- Shared: bitmap starts after header (1 or 2 u64s) ---
     static const bitmap256& bm_(const uint64_t* n) noexcept {
-        return *reinterpret_cast<const bitmap256*>(n + HEADER_U64);
+        return *reinterpret_cast<const bitmap256*>(n + hdr_u64(n));
     }
     static bitmap256& bm_mut_(uint64_t* n) noexcept {
-        return *reinterpret_cast<bitmap256*>(n + HEADER_U64);
+        return *reinterpret_cast<bitmap256*>(n + hdr_u64(n));
     }
 
     // --- Bitmask node: children array (includes sentinel at [0]) ---
     static const uint64_t* children_(const uint64_t* n) noexcept {
-        return n + HEADER_U64 + BITMAP256_U64;  // offset 6
+        return n + hdr_u64(n) + BITMAP256_U64;
     }
     static uint64_t* children_mut_(uint64_t* n) noexcept {
-        return n + HEADER_U64 + BITMAP256_U64;
+        return n + hdr_u64(n) + BITMAP256_U64;
     }
 
     // --- Bitmask node: real children (past sentinel) ---
     static const uint64_t* real_children_(const uint64_t* n) noexcept {
-        return n + HEADER_U64 + BITMAP256_U64 + 1;  // offset 7
+        return n + hdr_u64(n) + BITMAP256_U64 + 1;
     }
     static uint64_t* real_children_mut_(uint64_t* n) noexcept {
-        return n + HEADER_U64 + BITMAP256_U64 + 1;
+        return n + hdr_u64(n) + BITMAP256_U64 + 1;
     }
 
     // --- Bitmap256 leaf: values after bitmap ---
     static const VST* bl_vals_(const uint64_t* n) noexcept {
-        return reinterpret_cast<const VST*>(n + HEADER_U64 + BITMAP256_U64);  // offset 6
+        return reinterpret_cast<const VST*>(n + hdr_u64(n) + BITMAP256_U64);
     }
     static VST* bl_vals_mut_(uint64_t* n) noexcept {
-        return reinterpret_cast<VST*>(n + HEADER_U64 + BITMAP256_U64);
+        return reinterpret_cast<VST*>(n + hdr_u64(n) + BITMAP256_U64);
     }
 };
 
