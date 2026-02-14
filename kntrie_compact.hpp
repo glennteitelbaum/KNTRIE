@@ -26,27 +26,6 @@ struct adaptive_search {
             base = (base[step] <= key) ? base + step : base;
         return base;
     }
-
-    // Returns index if found (>=0), or -1 if not found.
-    // count must be a power of 2.
-    static int search(const K* keys, int count, K key) noexcept {
-        const K* base = keys;
-        for (int step = count >> 1; step > 0; step >>= 1)
-            base = (base[step] <= key) ? base + step : base;
-        return (*base == key) ? static_cast<int>(base - keys) : -1;
-    }
-
-    // Returns index if found (>=0), or -(insertion_point + 1) if not found.
-    // count must be a power of 2.
-    static int search_insert(const K* keys, int count, K key) noexcept {
-        const K* base = keys;
-        for (int step = count >> 1; step > 0; step >>= 1)
-            base = (base[step] <= key) ? base + step : base;
-        if (*base == key) return static_cast<int>(base - keys);
-        int pos = static_cast<int>(base - keys);
-        if (*base < key) pos++;
-        return -(pos + 1);
-    }
 };
 
 // ==========================================================================
@@ -179,12 +158,13 @@ struct compact_ops {
         K*   kd = keys_(node);
         VST* vd = vals_mut_(node, ts);
 
-        int idx = adaptive_search<K>::search_insert(
+        const K* base = adaptive_search<K>::find_base(
             kd, static_cast<int>(ts), suffix);
 
         // Key exists
-        if (idx >= 0) {
+        if (*base == suffix) {
             if constexpr (ASSIGN) {
+                int idx = static_cast<int>(base - kd);
                 VT::destroy(vd[idx], alloc);
                 VT::write_slot(&vd[idx], value);
                 // Update all dup copies too
@@ -198,7 +178,7 @@ struct compact_ops {
         if (entries >= COMPACT_MAX)
             return {node, false, true};  // needs_split
 
-        int ins = -(idx + 1);
+        int ins = static_cast<int>(base - kd) + (*base < suffix);
         uint16_t dups = ts - entries;
 
         // Dups available: consume one in-place
@@ -238,9 +218,10 @@ struct compact_ops {
         K*   kd = keys_(node);
         VST* vd = vals_mut_(node, ts);
 
-        int idx = adaptive_search<K>::search(
+        const K* base = adaptive_search<K>::find_base(
             kd, static_cast<int>(ts), suffix);
-        if (idx < 0) return {node, false};
+        if (*base != suffix) return {node, false};
+        int idx = static_cast<int>(base - kd);
 
         uint16_t nc = entries - 1;
 
