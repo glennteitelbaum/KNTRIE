@@ -268,21 +268,42 @@ static void emit_html(const std::vector<Row>& rows) {
     const char* names[] = {"kntrie_int32", "kntrie_uint64", "map_int32", "map_uint64", "umap_int32", "umap_uint64"};
     const char* suffixes[] = {"find", "insert", "erase", "mem"};
 
-    // HTML preamble — ES modules via esm.sh, deps bundled
+    // HTML preamble — Chart.js from CDN, zero framework deps
     std::printf("%s", R"HTML(<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>kntrie Benchmark</title>
-<style>body{margin:0;background:#0f0f1a;}</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  body { margin:0; background:#0f0f1a; color:#ddd; font-family:system-ui,sans-serif; }
+  .wrap { max-width:700px; margin:0 auto; padding:16px 12px; }
+  h2 { margin:0 0 4px; font-size:18px; font-weight:700; text-align:center; }
+  .sub { text-align:center; color:#777; font-size:12px; margin:0 0 12px; }
+  .btns { display:flex; justify-content:center; gap:8px; margin-bottom:16px; }
+  .btns button { padding:6px 16px; border-radius:6px; border:1px solid #444;
+    background:#1a1a2e; color:#aaa; cursor:pointer; font-size:13px; font-weight:600; }
+  .btns button.active { background:#3b82f6; color:#fff; }
+  .chart-box { margin-bottom:24px; }
+  .chart-box h3 { margin:0 0 6px; font-size:14px; font-weight:600; text-align:center; }
+  canvas { background:#12122a; border-radius:8px; }
+</style>
 </head>
 <body>
-<div id="root"></div>
-<script type="module">
-import React, { useState } from "https://esm.sh/react@18.2.0";
-import { createRoot } from "https://esm.sh/react-dom@18.2.0/client";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "https://esm.sh/recharts@2.12.7?deps=react@18.2.0,react-dom@18.2.0";
+<div class="wrap">
+  <h2>kntrie Benchmark</h2>
+  <p class="sub">Log-log · Per-entry · Lower is better · Solid = i32, Dashed = u64</p>
+  <div class="btns">
+    <button class="active" onclick="show('random')">random</button>
+    <button onclick="show('sequential')">sequential</button>
+  </div>
+  <div class="chart-box"><h3>Find (ns/entry)</h3><canvas id="c_find"></canvas></div>
+  <div class="chart-box"><h3>Insert (ns/entry)</h3><canvas id="c_insert"></canvas></div>
+  <div class="chart-box"><h3>Erase N/2 (ns/entry)</h3><canvas id="c_erase"></canvas></div>
+  <div class="chart-box"><h3>Memory (B/entry)</h3><canvas id="c_mem"></canvas></div>
+</div>
+<script>
 )HTML");
 
     // Emit data blob
@@ -302,154 +323,135 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
     }
     std::printf("];\n\n");
 
-    // Static template using htm (tagged template JSX alternative, no Babel needed)
+    // Chart.js template — plain JS, no framework
     std::printf("%s",
-R"JSX(import htm from "https://esm.sh/htm@3.1.1";
-const html = htm.bind(React.createElement);
-
+R"JS(
 const LINES = [
-  { key: "kntrie_int32", color: "#3b82f6", dash: "", label: "kntrie i32" },
-  { key: "kntrie_uint64", color: "#93c5fd", dash: "6 3", label: "kntrie u64" },
-  { key: "map_int32", color: "#ef4444", dash: "", label: "map i32" },
-  { key: "map_uint64", color: "#fca5a5", dash: "6 3", label: "map u64" },
-  { key: "umap_int32", color: "#22c55e", dash: "", label: "umap i32" },
-  { key: "umap_uint64", color: "#86efac", dash: "6 3", label: "umap u64" },
-  { key: "raw_int32", color: "#888", dash: "", label: "raw i32", memOnly: true },
-  { key: "raw_uint64", color: "#555", dash: "3 3", label: "raw u64", memOnly: true },
+  { key: "kntrie_int32", color: "#3b82f6", dash: [], width: 2.5, label: "kntrie i32" },
+  { key: "kntrie_uint64", color: "#93c5fd", dash: [6,3], width: 1.5, label: "kntrie u64" },
+  { key: "map_int32", color: "#ef4444", dash: [], width: 2.5, label: "map i32" },
+  { key: "map_uint64", color: "#fca5a5", dash: [6,3], width: 1.5, label: "map u64" },
+  { key: "umap_int32", color: "#22c55e", dash: [], width: 2.5, label: "umap i32" },
+  { key: "umap_uint64", color: "#86efac", dash: [6,3], width: 1.5, label: "umap u64" },
+];
+
+const MEM_LINES = [
+  ...LINES,
+  { key: "raw_int32", color: "#888", dash: [], width: 1, label: "raw i32" },
+  { key: "raw_uint64", color: "#555", dash: [3,3], width: 1, label: "raw u64" },
 ];
 
 const METRICS = [
-  { suffix: "find", label: "Find (ns/entry)", convert: (ms, n) => (ms * 1e6) / n },
-  { suffix: "insert", label: "Insert (ns/entry)", convert: (ms, n) => (ms * 1e6) / n },
-  { suffix: "erase", label: "Erase N/2 (ns/entry)", convert: (ms, n) => (ms * 1e6) / (n / 2) },
-  { suffix: "mem", label: "Memory (B/entry)", convert: (b, n) => b / n },
+  { id: "find", suffix: "find", convert: (ms, n) => (ms * 1e6) / n },
+  { id: "insert", suffix: "insert", convert: (ms, n) => (ms * 1e6) / n },
+  { id: "erase", suffix: "erase", convert: (ms, n) => (ms * 1e6) / (n / 2) },
+  { id: "mem", suffix: "mem", convert: (b, n) => b / n },
 ];
 
-const PATTERNS = ["random", "sequential"];
-
 function buildData(pattern, metric) {
-  const lines = LINES.filter((l) => metric.suffix === "mem" || !l.memOnly);
+  const lines = metric.id === "mem" ? MEM_LINES : LINES;
   return RAW_DATA
-    .filter((r) => r.pattern === pattern)
-    .map((r) => {
-      const out = { N: r.N, logN: Math.log10(r.N) };
-      for (const line of lines) {
-        if (line.key === "raw_int32") {
-          if (metric.suffix === "mem") out[line.key] = r.N * 12 / r.N;
-        } else if (line.key === "raw_uint64") {
-          if (metric.suffix === "mem") out[line.key] = r.N * 16 / r.N;
-        } else {
-          const raw = r[`${line.key}_${metric.suffix}`];
-          if (raw != null) out[line.key] = metric.convert(raw, r.N);
-        }
+    .filter(r => r.pattern === pattern)
+    .map(r => {
+      const pt = { N: r.N };
+      for (const l of lines) {
+        if (l.key === "raw_int32") { pt[l.key] = 12; continue; }
+        if (l.key === "raw_uint64") { pt[l.key] = 16; continue; }
+        const raw = r[l.key + "_" + metric.suffix];
+        if (raw != null) pt[l.key] = metric.convert(raw, r.N);
       }
-      return out;
+      return pt;
     });
 }
 
-const fmtN = (logV) => {
-  const v = Math.pow(10, logV);
-  if (v >= 1e6) return (v / 1e6).toFixed(v >= 1e7 ? 0 : 1) + "M";
-  if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + "K";
-  return String(Math.round(v));
-};
+const charts = {};
 
-const fmtVal = (v) => {
-  if (v == null) return "";
-  if (v < 0.1) return v.toFixed(3);
-  if (v < 10) return v.toFixed(2);
-  if (v < 1000) return v.toFixed(1);
-  return v.toFixed(0);
-};
+function makeChart(canvasId, metric) {
+  const ctx = document.getElementById(canvasId).getContext("2d");
+  const lines = metric.id === "mem" ? MEM_LINES : LINES;
+  const data = buildData("random", metric);
 
-const Tip = ({ active, payload, label }) => {
-  if (!active || !payload?.length) return null;
-  return html`<div style=${{ background: "#1a1a2e", border: "1px solid #444", borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
-    <div style=${{ color: "#aaa", marginBottom: 4, fontWeight: 600 }}>N = ${fmtN(label)}</div>
-    ${payload.filter((p) => p.value != null).map((p) => html`
-      <div key=${p.dataKey} style=${{ color: p.color, marginBottom: 1 }}>
-        ${LINES.find((l) => l.key === p.dataKey)?.label}: ${fmtVal(p.value)}
-      </div>
-    `)}
-  </div>`;
-};
-
-const Chart = ({ title, data }) => {
-  const allVals = data.flatMap((d) => LINES.map((l) => d[l.key]).filter((v) => v != null && v > 0));
-  if (!allVals.length) return null;
-
-  const logNs = data.map(d => d.logN);
-  const minX = Math.floor(Math.min(...logNs));
-  const maxX = Math.ceil(Math.max(...logNs));
-  const xTicks = [];
-  for (let i = minX; i <= maxX; i++) xTicks.push(i);
-
-  return html`<div style=${{ marginBottom: 28 }}>
-    <h3 style=${{ margin: "0 0 6px 0", fontSize: 14, fontWeight: 600, color: "#ddd", textAlign: "center" }}>${title}</h3>
-    <${ResponsiveContainer} width="100%" height=${240}>
-      <${LineChart} data=${data} margin=${{ top: 4, right: 16, left: 8, bottom: 4 }}>
-        <${CartesianGrid} strokeDasharray="3 3" stroke="#2a2a3e" />
-        <${XAxis} dataKey="logN" type="number" domain=${[minX, maxX]}
-          ticks=${xTicks} tickFormatter=${fmtN}
-          tick=${{ fill: "#888", fontSize: 11 }} stroke="#444" />
-        <${YAxis} scale="log" domain=${["auto", "auto"]} type="number"
-          tickFormatter=${fmtVal} tick=${{ fill: "#888", fontSize: 10 }}
-          stroke="#444" width=${52} allowDataOverflow />
-        <${Tooltip} content=${html`<${Tip} />`} />
-        ${LINES.map((l) => html`
-          <${Line} key=${l.key} type="monotone" dataKey=${l.key} stroke=${l.color}
-            strokeWidth=${l.dash ? 1.5 : 2.5} dot=${false}
-            strokeDasharray=${l.dash || undefined} connectNulls isAnimationActive=${false} />
-        `)}
-      </${LineChart}>
-    </${ResponsiveContainer}>
-  </div>`;
-};
-
-function App() {
-  const [pattern, setPattern] = useState("random");
-  return html`<div style=${{ background: "#0f0f1a", color: "#ddd", minHeight: "100vh", padding: "16px 12px", fontFamily: "system-ui, sans-serif" }}>
-    <h2 style=${{ margin: "0 0 4px 0", fontSize: 18, fontWeight: 700, textAlign: "center" }}>kntrie Benchmark</h2>
-    <p style=${{ textAlign: "center", color: "#777", fontSize: 12, margin: "0 0 12px 0" }}>
-      Log-log · Per-entry · Lower is better · Solid = i32, Dashed = u64
-    </p>
-
-    <div style=${{ display: "flex", justifyContent: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
-      ${LINES.map((l) => html`
-        <div key=${l.key} style=${{ display: "flex", alignItems: "center", gap: 5, fontSize: 11 }}>
-          ${l.dash
-            ? html`<svg width=${22} height=${4}><line x1=${0} y1=${2} x2=${22} y2=${2} stroke=${l.color} strokeWidth=${2} strokeDasharray=${l.dash} /></svg>`
-            : html`<div style=${{ width: 22, height: 2.5, background: l.color, borderRadius: 1 }} />`}
-          <span style=${{ color: "#bbb" }}>${l.label}</span>
-        </div>
-      `)}
-    </div>
-
-    <div style=${{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 16 }}>
-      ${PATTERNS.map((p) => html`
-        <button key=${p} onClick=${() => setPattern(p)}
-          style=${{
-            padding: "6px 16px", borderRadius: 6, border: "1px solid #444",
-            background: pattern === p ? "#3b82f6" : "#1a1a2e",
-            color: pattern === p ? "#fff" : "#aaa",
-            cursor: "pointer", fontSize: 13, fontWeight: 600,
-          }}>
-          ${p}
-        </button>
-      `)}
-    </div>
-
-    <div style=${{ maxWidth: 620, margin: "0 auto" }}>
-      ${METRICS.map((m) => html`
-        <${Chart} key=${pattern + "-" + m.suffix} title=${m.label}
-          data=${buildData(pattern, m)} />
-      `)}
-    </div>
-  </div>`;
+  charts[canvasId] = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: data.map(d => d.N),
+      datasets: lines.map(l => ({
+        label: l.label,
+        data: data.map(d => d[l.key] ?? null),
+        borderColor: l.color,
+        backgroundColor: l.color + "33",
+        borderWidth: l.width,
+        borderDash: l.dash,
+        pointRadius: 0,
+        pointHitRadius: 8,
+        tension: 0.2,
+        spanGaps: true,
+      })),
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: true, labels: { color: "#bbb", font: { size: 11 }, boxWidth: 20, padding: 10 } },
+        tooltip: {
+          backgroundColor: "#1a1a2e",
+          borderColor: "#444",
+          borderWidth: 1,
+          titleColor: "#aaa",
+          bodyColor: "#ddd",
+          callbacks: {
+            title: (items) => {
+              const v = items[0].parsed.x;
+              if (v >= 1e6) return "N = " + (v/1e6).toFixed(1) + "M";
+              if (v >= 1e3) return "N = " + (v/1e3).toFixed(1) + "K";
+              return "N = " + v;
+            },
+            label: (item) => {
+              const v = item.parsed.y;
+              if (v == null) return null;
+              const s = v < 0.1 ? v.toFixed(3) : v < 10 ? v.toFixed(2) : v < 1000 ? v.toFixed(1) : v.toFixed(0);
+              return " " + item.dataset.label + ": " + s;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: "logarithmic",
+          title: { display: false },
+          ticks: { color: "#888", font: { size: 11 },
+            callback: (v) => v >= 1e6 ? (v/1e6)+"M" : v >= 1e3 ? (v/1e3)+"K" : v },
+          grid: { color: "#2a2a3e" },
+        },
+        y: {
+          type: "logarithmic",
+          ticks: { color: "#888", font: { size: 10 },
+            callback: (v) => v < 0.1 ? v.toFixed(2) : v < 10 ? v.toFixed(1) : v >= 1000 ? v.toFixed(0) : v.toFixed(1) },
+          grid: { color: "#2a2a3e" },
+        },
+      },
+    },
+  });
+  charts[canvasId]._metric = metric;
 }
 
-createRoot(document.getElementById("root")).render(html`<${App} />`);
-)JSX");
+METRICS.forEach(m => makeChart("c_" + m.id, m));
+
+function show(pattern) {
+  document.querySelectorAll(".btns button").forEach(b => b.classList.remove("active"));
+  event.target.classList.add("active");
+  for (const [id, chart] of Object.entries(charts)) {
+    const m = chart._metric;
+    const lines = m.id === "mem" ? MEM_LINES : LINES;
+    const data = buildData(pattern, m);
+    chart.data.labels = data.map(d => d.N);
+    lines.forEach((l, i) => {
+      chart.data.datasets[i].data = data.map(d => d[l.key] ?? null);
+    });
+    chart.update("none");
+  }
+}
+)JS");
 
     std::printf("</script>\n</body>\n</html>\n");
 }

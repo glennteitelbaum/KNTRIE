@@ -4,186 +4,188 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>kntrie Benchmark</title>
-<style>body{margin:0;background:#0f0f1a;}</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  body { margin:0; background:#0f0f1a; color:#ddd; font-family:system-ui,sans-serif; }
+  .wrap { max-width:700px; margin:0 auto; padding:16px 12px; }
+  h2 { margin:0 0 4px; font-size:18px; font-weight:700; text-align:center; }
+  .sub { text-align:center; color:#777; font-size:12px; margin:0 0 12px; }
+  .btns { display:flex; justify-content:center; gap:8px; margin-bottom:16px; }
+  .btns button { padding:6px 16px; border-radius:6px; border:1px solid #444;
+    background:#1a1a2e; color:#aaa; cursor:pointer; font-size:13px; font-weight:600; }
+  .btns button.active { background:#3b82f6; color:#fff; }
+  .chart-box { margin-bottom:24px; }
+  .chart-box h3 { margin:0 0 6px; font-size:14px; font-weight:600; text-align:center; }
+  canvas { background:#12122a; border-radius:8px; }
+</style>
 </head>
 <body>
-<div id="root"></div>
-<script type="module">
-import React, { useState } from "https://esm.sh/react@18.2.0";
-import { createRoot } from "https://esm.sh/react-dom@18.2.0/client";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "https://esm.sh/recharts@2.12.7?deps=react@18.2.0,react-dom@18.2.0";
+<div class="wrap">
+  <h2>kntrie Benchmark</h2>
+  <p class="sub">Log-log · Per-entry · Lower is better · Solid = i32, Dashed = u64</p>
+  <div class="btns">
+    <button class="active" onclick="show('random')">random</button>
+    <button onclick="show('sequential')">sequential</button>
+  </div>
+  <div class="chart-box"><h3>Find (ns/entry)</h3><canvas id="c_find"></canvas></div>
+  <div class="chart-box"><h3>Insert (ns/entry)</h3><canvas id="c_insert"></canvas></div>
+  <div class="chart-box"><h3>Erase N/2 (ns/entry)</h3><canvas id="c_erase"></canvas></div>
+  <div class="chart-box"><h3>Memory (B/entry)</h3><canvas id="c_mem"></canvas></div>
+</div>
+<script>
 const RAW_DATA = [
-  {pattern:"random",N:100,kntrie_int32_find:0.0004,kntrie_int32_insert:0.0021,kntrie_int32_erase:0.0012,kntrie_int32_mem:4816,kntrie_uint64_find:0.0005,kntrie_uint64_insert:0.0026,kntrie_uint64_erase:0.0010,kntrie_uint64_mem:4880,map_int32_find:0.0005,map_int32_insert:0.0036,map_int32_erase:0.0019,map_int32_mem:4800,map_uint64_find:0.0005,map_uint64_insert:0.0036,map_uint64_erase:0.0027,map_uint64_mem:4800,umap_int32_find:0.0004,umap_int32_insert:0.0013,umap_int32_erase:0.0010,umap_int32_mem:3224,umap_uint64_find:0.0005,umap_uint64_insert:0.0015,umap_uint64_erase:0.0014,umap_uint64_mem:3224},
-  {pattern:"random",N:150,kntrie_int32_find:0.0006,kntrie_int32_insert:0.0034,kntrie_int32_erase:0.0017,kntrie_int32_mem:5984,kntrie_uint64_find:0.0007,kntrie_uint64_insert:0.0037,kntrie_uint64_erase:0.0020,kntrie_uint64_mem:6208,map_int32_find:0.0010,map_int32_insert:0.0054,map_int32_erase:0.0029,map_int32_mem:7200,map_uint64_find:0.0010,map_uint64_insert:0.0092,map_uint64_erase:0.0037,map_uint64_mem:7200,umap_int32_find:0.0007,umap_int32_insert:0.0054,umap_int32_erase:0.0017,umap_int32_mem:4856,umap_uint64_find:0.0007,umap_uint64_insert:0.0036,umap_uint64_erase:0.0014,umap_uint64_mem:4856},
-  {pattern:"random",N:225,kntrie_int32_find:0.0008,kntrie_int32_insert:0.0064,kntrie_int32_erase:0.0021,kntrie_int32_mem:7464,kntrie_uint64_find:0.0011,kntrie_uint64_insert:0.0059,kntrie_uint64_erase:0.0030,kntrie_uint64_mem:8016,map_int32_find:0.0013,map_int32_insert:0.0091,map_int32_erase:0.0045,map_int32_mem:10800,map_uint64_find:0.0017,map_uint64_insert:0.0144,map_uint64_erase:0.0087,map_uint64_mem:10800,umap_int32_find:0.0011,umap_int32_insert:0.0080,umap_int32_erase:0.0020,umap_int32_mem:7216,umap_uint64_find:0.0011,umap_uint64_insert:0.0073,umap_uint64_erase:0.0022,umap_uint64_mem:7216},
-  {pattern:"random",N:337,kntrie_int32_find:0.0013,kntrie_int32_insert:0.0110,kntrie_int32_erase:0.0039,kntrie_int32_mem:9488,kntrie_uint64_find:0.0015,kntrie_uint64_insert:0.0103,kntrie_uint64_erase:0.0037,kntrie_uint64_mem:10448,map_int32_find:0.0024,map_int32_insert:0.0177,map_int32_erase:0.0091,map_int32_mem:16176,map_uint64_find:0.0022,map_uint64_insert:0.0226,map_uint64_erase:0.0092,map_uint64_mem:16176,umap_int32_find:0.0016,umap_int32_insert:0.0105,umap_int32_erase:0.0027,umap_int32_mem:10784,umap_uint64_find:0.0015,umap_uint64_insert:0.0093,umap_uint64_erase:0.0031,umap_uint64_mem:10784},
-  {pattern:"random",N:506,kntrie_int32_find:0.0022,kntrie_int32_insert:0.0186,kntrie_int32_erase:0.0066,kntrie_int32_mem:12224,kntrie_uint64_find:0.0024,kntrie_uint64_insert:0.0196,kntrie_uint64_erase:0.0088,kntrie_uint64_mem:13664,map_int32_find:0.0037,map_int32_insert:0.0331,map_int32_erase:0.0159,map_int32_mem:24288,map_uint64_find:0.0037,map_uint64_insert:0.0380,map_uint64_erase:0.0189,map_uint64_mem:24288,umap_int32_find:0.0022,umap_int32_insert:0.0143,umap_int32_erase:0.0045,umap_int32_mem:16472,umap_uint64_find:0.0023,umap_uint64_insert:0.0125,umap_uint64_erase:0.0055,umap_uint64_mem:16472},
-  {pattern:"random",N:759,kntrie_int32_find:0.0037,kntrie_int32_insert:0.0328,kntrie_int32_erase:0.0124,kntrie_int32_mem:15824,kntrie_uint64_find:0.0036,kntrie_uint64_insert:0.0336,kntrie_uint64_erase:0.0129,kntrie_uint64_mem:18160,map_int32_find:0.0065,map_int32_insert:0.0579,map_int32_erase:0.0314,map_int32_mem:36432,map_uint64_find:0.0071,map_uint64_insert:0.0633,map_uint64_erase:0.0345,map_uint64_mem:36432,umap_int32_find:0.0035,umap_int32_insert:0.0224,umap_int32_erase:0.0079,umap_int32_mem:24304,umap_uint64_find:0.0036,umap_uint64_insert:0.0207,umap_uint64_erase:0.0087,umap_uint64_mem:24304},
-  {pattern:"random",N:1139,kntrie_int32_find:0.0055,kntrie_int32_insert:0.0555,kntrie_int32_erase:0.0216,kntrie_int32_mem:20824,kntrie_uint64_find:0.0059,kntrie_uint64_insert:0.0577,kntrie_uint64_erase:0.0213,kntrie_uint64_mem:24544,map_int32_find:0.0159,map_int32_insert:0.0904,map_int32_erase:0.0560,map_int32_mem:54672,map_uint64_find:0.0164,map_uint64_insert:0.1052,map_uint64_erase:0.0540,map_uint64_mem:54672,umap_int32_find:0.0055,umap_int32_insert:0.0345,umap_int32_erase:0.0149,umap_int32_mem:36880,umap_uint64_find:0.0052,umap_uint64_insert:0.0306,umap_uint64_erase:0.0106,umap_uint64_mem:36880},
-  {pattern:"random",N:1708,kntrie_int32_find:0.0129,kntrie_int32_insert:0.1132,kntrie_int32_erase:0.0418,kntrie_int32_mem:28320,kntrie_uint64_find:0.0131,kntrie_uint64_insert:0.0929,kntrie_uint64_erase:0.0332,kntrie_uint64_mem:34384,map_int32_find:0.0334,map_int32_insert:0.1559,map_int32_erase:0.0882,map_int32_mem:81984,map_uint64_find:0.0348,map_uint64_insert:0.1762,map_uint64_erase:0.0851,map_uint64_mem:81984,umap_int32_find:0.0084,umap_int32_insert:0.0465,umap_int32_erase:0.0184,umap_int32_mem:54920,umap_uint64_find:0.0083,umap_uint64_insert:0.0448,umap_uint64_erase:0.0183,umap_uint64_mem:54920},
-  {pattern:"random",N:2562,kntrie_int32_find:0.0328,kntrie_int32_insert:0.1501,kntrie_int32_erase:0.0515,kntrie_int32_mem:39680,kntrie_uint64_find:0.0315,kntrie_uint64_insert:0.1446,kntrie_uint64_erase:0.0504,kntrie_uint64_mem:49104,map_int32_find:0.0599,map_int32_insert:0.2569,map_int32_erase:0.1462,map_int32_mem:122976,map_uint64_find:0.0619,map_uint64_insert:0.2732,map_uint64_erase:0.1509,map_uint64_mem:122976,umap_int32_find:0.0120,umap_int32_insert:0.0710,umap_int32_erase:0.0329,umap_int32_mem:83512,umap_uint64_find:0.0123,umap_uint64_insert:0.0667,umap_uint64_erase:0.0303,umap_uint64_mem:83512},
-  {pattern:"random",N:3844,kntrie_int32_find:0.0663,kntrie_int32_insert:0.2351,kntrie_int32_erase:0.0809,kntrie_int32_mem:56080,kntrie_uint64_find:0.0643,kntrie_uint64_insert:0.2342,kntrie_uint64_erase:0.0828,kntrie_uint64_mem:71840,map_int32_find:0.1047,map_int32_insert:0.3941,map_int32_erase:0.2253,map_int32_mem:184512,map_uint64_find:0.1089,map_uint64_insert:0.4363,map_uint64_erase:0.2285,map_uint64_mem:184512,umap_int32_find:0.0186,umap_int32_insert:0.1067,umap_int32_erase:0.0530,umap_int32_mem:124472,umap_uint64_find:0.0198,umap_uint64_insert:0.1066,umap_uint64_erase:0.0542,umap_uint64_mem:124472},
-  {pattern:"random",N:5766,kntrie_int32_find:0.1061,kntrie_int32_insert:0.3399,kntrie_int32_erase:0.1278,kntrie_int32_mem:82336,kntrie_uint64_find:0.1042,kntrie_uint64_insert:0.3538,kntrie_uint64_erase:0.1225,kntrie_uint64_mem:104832,map_int32_find:0.1914,map_int32_insert:0.6676,map_int32_erase:0.3786,map_int32_mem:276768,map_uint64_find:0.1969,map_uint64_insert:0.7211,map_uint64_erase:0.3836,map_uint64_mem:276768,umap_int32_find:0.0296,umap_int32_insert:0.1618,umap_int32_erase:0.0791,umap_int32_mem:186008,umap_uint64_find:0.0310,umap_uint64_insert:0.1618,umap_uint64_erase:0.0795,umap_uint64_mem:186008},
-  {pattern:"random",N:8649,kntrie_int32_find:0.2064,kntrie_int32_insert:0.5062,kntrie_int32_erase:0.1923,kntrie_int32_mem:118592,kntrie_uint64_find:0.2097,kntrie_uint64_insert:0.5134,kntrie_uint64_erase:0.1915,kntrie_uint64_mem:156416,map_int32_find:0.3209,map_int32_insert:1.0943,map_int32_erase:0.6161,map_int32_mem:415152,map_uint64_find:0.3380,map_uint64_insert:1.2066,map_uint64_erase:0.6339,map_uint64_mem:415152,umap_int32_find:0.0694,umap_int32_insert:0.2362,umap_int32_erase:0.1233,umap_int32_mem:277840,umap_uint64_find:0.0723,umap_uint64_insert:0.2505,umap_uint64_erase:0.1205,umap_uint64_mem:277840},
-  {pattern:"sequential",N:100,kntrie_int32_find:0.0008,kntrie_int32_insert:0.0043,kntrie_int32_erase:0.0020,kntrie_int32_mem:3328,kntrie_uint64_find:0.0008,kntrie_uint64_insert:0.0039,kntrie_uint64_erase:0.0015,kntrie_uint64_mem:3840,map_int32_find:0.0005,map_int32_insert:0.0034,map_int32_erase:0.0022,map_int32_mem:4800,map_uint64_find:0.0005,map_uint64_insert:0.0037,map_uint64_erase:0.0018,map_uint64_mem:4800,umap_int32_find:0.0003,umap_int32_insert:0.0012,umap_int32_erase:0.0006,umap_int32_mem:3224,umap_uint64_find:0.0003,umap_uint64_insert:0.0014,umap_uint64_erase:0.0010,umap_uint64_mem:3224},
-  {pattern:"sequential",N:150,kntrie_int32_find:0.0013,kntrie_int32_insert:0.0063,kntrie_int32_erase:0.0023,kntrie_int32_mem:4096,kntrie_uint64_find:0.0013,kntrie_uint64_insert:0.0088,kntrie_uint64_erase:0.0034,kntrie_uint64_mem:4608,map_int32_find:0.0008,map_int32_insert:0.0058,map_int32_erase:0.0031,map_int32_mem:7200,map_uint64_find:0.0008,map_uint64_insert:0.0070,map_uint64_erase:0.0037,map_uint64_mem:7200,umap_int32_find:0.0005,umap_int32_insert:0.0033,umap_int32_erase:0.0009,umap_int32_mem:4856,umap_uint64_find:0.0005,umap_uint64_insert:0.0033,umap_uint64_erase:0.0009,umap_uint64_mem:4856},
-  {pattern:"sequential",N:225,kntrie_int32_find:0.0023,kntrie_int32_insert:0.0101,kntrie_int32_erase:0.0044,kntrie_int32_mem:5120,kntrie_uint64_find:0.0021,kntrie_uint64_insert:0.0098,kntrie_uint64_erase:0.0043,kntrie_uint64_mem:6144,map_int32_find:0.0013,map_int32_insert:0.0099,map_int32_erase:0.0048,map_int32_mem:10800,map_uint64_find:0.0013,map_uint64_insert:0.0111,map_uint64_erase:0.0059,map_uint64_mem:10800,umap_int32_find:0.0007,umap_int32_insert:0.0045,umap_int32_erase:0.0013,umap_int32_mem:7216,umap_uint64_find:0.0007,umap_uint64_insert:0.0048,umap_uint64_erase:0.0014,umap_uint64_mem:7216},
-  {pattern:"sequential",N:337,kntrie_int32_find:0.0034,kntrie_int32_insert:0.0217,kntrie_int32_erase:0.0080,kntrie_int32_mem:6144,kntrie_uint64_find:0.0034,kntrie_uint64_insert:0.0216,kntrie_uint64_erase:0.0104,kntrie_uint64_mem:8192,map_int32_find:0.0022,map_int32_insert:0.0181,map_int32_erase:0.0101,map_int32_mem:16176,map_uint64_find:0.0022,map_uint64_insert:0.0227,map_uint64_erase:0.0106,map_uint64_mem:16176,umap_int32_find:0.0010,umap_int32_insert:0.0068,umap_int32_erase:0.0017,umap_int32_mem:10784,umap_uint64_find:0.0010,umap_uint64_insert:0.0073,umap_uint64_erase:0.0018,umap_uint64_mem:10784},
-  {pattern:"sequential",N:506,kntrie_int32_find:0.0055,kntrie_int32_insert:0.0379,kntrie_int32_erase:0.0147,kntrie_int32_mem:8192,kntrie_uint64_find:0.0052,kntrie_uint64_insert:0.0387,kntrie_uint64_erase:0.0125,kntrie_uint64_mem:10240,map_int32_find:0.0037,map_int32_insert:0.0336,map_int32_erase:0.0171,map_int32_mem:24288,map_uint64_find:0.0036,map_uint64_insert:0.0368,map_uint64_erase:0.0218,map_uint64_mem:24288,umap_int32_find:0.0015,umap_int32_insert:0.0103,umap_int32_erase:0.0025,umap_int32_mem:16472,umap_uint64_find:0.0015,umap_uint64_insert:0.0104,umap_uint64_erase:0.0026,umap_uint64_mem:16472},
-  {pattern:"sequential",N:759,kntrie_int32_find:0.0085,kntrie_int32_insert:0.0658,kntrie_int32_erase:0.0221,kntrie_int32_mem:12288,kntrie_uint64_find:0.0085,kntrie_uint64_insert:0.0646,kntrie_uint64_erase:0.0200,kntrie_uint64_mem:14336,map_int32_find:0.0072,map_int32_insert:0.0615,map_int32_erase:0.0340,map_int32_mem:36432,map_uint64_find:0.0070,map_uint64_insert:0.0681,map_uint64_erase:0.0323,map_uint64_mem:36432,umap_int32_find:0.0023,umap_int32_insert:0.0150,umap_int32_erase:0.0039,umap_int32_mem:24304,umap_uint64_find:0.0023,umap_uint64_insert:0.0151,umap_uint64_erase:0.0039,umap_uint64_mem:24304},
-  {pattern:"sequential",N:1139,kntrie_int32_find:0.0145,kntrie_int32_insert:0.1040,kntrie_int32_erase:0.0351,kntrie_int32_mem:16384,kntrie_uint64_find:0.0154,kntrie_uint64_insert:0.1020,kntrie_uint64_erase:0.0314,kntrie_uint64_mem:22528,map_int32_find:0.0154,map_int32_insert:0.0942,map_int32_erase:0.0522,map_int32_mem:54672,map_uint64_find:0.0155,map_uint64_insert:0.1034,map_uint64_erase:0.0517,map_uint64_mem:54672,umap_int32_find:0.0035,umap_int32_insert:0.0212,umap_int32_erase:0.0055,umap_int32_mem:36880,umap_uint64_find:0.0035,umap_uint64_insert:0.0223,umap_uint64_erase:0.0058,umap_uint64_mem:36880},
-  {pattern:"sequential",N:1708,kntrie_int32_find:0.0425,kntrie_int32_insert:0.1926,kntrie_int32_erase:0.0533,kntrie_int32_mem:26624,kntrie_uint64_find:0.0423,kntrie_uint64_insert:0.1753,kntrie_uint64_erase:0.0500,kntrie_uint64_mem:30720,map_int32_find:0.0338,map_int32_insert:0.1508,map_int32_erase:0.0839,map_int32_mem:81984,map_uint64_find:0.0347,map_uint64_insert:0.1680,map_uint64_erase:0.0863,map_uint64_mem:81984,umap_int32_find:0.0052,umap_int32_insert:0.0303,umap_int32_erase:0.0091,umap_int32_mem:54920,umap_uint64_find:0.0052,umap_uint64_insert:0.0317,umap_uint64_erase:0.0086,umap_uint64_mem:54920},
-  {pattern:"sequential",N:2562,kntrie_int32_find:0.0863,kntrie_int32_insert:0.2847,kntrie_int32_erase:0.0805,kntrie_int32_mem:34816,kntrie_uint64_find:0.0913,kntrie_uint64_insert:0.2978,kntrie_uint64_erase:0.0769,kntrie_uint64_mem:51200,map_int32_find:0.0606,map_int32_insert:0.2471,map_int32_erase:0.1391,map_int32_mem:122976,map_uint64_find:0.0639,map_uint64_insert:0.2690,map_uint64_erase:0.1371,map_uint64_mem:122976,umap_int32_find:0.0078,umap_int32_insert:0.0444,umap_int32_erase:0.0136,umap_int32_mem:83512,umap_uint64_find:0.0078,umap_uint64_insert:0.0453,umap_uint64_erase:0.0130,umap_uint64_mem:83512},
-  {pattern:"sequential",N:3844,kntrie_int32_find:0.1540,kntrie_int32_insert:0.4398,kntrie_int32_erase:0.1256,kntrie_int32_mem:51200,kntrie_uint64_find:0.1624,kntrie_uint64_insert:0.6142,kntrie_uint64_erase:0.1165,kntrie_uint64_mem:67584,map_int32_find:0.1028,map_int32_insert:0.3975,map_int32_erase:0.2222,map_int32_mem:184512,map_uint64_find:0.1086,map_uint64_insert:0.4267,map_uint64_erase:0.2303,map_uint64_mem:184512,umap_int32_find:0.0117,umap_int32_insert:0.0641,umap_int32_erase:0.0205,umap_int32_mem:124472,umap_uint64_find:0.0117,umap_uint64_insert:0.0665,umap_uint64_erase:0.0200,umap_uint64_mem:124472},
-  {pattern:"sequential",N:5766,kntrie_int32_find:0.0382,kntrie_int32_insert:0.6170,kntrie_int32_erase:0.0930,kntrie_int32_mem:59904,kntrie_uint64_find:0.0505,kntrie_uint64_insert:0.6478,kntrie_uint64_erase:0.1037,kntrie_uint64_mem:59904,map_int32_find:0.1965,map_int32_insert:0.6594,map_int32_erase:0.3625,map_int32_mem:276768,map_uint64_find:0.1925,map_uint64_insert:0.7002,map_uint64_erase:0.3708,map_uint64_mem:276768,umap_int32_find:0.0177,umap_int32_insert:0.0933,umap_int32_erase:0.0311,umap_int32_mem:186008,umap_uint64_find:0.0176,umap_uint64_insert:0.0946,umap_uint64_erase:0.0308,umap_uint64_mem:186008},
-  {pattern:"sequential",N:8649,kntrie_int32_find:0.0590,kntrie_int32_insert:0.8888,kntrie_int32_erase:0.1467,kntrie_int32_mem:88704,kntrie_uint64_find:0.0769,kntrie_uint64_insert:0.7272,kntrie_uint64_erase:0.1584,kntrie_uint64_mem:88704,map_int32_find:0.3345,map_int32_insert:1.1304,map_int32_erase:0.6293,map_int32_mem:415152,map_uint64_find:0.3330,map_uint64_insert:1.1621,map_uint64_erase:0.6252,map_uint64_mem:415152,umap_int32_find:0.0268,umap_int32_insert:0.1379,umap_int32_erase:0.0493,umap_int32_mem:277840,umap_uint64_find:0.0266,umap_uint64_insert:0.1356,umap_uint64_erase:0.0467,umap_uint64_mem:277840},
+  {pattern:"random",N:100,kntrie_int32_find:0.0005,kntrie_int32_insert:0.0030,kntrie_int32_erase:0.0016,kntrie_int32_mem:4816,kntrie_uint64_find:0.0005,kntrie_uint64_insert:0.0028,kntrie_uint64_erase:0.0011,kntrie_uint64_mem:4880,map_int32_find:0.0005,map_int32_insert:0.0034,map_int32_erase:0.0020,map_int32_mem:4800,map_uint64_find:0.0005,map_uint64_insert:0.0044,map_uint64_erase:0.0024,map_uint64_mem:4800,umap_int32_find:0.0004,umap_int32_insert:0.0014,umap_int32_erase:0.0009,umap_int32_mem:3224,umap_uint64_find:0.0005,umap_uint64_insert:0.0016,umap_uint64_erase:0.0009,umap_uint64_mem:3224},
+  {pattern:"random",N:150,kntrie_int32_find:0.0006,kntrie_int32_insert:0.0032,kntrie_int32_erase:0.0016,kntrie_int32_mem:5984,kntrie_uint64_find:0.0007,kntrie_uint64_insert:0.0041,kntrie_uint64_erase:0.0014,kntrie_uint64_mem:6208,map_int32_find:0.0009,map_int32_insert:0.0055,map_int32_erase:0.0029,map_int32_mem:7200,map_uint64_find:0.0010,map_uint64_insert:0.0071,map_uint64_erase:0.0047,map_uint64_mem:7200,umap_int32_find:0.0007,umap_int32_insert:0.0054,umap_int32_erase:0.0016,umap_int32_mem:4856,umap_uint64_find:0.0008,umap_uint64_insert:0.0054,umap_uint64_erase:0.0020,umap_uint64_mem:4856},
+  {pattern:"random",N:225,kntrie_int32_find:0.0009,kntrie_int32_insert:0.0063,kntrie_int32_erase:0.0027,kntrie_int32_mem:7464,kntrie_uint64_find:0.0011,kntrie_uint64_insert:0.0073,kntrie_uint64_erase:0.0028,kntrie_uint64_mem:8016,map_int32_find:0.0013,map_int32_insert:0.0089,map_int32_erase:0.0045,map_int32_mem:10800,map_uint64_find:0.0013,map_uint64_insert:0.0114,map_uint64_erase:0.0051,map_uint64_mem:10800,umap_int32_find:0.0011,umap_int32_insert:0.0075,umap_int32_erase:0.0020,umap_int32_mem:7216,umap_uint64_find:0.0011,umap_uint64_insert:0.0063,umap_uint64_erase:0.0019,umap_uint64_mem:7216},
+  {pattern:"random",N:337,kntrie_int32_find:0.0013,kntrie_int32_insert:0.0113,kntrie_int32_erase:0.0035,kntrie_int32_mem:9488,kntrie_uint64_find:0.0015,kntrie_uint64_insert:0.0097,kntrie_uint64_erase:0.0040,kntrie_uint64_mem:10448,map_int32_find:0.0023,map_int32_insert:0.0178,map_int32_erase:0.0096,map_int32_mem:16176,map_uint64_find:0.0023,map_uint64_insert:0.0204,map_uint64_erase:0.0089,map_uint64_mem:16176,umap_int32_find:0.0016,umap_int32_insert:0.0101,umap_int32_erase:0.0031,umap_int32_mem:10784,umap_uint64_find:0.0015,umap_uint64_insert:0.0093,umap_uint64_erase:0.0029,umap_uint64_mem:10784},
+  {pattern:"random",N:506,kntrie_int32_find:0.0020,kntrie_int32_insert:0.0189,kntrie_int32_erase:0.0066,kntrie_int32_mem:12224,kntrie_uint64_find:0.0023,kntrie_uint64_insert:0.0183,kntrie_uint64_erase:0.0077,kntrie_uint64_mem:13664,map_int32_find:0.0037,map_int32_insert:0.0333,map_int32_erase:0.0167,map_int32_mem:24288,map_uint64_find:0.0037,map_uint64_insert:0.0416,map_uint64_erase:0.0176,map_uint64_mem:24288,umap_int32_find:0.0022,umap_int32_insert:0.0134,umap_int32_erase:0.0048,umap_int32_mem:16472,umap_uint64_find:0.0023,umap_uint64_insert:0.0124,umap_uint64_erase:0.0054,umap_uint64_mem:16472},
+  {pattern:"random",N:759,kntrie_int32_find:0.0031,kntrie_int32_insert:0.0319,kntrie_int32_erase:0.0118,kntrie_int32_mem:15824,kntrie_uint64_find:0.0035,kntrie_uint64_insert:0.0315,kntrie_uint64_erase:0.0119,kntrie_uint64_mem:18160,map_int32_find:0.0074,map_int32_insert:0.0572,map_int32_erase:0.0326,map_int32_mem:36432,map_uint64_find:0.0083,map_uint64_insert:0.0676,map_uint64_erase:0.0344,map_uint64_mem:36432,umap_int32_find:0.0035,umap_int32_insert:0.0219,umap_int32_erase:0.0075,umap_int32_mem:24304,umap_uint64_find:0.0035,umap_uint64_insert:0.0216,umap_uint64_erase:0.0069,umap_uint64_mem:24304},
+  {pattern:"random",N:1139,kntrie_int32_find:0.0055,kntrie_int32_insert:0.0550,kntrie_int32_erase:0.0213,kntrie_int32_mem:20824,kntrie_uint64_find:0.0056,kntrie_uint64_insert:0.0548,kntrie_uint64_erase:0.0213,kntrie_uint64_mem:24544,map_int32_find:0.0161,map_int32_insert:0.0959,map_int32_erase:0.0543,map_int32_mem:54672,map_uint64_find:0.0153,map_uint64_insert:0.1039,map_uint64_erase:0.0522,map_uint64_mem:54672,umap_int32_find:0.0054,umap_int32_insert:0.0309,umap_int32_erase:0.0106,umap_int32_mem:36880,umap_uint64_find:0.0052,umap_uint64_insert:0.0298,umap_uint64_erase:0.0102,umap_uint64_mem:36880},
+  {pattern:"random",N:1708,kntrie_int32_find:0.0099,kntrie_int32_insert:0.0896,kntrie_int32_erase:0.0357,kntrie_int32_mem:28320,kntrie_uint64_find:0.0145,kntrie_uint64_insert:0.0917,kntrie_uint64_erase:0.0337,kntrie_uint64_mem:34384,map_int32_find:0.0332,map_int32_insert:0.1504,map_int32_erase:0.0852,map_int32_mem:81984,map_uint64_find:0.0356,map_uint64_insert:0.1652,map_uint64_erase:0.0848,map_uint64_mem:81984,umap_int32_find:0.0082,umap_int32_insert:0.0463,umap_int32_erase:0.0194,umap_int32_mem:54920,umap_uint64_find:0.0082,umap_uint64_insert:0.0452,umap_uint64_erase:0.0179,umap_uint64_mem:54920},
+  {pattern:"random",N:2562,kntrie_int32_find:0.0307,kntrie_int32_insert:0.1438,kntrie_int32_erase:0.0519,kntrie_int32_mem:39680,kntrie_uint64_find:0.0305,kntrie_uint64_insert:0.1458,kntrie_uint64_erase:0.0500,kntrie_uint64_mem:49104,map_int32_find:0.0597,map_int32_insert:0.2422,map_int32_erase:0.1416,map_int32_mem:122976,map_uint64_find:0.0621,map_uint64_insert:0.2690,map_uint64_erase:0.1367,map_uint64_mem:122976,umap_int32_find:0.0123,umap_int32_insert:0.0693,umap_int32_erase:0.0323,umap_int32_mem:83512,umap_uint64_find:0.0122,umap_uint64_insert:0.0684,umap_uint64_erase:0.0292,umap_uint64_mem:83512},
+  {pattern:"random",N:3844,kntrie_int32_find:0.0652,kntrie_int32_insert:0.2366,kntrie_int32_erase:0.0803,kntrie_int32_mem:56080,kntrie_uint64_find:0.0619,kntrie_uint64_insert:0.2273,kntrie_uint64_erase:0.0804,kntrie_uint64_mem:71840,map_int32_find:0.1026,map_int32_insert:0.3980,map_int32_erase:0.2191,map_int32_mem:184512,map_uint64_find:0.1063,map_uint64_insert:0.4265,map_uint64_erase:0.2208,map_uint64_mem:184512,umap_int32_find:0.0183,umap_int32_insert:0.1050,umap_int32_erase:0.0478,umap_int32_mem:124472,umap_uint64_find:0.0192,umap_uint64_insert:0.1080,umap_uint64_erase:0.0510,umap_uint64_mem:124472},
+  {pattern:"random",N:5766,kntrie_int32_find:0.1032,kntrie_int32_insert:0.3412,kntrie_int32_erase:0.1236,kntrie_int32_mem:82336,kntrie_uint64_find:0.1034,kntrie_uint64_insert:0.3426,kntrie_uint64_erase:0.1245,kntrie_uint64_mem:104832,map_int32_find:0.1897,map_int32_insert:0.6640,map_int32_erase:0.3697,map_int32_mem:276768,map_uint64_find:0.1928,map_uint64_insert:0.7041,map_uint64_erase:0.3799,map_uint64_mem:276768,umap_int32_find:0.0316,umap_int32_insert:0.1585,umap_int32_erase:0.0779,umap_int32_mem:186008,umap_uint64_find:0.0301,umap_uint64_insert:0.1649,umap_uint64_erase:0.0802,umap_uint64_mem:186008},
+  {pattern:"random",N:8649,kntrie_int32_find:0.2063,kntrie_int32_insert:0.5073,kntrie_int32_erase:0.1871,kntrie_int32_mem:118592,kntrie_uint64_find:0.2013,kntrie_uint64_insert:0.5077,kntrie_uint64_erase:0.1882,kntrie_uint64_mem:156416,map_int32_find:0.3288,map_int32_insert:1.0974,map_int32_erase:0.6108,map_int32_mem:415152,map_uint64_find:0.3256,map_uint64_insert:1.1758,map_uint64_erase:0.6231,map_uint64_mem:415152,umap_int32_find:0.0706,umap_int32_insert:0.2440,umap_int32_erase:0.1214,umap_int32_mem:277840,umap_uint64_find:0.0734,umap_uint64_insert:0.2440,umap_uint64_erase:0.1213,umap_uint64_mem:277840},
+  {pattern:"sequential",N:100,kntrie_int32_find:0.0008,kntrie_int32_insert:0.0038,kntrie_int32_erase:0.0014,kntrie_int32_mem:3328,kntrie_uint64_find:0.0008,kntrie_uint64_insert:0.0039,kntrie_uint64_erase:0.0021,kntrie_uint64_mem:3840,map_int32_find:0.0005,map_int32_insert:0.0033,map_int32_erase:0.0017,map_int32_mem:4800,map_uint64_find:0.0005,map_uint64_insert:0.0036,map_uint64_erase:0.0019,map_uint64_mem:4800,umap_int32_find:0.0003,umap_int32_insert:0.0012,umap_int32_erase:0.0006,umap_int32_mem:3224,umap_uint64_find:0.0003,umap_uint64_insert:0.0012,umap_uint64_erase:0.0006,umap_uint64_mem:3224},
+  {pattern:"sequential",N:150,kntrie_int32_find:0.0014,kntrie_int32_insert:0.0062,kntrie_int32_erase:0.0029,kntrie_int32_mem:4096,kntrie_uint64_find:0.0013,kntrie_uint64_insert:0.0057,kntrie_uint64_erase:0.0026,kntrie_uint64_mem:4608,map_int32_find:0.0008,map_int32_insert:0.0056,map_int32_erase:0.0027,map_int32_mem:7200,map_uint64_find:0.0008,map_uint64_insert:0.0060,map_uint64_erase:0.0029,map_uint64_mem:7200,umap_int32_find:0.0005,umap_int32_insert:0.0032,umap_int32_erase:0.0010,umap_int32_mem:4856,umap_uint64_find:0.0005,umap_uint64_insert:0.0034,umap_uint64_erase:0.0010,umap_uint64_mem:4856},
+  {pattern:"sequential",N:225,kntrie_int32_find:0.0023,kntrie_int32_insert:0.0112,kntrie_int32_erase:0.0042,kntrie_int32_mem:5120,kntrie_uint64_find:0.0021,kntrie_uint64_insert:0.0096,kntrie_uint64_erase:0.0048,kntrie_uint64_mem:6144,map_int32_find:0.0013,map_int32_insert:0.0097,map_int32_erase:0.0047,map_int32_mem:10800,map_uint64_find:0.0013,map_uint64_insert:0.0114,map_uint64_erase:0.0050,map_uint64_mem:10800,umap_int32_find:0.0007,umap_int32_insert:0.0044,umap_int32_erase:0.0012,umap_int32_mem:7216,umap_uint64_find:0.0007,umap_uint64_insert:0.0048,umap_uint64_erase:0.0013,umap_uint64_mem:7216},
+  {pattern:"sequential",N:337,kntrie_int32_find:0.0032,kntrie_int32_insert:0.0211,kntrie_int32_erase:0.0079,kntrie_int32_mem:6144,kntrie_uint64_find:0.0034,kntrie_uint64_insert:0.0200,kntrie_uint64_erase:0.0104,kntrie_uint64_mem:8192,map_int32_find:0.0022,map_int32_insert:0.0219,map_int32_erase:0.0084,map_int32_mem:16176,map_uint64_find:0.0022,map_uint64_insert:0.0195,map_uint64_erase:0.0082,map_uint64_mem:16176,umap_int32_find:0.0010,umap_int32_insert:0.0068,umap_int32_erase:0.0018,umap_int32_mem:10784,umap_uint64_find:0.0010,umap_uint64_insert:0.0072,umap_uint64_erase:0.0022,umap_uint64_mem:10784},
+  {pattern:"sequential",N:506,kntrie_int32_find:0.0056,kntrie_int32_insert:0.0374,kntrie_int32_erase:0.0141,kntrie_int32_mem:8192,kntrie_uint64_find:0.0053,kntrie_uint64_insert:0.0378,kntrie_uint64_erase:0.0116,kntrie_uint64_mem:10240,map_int32_find:0.0036,map_int32_insert:0.0336,map_int32_erase:0.0170,map_int32_mem:24288,map_uint64_find:0.0036,map_uint64_insert:0.0367,map_uint64_erase:0.0168,map_uint64_mem:24288,umap_int32_find:0.0016,umap_int32_insert:0.0108,umap_int32_erase:0.0026,umap_int32_mem:16472,umap_uint64_find:0.0015,umap_uint64_insert:0.0104,umap_uint64_erase:0.0027,umap_uint64_mem:16472},
+  {pattern:"sequential",N:759,kntrie_int32_find:0.0086,kntrie_int32_insert:0.0662,kntrie_int32_erase:0.0214,kntrie_int32_mem:12288,kntrie_uint64_find:0.0084,kntrie_uint64_insert:0.0627,kntrie_uint64_erase:0.0194,kntrie_uint64_mem:14336,map_int32_find:0.0073,map_int32_insert:0.0561,map_int32_erase:0.0329,map_int32_mem:36432,map_uint64_find:0.0069,map_uint64_insert:0.0600,map_uint64_erase:0.0299,map_uint64_mem:36432,umap_int32_find:0.0023,umap_int32_insert:0.0150,umap_int32_erase:0.0039,umap_int32_mem:24304,umap_uint64_find:0.0023,umap_uint64_insert:0.0149,umap_uint64_erase:0.0039,umap_uint64_mem:24304},
+  {pattern:"sequential",N:1139,kntrie_int32_find:0.0142,kntrie_int32_insert:0.1009,kntrie_int32_erase:0.0346,kntrie_int32_mem:16384,kntrie_uint64_find:0.0153,kntrie_uint64_insert:0.1005,kntrie_uint64_erase:0.0313,kntrie_uint64_mem:22528,map_int32_find:0.0163,map_int32_insert:0.0925,map_int32_erase:0.0508,map_int32_mem:54672,map_uint64_find:0.0171,map_uint64_insert:0.1005,map_uint64_erase:0.0518,map_uint64_mem:54672,umap_int32_find:0.0035,umap_int32_insert:0.0211,umap_int32_erase:0.0060,umap_int32_mem:36880,umap_uint64_find:0.0035,umap_uint64_insert:0.0234,umap_uint64_erase:0.0061,umap_uint64_mem:36880},
+  {pattern:"sequential",N:1708,kntrie_int32_find:0.0427,kntrie_int32_insert:0.1873,kntrie_int32_erase:0.0540,kntrie_int32_mem:26624,kntrie_uint64_find:0.0394,kntrie_uint64_insert:0.1712,kntrie_uint64_erase:0.0503,kntrie_uint64_mem:30720,map_int32_find:0.0330,map_int32_insert:0.1513,map_int32_erase:0.0894,map_int32_mem:81984,map_uint64_find:0.0361,map_uint64_insert:0.1664,map_uint64_erase:0.0858,map_uint64_mem:81984,umap_int32_find:0.0052,umap_int32_insert:0.0307,umap_int32_erase:0.0089,umap_int32_mem:54920,umap_uint64_find:0.0052,umap_uint64_insert:0.0301,umap_uint64_erase:0.0087,umap_uint64_mem:54920},
+  {pattern:"sequential",N:2562,kntrie_int32_find:0.0849,kntrie_int32_insert:0.2901,kntrie_int32_erase:0.0810,kntrie_int32_mem:34816,kntrie_uint64_find:0.0902,kntrie_uint64_insert:0.2959,kntrie_uint64_erase:0.0768,kntrie_uint64_mem:51200,map_int32_find:0.0591,map_int32_insert:0.2400,map_int32_erase:0.1385,map_int32_mem:122976,map_uint64_find:0.0645,map_uint64_insert:0.2598,map_uint64_erase:0.1396,map_uint64_mem:122976,umap_int32_find:0.0078,umap_int32_insert:0.0448,umap_int32_erase:0.0130,umap_int32_mem:83512,umap_uint64_find:0.0078,umap_uint64_insert:0.0443,umap_uint64_erase:0.0131,umap_uint64_mem:83512},
+  {pattern:"sequential",N:3844,kntrie_int32_find:0.1529,kntrie_int32_insert:0.4347,kntrie_int32_erase:0.1263,kntrie_int32_mem:51200,kntrie_uint64_find:0.1610,kntrie_uint64_insert:0.6356,kntrie_uint64_erase:0.1181,kntrie_uint64_mem:67584,map_int32_find:0.1034,map_int32_insert:0.3963,map_int32_erase:0.2240,map_int32_mem:184512,map_uint64_find:0.1085,map_uint64_insert:0.4258,map_uint64_erase:0.2255,map_uint64_mem:184512,umap_int32_find:0.0118,umap_int32_insert:0.0670,umap_int32_erase:0.0201,umap_int32_mem:124472,umap_uint64_find:0.0118,umap_uint64_insert:0.0661,umap_uint64_erase:0.0210,umap_uint64_mem:124472},
+  {pattern:"sequential",N:5766,kntrie_int32_find:0.0385,kntrie_int32_insert:0.6201,kntrie_int32_erase:0.0934,kntrie_int32_mem:59904,kntrie_uint64_find:0.0508,kntrie_uint64_insert:0.6423,kntrie_uint64_erase:0.1034,kntrie_uint64_mem:59904,map_int32_find:0.1950,map_int32_insert:0.6619,map_int32_erase:0.3797,map_int32_mem:276768,map_uint64_find:0.1977,map_uint64_insert:0.6988,map_uint64_erase:0.3723,map_uint64_mem:276768,umap_int32_find:0.0178,umap_int32_insert:0.0943,umap_int32_erase:0.0313,umap_int32_mem:186008,umap_uint64_find:0.0177,umap_uint64_insert:0.0970,umap_uint64_erase:0.0315,umap_uint64_mem:186008},
+  {pattern:"sequential",N:8649,kntrie_int32_find:0.0590,kntrie_int32_insert:0.8832,kntrie_int32_erase:0.1459,kntrie_int32_mem:88704,kntrie_uint64_find:0.0764,kntrie_uint64_insert:0.7302,kntrie_uint64_erase:0.1575,kntrie_uint64_mem:88704,map_int32_find:0.3310,map_int32_insert:1.1247,map_int32_erase:0.6280,map_int32_mem:415152,map_uint64_find:0.3311,map_uint64_insert:1.1728,map_uint64_erase:0.6323,map_uint64_mem:415152,umap_int32_find:0.0271,umap_int32_insert:0.1406,umap_int32_erase:0.0487,umap_int32_mem:277840,umap_uint64_find:0.0266,umap_uint64_insert:0.1368,umap_uint64_erase:0.0485,umap_uint64_mem:277840},
 ];
 
-import htm from "https://esm.sh/htm@3.1.1";
-const html = htm.bind(React.createElement);
 
 const LINES = [
-  { key: "kntrie_int32", color: "#3b82f6", dash: "", label: "kntrie i32" },
-  { key: "kntrie_uint64", color: "#93c5fd", dash: "6 3", label: "kntrie u64" },
-  { key: "map_int32", color: "#ef4444", dash: "", label: "map i32" },
-  { key: "map_uint64", color: "#fca5a5", dash: "6 3", label: "map u64" },
-  { key: "umap_int32", color: "#22c55e", dash: "", label: "umap i32" },
-  { key: "umap_uint64", color: "#86efac", dash: "6 3", label: "umap u64" },
-  { key: "raw_int32", color: "#888", dash: "", label: "raw i32", memOnly: true },
-  { key: "raw_uint64", color: "#555", dash: "3 3", label: "raw u64", memOnly: true },
+  { key: "kntrie_int32", color: "#3b82f6", dash: [], width: 2.5, label: "kntrie i32" },
+  { key: "kntrie_uint64", color: "#93c5fd", dash: [6,3], width: 1.5, label: "kntrie u64" },
+  { key: "map_int32", color: "#ef4444", dash: [], width: 2.5, label: "map i32" },
+  { key: "map_uint64", color: "#fca5a5", dash: [6,3], width: 1.5, label: "map u64" },
+  { key: "umap_int32", color: "#22c55e", dash: [], width: 2.5, label: "umap i32" },
+  { key: "umap_uint64", color: "#86efac", dash: [6,3], width: 1.5, label: "umap u64" },
+];
+
+const MEM_LINES = [
+  ...LINES,
+  { key: "raw_int32", color: "#888", dash: [], width: 1, label: "raw i32" },
+  { key: "raw_uint64", color: "#555", dash: [3,3], width: 1, label: "raw u64" },
 ];
 
 const METRICS = [
-  { suffix: "find", label: "Find (ns/entry)", convert: (ms, n) => (ms * 1e6) / n },
-  { suffix: "insert", label: "Insert (ns/entry)", convert: (ms, n) => (ms * 1e6) / n },
-  { suffix: "erase", label: "Erase N/2 (ns/entry)", convert: (ms, n) => (ms * 1e6) / (n / 2) },
-  { suffix: "mem", label: "Memory (B/entry)", convert: (b, n) => b / n },
+  { id: "find", suffix: "find", convert: (ms, n) => (ms * 1e6) / n },
+  { id: "insert", suffix: "insert", convert: (ms, n) => (ms * 1e6) / n },
+  { id: "erase", suffix: "erase", convert: (ms, n) => (ms * 1e6) / (n / 2) },
+  { id: "mem", suffix: "mem", convert: (b, n) => b / n },
 ];
 
-const PATTERNS = ["random", "sequential"];
-
 function buildData(pattern, metric) {
-  const lines = LINES.filter((l) => metric.suffix === "mem" || !l.memOnly);
+  const lines = metric.id === "mem" ? MEM_LINES : LINES;
   return RAW_DATA
-    .filter((r) => r.pattern === pattern)
-    .map((r) => {
-      const out = { N: r.N, logN: Math.log10(r.N) };
-      for (const line of lines) {
-        if (line.key === "raw_int32") {
-          if (metric.suffix === "mem") out[line.key] = r.N * 12 / r.N;
-        } else if (line.key === "raw_uint64") {
-          if (metric.suffix === "mem") out[line.key] = r.N * 16 / r.N;
-        } else {
-          const raw = r[`${line.key}_${metric.suffix}`];
-          if (raw != null) out[line.key] = metric.convert(raw, r.N);
-        }
+    .filter(r => r.pattern === pattern)
+    .map(r => {
+      const pt = { N: r.N };
+      for (const l of lines) {
+        if (l.key === "raw_int32") { pt[l.key] = 12; continue; }
+        if (l.key === "raw_uint64") { pt[l.key] = 16; continue; }
+        const raw = r[l.key + "_" + metric.suffix];
+        if (raw != null) pt[l.key] = metric.convert(raw, r.N);
       }
-      return out;
+      return pt;
     });
 }
 
-const fmtN = (logV) => {
-  const v = Math.pow(10, logV);
-  if (v >= 1e6) return (v / 1e6).toFixed(v >= 1e7 ? 0 : 1) + "M";
-  if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + "K";
-  return String(Math.round(v));
-};
+const charts = {};
 
-const fmtVal = (v) => {
-  if (v == null) return "";
-  if (v < 0.1) return v.toFixed(3);
-  if (v < 10) return v.toFixed(2);
-  if (v < 1000) return v.toFixed(1);
-  return v.toFixed(0);
-};
+function makeChart(canvasId, metric) {
+  const ctx = document.getElementById(canvasId).getContext("2d");
+  const lines = metric.id === "mem" ? MEM_LINES : LINES;
+  const data = buildData("random", metric);
 
-const Tip = ({ active, payload, label }) => {
-  if (!active || !payload?.length) return null;
-  return html`<div style=${{ background: "#1a1a2e", border: "1px solid #444", borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
-    <div style=${{ color: "#aaa", marginBottom: 4, fontWeight: 600 }}>N = ${fmtN(label)}</div>
-    ${payload.filter((p) => p.value != null).map((p) => html`
-      <div key=${p.dataKey} style=${{ color: p.color, marginBottom: 1 }}>
-        ${LINES.find((l) => l.key === p.dataKey)?.label}: ${fmtVal(p.value)}
-      </div>
-    `)}
-  </div>`;
-};
-
-const Chart = ({ title, data }) => {
-  const allVals = data.flatMap((d) => LINES.map((l) => d[l.key]).filter((v) => v != null && v > 0));
-  if (!allVals.length) return null;
-
-  const logNs = data.map(d => d.logN);
-  const minX = Math.floor(Math.min(...logNs));
-  const maxX = Math.ceil(Math.max(...logNs));
-  const xTicks = [];
-  for (let i = minX; i <= maxX; i++) xTicks.push(i);
-
-  return html`<div style=${{ marginBottom: 28 }}>
-    <h3 style=${{ margin: "0 0 6px 0", fontSize: 14, fontWeight: 600, color: "#ddd", textAlign: "center" }}>${title}</h3>
-    <${ResponsiveContainer} width="100%" height=${240}>
-      <${LineChart} data=${data} margin=${{ top: 4, right: 16, left: 8, bottom: 4 }}>
-        <${CartesianGrid} strokeDasharray="3 3" stroke="#2a2a3e" />
-        <${XAxis} dataKey="logN" type="number" domain=${[minX, maxX]}
-          ticks=${xTicks} tickFormatter=${fmtN}
-          tick=${{ fill: "#888", fontSize: 11 }} stroke="#444" />
-        <${YAxis} scale="log" domain=${["auto", "auto"]} type="number"
-          tickFormatter=${fmtVal} tick=${{ fill: "#888", fontSize: 10 }}
-          stroke="#444" width=${52} allowDataOverflow />
-        <${Tooltip} content=${html`<${Tip} />`} />
-        ${LINES.map((l) => html`
-          <${Line} key=${l.key} type="monotone" dataKey=${l.key} stroke=${l.color}
-            strokeWidth=${l.dash ? 1.5 : 2.5} dot=${false}
-            strokeDasharray=${l.dash || undefined} connectNulls isAnimationActive=${false} />
-        `)}
-      </${LineChart}>
-    </${ResponsiveContainer}>
-  </div>`;
-};
-
-function App() {
-  const [pattern, setPattern] = useState("random");
-  return html`<div style=${{ background: "#0f0f1a", color: "#ddd", minHeight: "100vh", padding: "16px 12px", fontFamily: "system-ui, sans-serif" }}>
-    <h2 style=${{ margin: "0 0 4px 0", fontSize: 18, fontWeight: 700, textAlign: "center" }}>kntrie Benchmark</h2>
-    <p style=${{ textAlign: "center", color: "#777", fontSize: 12, margin: "0 0 12px 0" }}>
-      Log-log · Per-entry · Lower is better · Solid = i32, Dashed = u64
-    </p>
-
-    <div style=${{ display: "flex", justifyContent: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
-      ${LINES.map((l) => html`
-        <div key=${l.key} style=${{ display: "flex", alignItems: "center", gap: 5, fontSize: 11 }}>
-          ${l.dash
-            ? html`<svg width=${22} height=${4}><line x1=${0} y1=${2} x2=${22} y2=${2} stroke=${l.color} strokeWidth=${2} strokeDasharray=${l.dash} /></svg>`
-            : html`<div style=${{ width: 22, height: 2.5, background: l.color, borderRadius: 1 }} />`}
-          <span style=${{ color: "#bbb" }}>${l.label}</span>
-        </div>
-      `)}
-    </div>
-
-    <div style=${{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 16 }}>
-      ${PATTERNS.map((p) => html`
-        <button key=${p} onClick=${() => setPattern(p)}
-          style=${{
-            padding: "6px 16px", borderRadius: 6, border: "1px solid #444",
-            background: pattern === p ? "#3b82f6" : "#1a1a2e",
-            color: pattern === p ? "#fff" : "#aaa",
-            cursor: "pointer", fontSize: 13, fontWeight: 600,
-          }}>
-          ${p}
-        </button>
-      `)}
-    </div>
-
-    <div style=${{ maxWidth: 620, margin: "0 auto" }}>
-      ${METRICS.map((m) => html`
-        <${Chart} key=${pattern + "-" + m.suffix} title=${m.label}
-          data=${buildData(pattern, m)} />
-      `)}
-    </div>
-  </div>`;
+  charts[canvasId] = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: data.map(d => d.N),
+      datasets: lines.map(l => ({
+        label: l.label,
+        data: data.map(d => d[l.key] ?? null),
+        borderColor: l.color,
+        backgroundColor: l.color + "33",
+        borderWidth: l.width,
+        borderDash: l.dash,
+        pointRadius: 0,
+        pointHitRadius: 8,
+        tension: 0.2,
+        spanGaps: true,
+      })),
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: true, labels: { color: "#bbb", font: { size: 11 }, boxWidth: 20, padding: 10 } },
+        tooltip: {
+          backgroundColor: "#1a1a2e",
+          borderColor: "#444",
+          borderWidth: 1,
+          titleColor: "#aaa",
+          bodyColor: "#ddd",
+          callbacks: {
+            title: (items) => {
+              const v = items[0].parsed.x;
+              if (v >= 1e6) return "N = " + (v/1e6).toFixed(1) + "M";
+              if (v >= 1e3) return "N = " + (v/1e3).toFixed(1) + "K";
+              return "N = " + v;
+            },
+            label: (item) => {
+              const v = item.parsed.y;
+              if (v == null) return null;
+              const s = v < 0.1 ? v.toFixed(3) : v < 10 ? v.toFixed(2) : v < 1000 ? v.toFixed(1) : v.toFixed(0);
+              return " " + item.dataset.label + ": " + s;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: "logarithmic",
+          title: { display: false },
+          ticks: { color: "#888", font: { size: 11 },
+            callback: (v) => v >= 1e6 ? (v/1e6)+"M" : v >= 1e3 ? (v/1e3)+"K" : v },
+          grid: { color: "#2a2a3e" },
+        },
+        y: {
+          type: "logarithmic",
+          ticks: { color: "#888", font: { size: 10 },
+            callback: (v) => v < 0.1 ? v.toFixed(2) : v < 10 ? v.toFixed(1) : v >= 1000 ? v.toFixed(0) : v.toFixed(1) },
+          grid: { color: "#2a2a3e" },
+        },
+      },
+    },
+  });
+  charts[canvasId]._metric = metric;
 }
 
-createRoot(document.getElementById("root")).render(html`<${App} />`);
+METRICS.forEach(m => makeChart("c_" + m.id, m));
+
+function show(pattern) {
+  document.querySelectorAll(".btns button").forEach(b => b.classList.remove("active"));
+  event.target.classList.add("active");
+  for (const [id, chart] of Object.entries(charts)) {
+    const m = chart._metric;
+    const lines = m.id === "mem" ? MEM_LINES : LINES;
+    const data = buildData(pattern, m);
+    chart.data.labels = data.map(d => d.N);
+    lines.forEach((l, i) => {
+      chart.data.datasets[i].data = data.map(d => d[l.key] ?? null);
+    });
+    chart.update("none");
+  }
+}
 </script>
 </body>
 </html>
