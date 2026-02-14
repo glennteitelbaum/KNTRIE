@@ -86,6 +86,14 @@ struct compact_ops {
         return HEADER_U64 + (kb + vb) / 8;
     }
 
+    // Allocation size for insert: 1.2x target slots, capped at COMPACT_MAX.
+    // Ensures no dups wasted at the final 4096-entry leaf.
+    static constexpr size_t insert_alloc_u64(uint16_t count) noexcept {
+        uint32_t target = std::min<uint32_t>(
+            static_cast<uint32_t>(count) * 12 / 10, COMPACT_MAX);
+        return round_up_u64(size_u64(target));
+    }
+
     // --- total physical slots for a given alloc ---
 
     static uint16_t total_slots(uint16_t alloc_u64) noexcept {
@@ -314,8 +322,7 @@ private:
             return {node, false, true};  // needs_split
 
         uint16_t new_entries = entries + 1;
-        size_t needed = size_u64(new_entries);
-        size_t au64 = round_up_u64(needed);
+        size_t au64 = insert_alloc_u64(new_entries);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         *nh = *h;
@@ -453,8 +460,7 @@ private:
             return {node, false, true};  // needs_split
 
         uint16_t new_entries = entries + 1;
-        size_t needed = size_u64(new_entries);
-        size_t au64 = round_up_u64(needed);
+        size_t au64 = insert_alloc_u64(new_entries);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         *nh = *h;

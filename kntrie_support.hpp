@@ -36,32 +36,21 @@ inline constexpr size_t HEADER_U64    = 2;   // header is 2 u64 (16 bytes)
 // Worst-case waste: ~25%.  Enables in-place insert/erase.
 // ==========================================================================
 
+// Size classes: exact up to 8, then powers-of-2 with midpoints.
+// 1..8, 12,16, 24,32, 48,64, 96,128, 192,256, ...
+// Max waste: 33%.
+
 inline constexpr size_t round_up_u64(size_t n) noexcept {
-    if (n <= 8) return n;
-    int bits = std::bit_width(n - 1);     // ceil(log2(n))
-    int k    = bits - 1;                   // lower bound exponent
-    if (k < 2) return n;
-    size_t step = size_t{1} << (k - 2);   // quarter of the range
-    return ((n + step - 1) / step) * step;
+    if (n < 12) return ((n + 3) / 4) * 4;
+    int bit  = static_cast<int>(std::bit_width(n - 1));
+    size_t pow2 = size_t{1} << bit;
+    size_t mid  = pow2 / 2 + pow2 / 4 + 2;
+    return (n <= mid) ? mid : pow2;
 }
 
-// Step up `steps` size classes from `cls` (for shrink hysteresis).
-inline constexpr size_t step_up_u64(size_t cls, int steps) noexcept {
-    size_t n = cls;
-    for (int i = 0; i < steps; ++i) {
-        if (n < 8) { ++n; continue; }
-        int bits = std::bit_width(n);
-        int k    = bits - 1;
-        size_t step = size_t{1} << (k >= 2 ? k - 2 : 0);
-        n += step;
-    }
-    return n;
-}
-
-// Shrink when allocated is more than 2 size-class steps above needed.
+// Shrink when allocated exceeds the class for 2x the needed size.
 inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcept {
-    size_t threshold = step_up_u64(round_up_u64(needed), 2);
-    return allocated > threshold;
+    return allocated > round_up_u64(needed * 2);
 }
 
 // ==========================================================================
@@ -177,7 +166,7 @@ inline constexpr uint8_t suffix_type_for(int bits) noexcept {
 
 template<typename K, typename VST>
 struct slot_table {
-    static constexpr size_t MAX_ALLOC = 10240;
+    static constexpr size_t MAX_ALLOC = 16384;
 
     static constexpr auto build() {
         std::array<uint16_t, MAX_ALLOC + 1> tbl{};
