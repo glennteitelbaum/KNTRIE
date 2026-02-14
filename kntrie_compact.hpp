@@ -10,37 +10,6 @@
 namespace gteitelbaum {
 
 // ==========================================================================
-// JumpSearch  (stride 256 -> 16 -> 1)
-// ==========================================================================
-
-template<typename K>
-struct jump_search {
-    // Returns index if found (>=0), or -1 if not found.
-    static int search(const K* keys, int count, K key) noexcept {
-        const K* end = keys + count;
-        const K* p = keys;
-        for (const K* q = p + 256; q < end; q += 256) { if (*q > key) break; p = q; }
-        for (const K* q = p + 16;  q < end; q += 16)  { if (*q > key) break; p = q; }
-        for (const K* q = p + 1;   q < end; ++q)      { if (*q > key) break; p = q; }
-        return (p < end && *p == key) ? static_cast<int>(p - keys) : -1;
-    }
-
-    // Returns index if found (>=0), or -(insertion_point + 1) if not found.
-    static int search_insert(const K* keys, int count, K key) noexcept {
-        if (count == 0) [[unlikely]] return -(0 + 1);
-        const K* end = keys + count;
-        const K* p = keys;
-        for (const K* q = p + 256; q < end; q += 256) { if (*q > key) break; p = q; }
-        for (const K* q = p + 16;  q < end; q += 16)  { if (*q > key) break; p = q; }
-        for (const K* q = p + 1;   q < end; ++q)      { if (*q > key) break; p = q; }
-        if (*p == key) return static_cast<int>(p - keys);
-        int pos = static_cast<int>(p - keys);
-        if (*p < key) pos++;
-        return -(pos + 1);
-    }
-};
-
-// ==========================================================================
 // AdaptiveSearch  (branchless binary search)
 //
 // First step aligns to power-of-2 via bit_floor, then each halving
