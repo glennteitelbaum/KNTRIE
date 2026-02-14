@@ -458,7 +458,7 @@ function show(pattern) {
 
 int main() {
     std::vector<size_t> sizes;
-    constexpr double MAX_N = 10000;  // change to 6000000 for full run
+    constexpr double MAX_N = 6000000;  // change to 10000 for quick test
     for (double n = 100; n < MAX_N; n *= 1.5)
         sizes.push_back(static_cast<size_t>(n));
 
