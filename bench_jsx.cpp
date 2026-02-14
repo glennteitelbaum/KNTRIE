@@ -217,10 +217,10 @@ static void bench_all(size_t target_n, const std::string& pattern,
 }
 
 // ==========================================================================
-// JSX output — embeds data + full React component
+// HTML output — self-contained page with React + Recharts from CDN
 // ==========================================================================
 
-static void emit_jsx(const std::vector<Row>& rows) {
+static void emit_html(const std::vector<Row>& rows) {
     // Group by (pattern, N) — merge int32 and uint64 into one object
     struct DataPoint {
         std::string pattern;
@@ -268,6 +268,34 @@ static void emit_jsx(const std::vector<Row>& rows) {
     const char* names[] = {"kntrie_int32", "kntrie_uint64", "map_int32", "map_uint64", "umap_int32", "umap_uint64"};
     const char* suffixes[] = {"find", "insert", "erase", "mem"};
 
+    // HTML preamble — ES modules via esm.sh, no Babel needed
+    std::printf("%s", R"HTML(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>kntrie Benchmark</title>
+<style>body{margin:0;background:#0f0f1a;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.2.0",
+    "react-dom": "https://esm.sh/react-dom@18.2.0",
+    "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+    "recharts": "https://esm.sh/recharts@2.12.7?external=react,react-dom"
+  }
+}
+</script>
+<script type="module">
+import React, { useState, createElement as h } from "react";
+import { createRoot } from "react-dom/client";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+)HTML");
+
+    // Emit data blob
     std::printf("const RAW_DATA = [\n");
     for (auto& p : points) {
         std::printf("  {pattern:\"%s\",N:%zu", p.pattern.c_str(), p.N);
@@ -284,10 +312,10 @@ static void emit_jsx(const std::vector<Row>& rows) {
     }
     std::printf("];\n\n");
 
-    // Static JSX template
+    // Static template using htm (tagged template JSX alternative, no Babel needed)
     std::printf("%s",
-R"JSX(import { useState } from "react";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+R"JSX(import htm from "https://esm.sh/htm@3.1.1";
+const html = htm.bind(React.createElement);
 
 const LINES = [
   { key: "kntrie_int32", color: "#3b82f6", dash: "", label: "kntrie i32" },
@@ -301,10 +329,10 @@ const LINES = [
 ];
 
 const METRICS = [
-  { suffix: "find", label: "Find", unit: "ns/entry", convert: (ms, n) => (ms * 1e6) / n },
-  { suffix: "insert", label: "Insert", unit: "ns/entry", convert: (ms, n) => (ms * 1e6) / n },
-  { suffix: "erase", label: "Erase (N/2)", unit: "ns/entry", convert: (ms, n) => (ms * 1e6) / (n / 2) },
-  { suffix: "mem", label: "Memory", unit: "B/entry", convert: (b, n) => b / n },
+  { suffix: "find", label: "Find (ns/entry)", convert: (ms, n) => (ms * 1e6) / n },
+  { suffix: "insert", label: "Insert (ns/entry)", convert: (ms, n) => (ms * 1e6) / n },
+  { suffix: "erase", label: "Erase N/2 (ns/entry)", convert: (ms, n) => (ms * 1e6) / (n / 2) },
+  { suffix: "mem", label: "Memory (B/entry)", convert: (b, n) => b / n },
 ];
 
 const PATTERNS = ["random", "sequential"];
@@ -314,12 +342,12 @@ function buildData(pattern, metric) {
   return RAW_DATA
     .filter((r) => r.pattern === pattern)
     .map((r) => {
-      const out = { N: r.N };
+      const out = { N: r.N, logN: Math.log10(r.N) };
       for (const line of lines) {
         if (line.key === "raw_int32") {
-          if (metric.suffix === "mem") out[line.key] = metric.convert(r.N * 12, r.N);
+          if (metric.suffix === "mem") out[line.key] = r.N * 12 / r.N;
         } else if (line.key === "raw_uint64") {
-          if (metric.suffix === "mem") out[line.key] = metric.convert(r.N * 16, r.N);
+          if (metric.suffix === "mem") out[line.key] = r.N * 16 / r.N;
         } else {
           const raw = r[`${line.key}_${metric.suffix}`];
           if (raw != null) out[line.key] = metric.convert(raw, r.N);
@@ -329,107 +357,117 @@ function buildData(pattern, metric) {
     });
 }
 
-const fmtN = (v) => {
-  if (v >= 1e6) return `${(v / 1e6).toFixed(0)}M`;
-  if (v >= 1e3) return `${(v / 1e3).toFixed(0)}K`;
-  return `${v}`;
+const fmtN = (logV) => {
+  const v = Math.pow(10, logV);
+  if (v >= 1e6) return (v / 1e6).toFixed(v >= 1e7 ? 0 : 1) + "M";
+  if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + "K";
+  return String(Math.round(v));
 };
 
-const fmtVal = (v, unit) => {
+const fmtVal = (v) => {
   if (v == null) return "";
-  if (v < 0.1) return `${v.toFixed(3)} ${unit}`;
-  if (v < 10) return `${v.toFixed(2)} ${unit}`;
-  if (v < 1000) return `${v.toFixed(1)} ${unit}`;
-  return `${v.toFixed(0)} ${unit}`;
+  if (v < 0.1) return v.toFixed(3);
+  if (v < 10) return v.toFixed(2);
+  if (v < 1000) return v.toFixed(1);
+  return v.toFixed(0);
 };
 
-const Tip = ({ active, payload, label, unit }) => {
+const Tip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
-  return (
-    <div style={{ background: "#1a1a2e", border: "1px solid #444", borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
-      <div style={{ color: "#aaa", marginBottom: 4, fontWeight: 600 }}>N = {fmtN(label)}</div>
-      {payload.filter((p) => p.value != null).map((p) => (
-        <div key={p.dataKey} style={{ color: p.color, marginBottom: 1 }}>
-          {LINES.find((l) => l.key === p.dataKey)?.label}: {fmtVal(p.value, unit)}
-        </div>
-      ))}
-    </div>
-  );
+  return html`<div style=${{ background: "#1a1a2e", border: "1px solid #444", borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
+    <div style=${{ color: "#aaa", marginBottom: 4, fontWeight: 600 }}>N = ${fmtN(label)}</div>
+    ${payload.filter((p) => p.value != null).map((p) => html`
+      <div key=${p.dataKey} style=${{ color: p.color, marginBottom: 1 }}>
+        ${LINES.find((l) => l.key === p.dataKey)?.label}: ${fmtVal(p.value)}
+      </div>
+    `)}
+  </div>`;
 };
 
-const Chart = ({ title, data, unit }) => {
+const Chart = ({ title, data }) => {
   const allVals = data.flatMap((d) => LINES.map((l) => d[l.key]).filter((v) => v != null && v > 0));
   if (!allVals.length) return null;
-  const minY = Math.pow(10, Math.floor(Math.log10(Math.min(...allVals))));
-  const maxY = Math.pow(10, Math.ceil(Math.log10(Math.max(...allVals))));
 
-  return (
-    <div style={{ marginBottom: 28 }}>
-      <h3 style={{ margin: "0 0 6px 0", fontSize: 14, fontWeight: 600, color: "#ddd", textAlign: "center" }}>{title}</h3>
-      <ResponsiveContainer width="100%" height={220}>
-        <LineChart data={data} margin={{ top: 4, right: 16, left: 8, bottom: 4 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a3e" />
-          <XAxis dataKey="N" scale="log" domain={["dataMin", "dataMax"]} type="number"
-            tickFormatter={fmtN} tick={{ fill: "#888", fontSize: 11 }} stroke="#444" />
-          <YAxis scale="log" domain={[minY, maxY]} type="number"
-            tickFormatter={(v) => fmtVal(v, "")} tick={{ fill: "#888", fontSize: 10 }}
-            stroke="#444" width={52} allowDataOverflow />
-          <Tooltip content={<Tip unit={unit} />} />
-          {LINES.map((l) => (
-            <Line key={l.key} type="monotone" dataKey={l.key} stroke={l.color}
-              strokeWidth={l.dash ? 1.5 : 2.5} dot={{ r: l.dash ? 2 : 3, fill: l.color }}
-              strokeDasharray={l.dash || undefined} connectNulls />
-          ))}
-        </LineChart>
-      </ResponsiveContainer>
-    </div>
-  );
+  const logNs = data.map(d => d.logN);
+  const minX = Math.floor(Math.min(...logNs));
+  const maxX = Math.ceil(Math.max(...logNs));
+  const xTicks = [];
+  for (let i = minX; i <= maxX; i++) xTicks.push(i);
+
+  return html`<div style=${{ marginBottom: 28 }}>
+    <h3 style=${{ margin: "0 0 6px 0", fontSize: 14, fontWeight: 600, color: "#ddd", textAlign: "center" }}>${title}</h3>
+    <${ResponsiveContainer} width="100%" height=${240}>
+      <${LineChart} data=${data} margin=${{ top: 4, right: 16, left: 8, bottom: 4 }}>
+        <${CartesianGrid} strokeDasharray="3 3" stroke="#2a2a3e" />
+        <${XAxis} dataKey="logN" type="number" domain=${[minX, maxX]}
+          ticks=${xTicks} tickFormatter=${fmtN}
+          tick=${{ fill: "#888", fontSize: 11 }} stroke="#444" />
+        <${YAxis} scale="log" domain=${["auto", "auto"]} type="number"
+          tickFormatter=${fmtVal} tick=${{ fill: "#888", fontSize: 10 }}
+          stroke="#444" width=${52} allowDataOverflow />
+        <${Tooltip} content=${html`<${Tip} />`} />
+        ${LINES.map((l) => html`
+          <${Line} key=${l.key} type="monotone" dataKey=${l.key} stroke=${l.color}
+            strokeWidth=${l.dash ? 1.5 : 2.5} dot=${false}
+            strokeDasharray=${l.dash || undefined} connectNulls isAnimationActive=${false} />
+        `)}
+      </${LineChart}>
+    </${ResponsiveContainer}>
+  </div>`;
 };
 
-export default function App() {
-  return (
-    <div style={{ background: "#0f0f1a", color: "#ddd", minHeight: "100vh", padding: "16px 12px", fontFamily: "system-ui, sans-serif" }}>
-      <h2 style={{ margin: "0 0 4px 0", fontSize: 18, fontWeight: 700, textAlign: "center" }}>kntrie Benchmark</h2>
-      <p style={{ textAlign: "center", color: "#777", fontSize: 12, margin: "0 0 12px 0" }}>
-        Log-log · Per-entry · Lower is better · Solid = i32, Dashed = u64
-      </p>
+function App() {
+  const [pattern, setPattern] = useState("random");
+  return html`<div style=${{ background: "#0f0f1a", color: "#ddd", minHeight: "100vh", padding: "16px 12px", fontFamily: "system-ui, sans-serif" }}>
+    <h2 style=${{ margin: "0 0 4px 0", fontSize: 18, fontWeight: 700, textAlign: "center" }}>kntrie Benchmark</h2>
+    <p style=${{ textAlign: "center", color: "#777", fontSize: 12, margin: "0 0 12px 0" }}>
+      Log-log · Per-entry · Lower is better · Solid = i32, Dashed = u64
+    </p>
 
-      <div style={{ display: "flex", justifyContent: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
-        {LINES.map((l) => (
-          <div key={l.key} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11 }}>
-            {l.dash ? (
-              <svg width={22} height={4}><line x1={0} y1={2} x2={22} y2={2} stroke={l.color} strokeWidth={2} strokeDasharray={l.dash} /></svg>
-            ) : (
-              <div style={{ width: 22, height: 2.5, background: l.color, borderRadius: 1 }} />
-            )}
-            <span style={{ color: "#bbb" }}>{l.label}</span>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ maxWidth: 580, margin: "0 auto" }}>
-        {PATTERNS.map((pat) => (
-          <div key={pat}>
-            <h3 style={{ fontSize: 16, fontWeight: 700, color: "#aac4ff", textAlign: "center",
-              margin: "20px 0 12px 0", borderBottom: "1px solid #333", paddingBottom: 6 }}>
-              {pat}
-            </h3>
-            {METRICS.map((m) => (
-              <Chart key={`${pat}-${m.suffix}`} title={m.label}
-                data={buildData(pat, m)} unit={m.unit} />
-            ))}
-          </div>
-        ))}
-      </div>
+    <div style=${{ display: "flex", justifyContent: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
+      ${LINES.map((l) => html`
+        <div key=${l.key} style=${{ display: "flex", alignItems: "center", gap: 5, fontSize: 11 }}>
+          ${l.dash
+            ? html`<svg width=${22} height=${4}><line x1=${0} y1=${2} x2=${22} y2=${2} stroke=${l.color} strokeWidth=${2} strokeDasharray=${l.dash} /></svg>`
+            : html`<div style=${{ width: 22, height: 2.5, background: l.color, borderRadius: 1 }} />`}
+          <span style=${{ color: "#bbb" }}>${l.label}</span>
+        </div>
+      `)}
     </div>
-  );
+
+    <div style=${{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 16 }}>
+      ${PATTERNS.map((p) => html`
+        <button key=${p} onClick=${() => setPattern(p)}
+          style=${{
+            padding: "6px 16px", borderRadius: 6, border: "1px solid #444",
+            background: pattern === p ? "#3b82f6" : "#1a1a2e",
+            color: pattern === p ? "#fff" : "#aaa",
+            cursor: "pointer", fontSize: 13, fontWeight: 600,
+          }}>
+          ${p}
+        </button>
+      `)}
+    </div>
+
+    <div style=${{ maxWidth: 620, margin: "0 auto" }}>
+      ${METRICS.map((m) => html`
+        <${Chart} key=${pattern + "-" + m.suffix} title=${m.label}
+          data=${buildData(pattern, m)} />
+      `)}
+    </div>
+  </div>`;
 }
+
+createRoot(document.getElementById("root")).render(html`<${App} />`);
 )JSX");
+
+    std::printf("</script>\n</body>\n</html>\n");
 }
 
 int main() {
     std::vector<size_t> sizes;
-    for (double n = 100; n < 6000000; n *= 1.5)
+    constexpr double MAX_N = 10000;  // change to 6000000 for full run
+    for (double n = 100; n < MAX_N; n *= 1.5)
         sizes.push_back(static_cast<size_t>(n));
 
     auto capped_sizes = [&](auto key_tag) {
@@ -460,6 +498,6 @@ int main() {
         }
     }
 
-    emit_jsx(rows);
+    emit_html(rows);
     return 0;
 }
