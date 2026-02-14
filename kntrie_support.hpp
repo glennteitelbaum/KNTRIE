@@ -9,7 +9,6 @@
 #include <utility>
 #include <algorithm>
 #include <cassert>
-#include <array>
 
 namespace gteitelbaum {
 
@@ -36,9 +35,16 @@ inline constexpr size_t HEADER_U64    = 2;   // header is 2 u64 (16 bytes)
 // Worst-case waste: ~25%.  Enables in-place insert/erase.
 // ==========================================================================
 
-// Size classes: exact up to 8, then powers-of-2 with midpoints.
-// 1..8, 12,16, 24,32, 48,64, 96,128, 192,256, ...
-// Max waste: 33%.
+// ==========================================================================
+// Allocation size classes (bitmask nodes only)
+//
+// Compact leaves use power-of-2 slot counts with exact allocation.
+// Bitmask nodes use these size classes:
+//   Up to 12 u64s: step 4 -> 4,8,12
+//   Then powers-of-2 with midpoints (+2 for header):
+//     16, 26, 32, 50, 64, 98, 128, 194, ...
+//   Max waste: ~33%.
+// ==========================================================================
 
 inline constexpr size_t round_up_u64(size_t n) noexcept {
     if (n < 12) return ((n + 3) / 4) * 4;
@@ -49,6 +55,7 @@ inline constexpr size_t round_up_u64(size_t n) noexcept {
 }
 
 // Shrink when allocated exceeds the class for 2x the needed size.
+// Bitmask nodes only — compact leaves use power-of-2 shrink logic.
 inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcept {
     return allocated > round_up_u64(needed * 2);
 }
@@ -156,41 +163,6 @@ inline constexpr uint8_t suffix_type_for(int bits) noexcept {
     if (bits <= 32) return 2;  // u32
     return 3;                  // u64
 }
-
-// ==========================================================================
-// slot_table -- constexpr lookup: max total slots for a given alloc_u64
-//
-// Templated on K (suffix type) and VST (value slot type).
-// Indexed directly by alloc_u64. table[0..HEADER_U64] = 0.
-// ==========================================================================
-
-template<typename K, typename VST>
-struct slot_table {
-    static constexpr size_t MAX_ALLOC = 16384;
-
-    static constexpr auto build() {
-        std::array<uint16_t, MAX_ALLOC + 1> tbl{};
-        for (size_t i = 0; i <= HEADER_U64; ++i) tbl[i] = 0;
-        for (size_t au64 = HEADER_U64 + 1; au64 <= MAX_ALLOC; ++au64) {
-            size_t avail = (au64 - HEADER_U64) * 8;
-            size_t total = avail / (sizeof(K) + sizeof(VST));
-            while (total > 0) {
-                size_t kb = (total * sizeof(K) + 7) & ~size_t{7};
-                size_t vb = (total * sizeof(VST) + 7) & ~size_t{7};
-                if (kb + vb <= avail) break;
-                --total;
-            }
-            tbl[au64] = static_cast<uint16_t>(total);
-        }
-        return tbl;
-    }
-
-    static constexpr auto table_ = build();
-
-    static constexpr uint16_t max_slots(size_t alloc_u64) noexcept {
-        return table_[alloc_u64];
-    }
-};
 
 // ==========================================================================
 // Value traits
