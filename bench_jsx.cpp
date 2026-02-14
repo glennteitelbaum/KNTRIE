@@ -268,7 +268,7 @@ static void emit_html(const std::vector<Row>& rows) {
     const char* names[] = {"kntrie_int32", "kntrie_uint64", "map_int32", "map_uint64", "umap_int32", "umap_uint64"};
     const char* suffixes[] = {"find", "insert", "erase", "mem"};
 
-    // HTML preamble — ES modules via esm.sh, no Babel needed
+    // HTML preamble — ES modules via esm.sh, deps bundled
     std::printf("%s", R"HTML(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -279,20 +279,10 @@ static void emit_html(const std::vector<Row>& rows) {
 </head>
 <body>
 <div id="root"></div>
-<script type="importmap">
-{
-  "imports": {
-    "react": "https://esm.sh/react@18.2.0",
-    "react-dom": "https://esm.sh/react-dom@18.2.0",
-    "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
-    "recharts": "https://esm.sh/recharts@2.12.7?external=react,react-dom"
-  }
-}
-</script>
 <script type="module">
-import React, { useState, createElement as h } from "react";
-import { createRoot } from "react-dom/client";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import React, { useState } from "https://esm.sh/react@18.2.0";
+import { createRoot } from "https://esm.sh/react-dom@18.2.0/client";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "https://esm.sh/recharts@2.12.7?deps=react@18.2.0,react-dom@18.2.0";
 )HTML");
 
     // Emit data blob
