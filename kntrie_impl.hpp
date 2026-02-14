@@ -414,6 +414,26 @@ private:
     }
 
     // ==================================================================
+    // remove_skip_: strip the skip u64 from a node that no longer needs it
+    //
+    // Realloc with -1 u64, shift data left, clear SKIP_BIT.
+    // Returns new node pointer.
+    // ==================================================================
+
+    uint64_t* remove_skip_(uint64_t* node) {
+        auto* h = get_header(node);
+        size_t old_au64 = h->alloc_u64();
+        size_t new_au64 = old_au64 - 1;
+        uint64_t* nn = alloc_node(alloc_, new_au64);
+        nn[0] = node[0];  // copy header
+        nn[0] &= ~node_header::SKIP_BIT;  // clear skip bit
+        std::memcpy(nn + 1, node + 2, (old_au64 - 2) * 8);  // shift data left
+        get_header(nn)->set_alloc_u64(static_cast<uint16_t>(new_au64));
+        dealloc_node(alloc_, node, old_au64);
+        return nn;
+    }
+
+    // ==================================================================
     // make_single_leaf: create 1-entry leaf at given bits
     // ==================================================================
 
@@ -623,12 +643,20 @@ private:
         uint8_t old_idx = actual[common];
         uint8_t old_rem = skip - 1 - common;
 
+        // Save common prefix before any reallocation invalidates `actual`
+        uint8_t saved_prefix[6] = {};
+        if (common > 0)
+            std::memcpy(saved_prefix, actual, common);
+
         // Update old node: strip consumed prefix, keep remainder
-        hdr->set_skip(old_rem);
         if (old_rem > 0) {
             uint8_t rem[6] = {};
             std::memcpy(rem, actual + common + 1, old_rem);
+            hdr->set_skip(old_rem);
             hdr->set_prefix(rem, old_rem);
+        } else {
+            node = remove_skip_(node);
+            hdr = get_header(node);
         }
 
         // Advance ik and bits past divergence byte + remaining prefix
@@ -658,7 +686,7 @@ private:
         }
 
         return BO::make_bitmask(bi, cp, 2, common,
-                                 common > 0 ? actual : nullptr, alloc_);
+                                 common > 0 ? saved_prefix : nullptr, alloc_);
     }
 
     // ==================================================================

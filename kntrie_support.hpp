@@ -136,14 +136,9 @@ struct node_header {
             bits_ |= SKIP_BIT;
             auto* p = reinterpret_cast<uint64_t*>(this);
             reinterpret_cast<uint8_t*>(p + 1)[7] = s;
-        } else if (bits_ & SKIP_BIT) {
-            // Node already has skip u64 allocated -- zero skip_len
-            // but keep SKIP_BIT so hdr_u64() stays 2 and offsets
-            // remain correct. Find loop runs 0 times.
-            auto* p = reinterpret_cast<uint64_t*>(this);
-            reinterpret_cast<uint8_t*>(p + 1)[7] = 0;
+        } else {
+            bits_ &= ~SKIP_BIT;
         }
-        // else: no skip space, nothing to do
     }
 
     void set_prefix(const uint8_t* pfx, uint8_t len) noexcept {
