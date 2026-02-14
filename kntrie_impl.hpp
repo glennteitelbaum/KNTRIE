@@ -484,10 +484,9 @@ private:
 
     uint64_t* build_node_from_arrays_(uint64_t* suf, VST* vals,
                                        size_t count, int bits) {
-        // Leaf case: max entries depends on suffix width
-        uint8_t st = suffix_type_for(bits);
-        size_t compact_max = (st <= 1) ? COMPACT_MAX : 512;
-        if (count <= compact_max) {
+        // Leaf case
+        if (count <= COMPACT_MAX) {
+            uint8_t st = suffix_type_for(bits);
             if (st == 0) {
                 auto bk = std::make_unique<uint8_t[]>(count);
                 for (size_t i = 0; i < count; ++i)

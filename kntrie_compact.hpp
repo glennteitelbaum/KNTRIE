@@ -50,15 +50,11 @@ struct compact_ops {
         (sizeof(K) == 2) ? 1 :
         (sizeof(K) == 4) ? 2 : 3;
 
-    // Max entries before split: small keys stay large, wide keys split early
-    static constexpr uint16_t COMPACT_MAX_FOR =
-        (sizeof(K) <= 2) ? 4096 : 512;
-
     // --- power-of-2 slot count for a given entry count ---
 
     static constexpr uint16_t slots_for(uint16_t entries) noexcept {
         return static_cast<uint16_t>(std::min<uint32_t>(
-            std::bit_ceil(static_cast<unsigned>(entries)), COMPACT_MAX_FOR));
+            std::bit_ceil(static_cast<unsigned>(entries)), COMPACT_MAX));
     }
 
     // --- exact u64 size for a given slot count ---
@@ -179,7 +175,7 @@ struct compact_ops {
         }
         if constexpr (!INSERT) return {node, false, false};
 
-        if (entries >= COMPACT_MAX_FOR)
+        if (entries >= COMPACT_MAX)
             return {node, false, true};  // needs_split
 
         int ins = static_cast<int>(base - kd) + (*base < suffix);
