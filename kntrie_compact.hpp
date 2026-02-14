@@ -41,6 +41,44 @@ struct jump_search {
 };
 
 // ==========================================================================
+// AdaptiveSearch  (branchless binary search)
+//
+// First step aligns to power-of-2 via bit_floor, then each halving
+// step uses a conditional move (no branch).
+// ==========================================================================
+
+template<typename K>
+struct adaptive_search {
+    // Branchless binary search for any count. First step aligns to power of 2.
+    // Returns index if found (>=0), or -1 if not found.
+    static int search(const K* keys, int count, K key) noexcept {
+        if (count == 0) [[unlikely]] return -1;
+        const K* base = keys;
+        int step = static_cast<int>(std::bit_floor(static_cast<unsigned>(count)));
+        if (step < count)
+            base = (base[count - step] <= key) ? base + (count - step) : base;
+        for (step >>= 1; step > 0; step >>= 1)
+            base = (base[step] <= key) ? base + step : base;
+        return (*base == key) ? static_cast<int>(base - keys) : -1;
+    }
+
+    // Returns index if found (>=0), or -(insertion_point + 1) if not found.
+    static int search_insert(const K* keys, int count, K key) noexcept {
+        if (count == 0) [[unlikely]] return -(0 + 1);
+        const K* base = keys;
+        int step = static_cast<int>(std::bit_floor(static_cast<unsigned>(count)));
+        if (step < count)
+            base = (base[count - step] <= key) ? base + (count - step) : base;
+        for (step >>= 1; step > 0; step >>= 1)
+            base = (base[step] <= key) ? base + step : base;
+        if (*base == key) return static_cast<int>(base - keys);
+        int pos = static_cast<int>(base - keys);
+        if (*base < key) pos++;
+        return -(pos + 1);
+    }
+};
+
+// ==========================================================================
 // compact_ops  -- compact leaf operations templated on K type
 //
 // Layout: [header (2 u64)][sorted_keys (aligned)][values (aligned)]
@@ -100,7 +138,7 @@ struct compact_ops {
         uint16_t ts = total_slots(&h);
         int search_count = (entries < DUP_THRESHOLD) ?
             static_cast<int>(entries) : static_cast<int>(ts);
-        int idx = jump_search<K>::search(keys_(node), search_count, suffix);
+        int idx = adaptive_search<K>::search(keys_(node), search_count, suffix);
         if (idx < 0) [[unlikely]] return nullptr;
         return VT::as_ptr(vals_(node, ts)[idx]);
     }
@@ -257,7 +295,7 @@ private:
         K*   kd = keys_(node);
         VST* vd = vals_mut_(node, ts);
 
-        int idx = jump_search<K>::search_insert(kd, static_cast<int>(entries), suffix);
+        int idx = adaptive_search<K>::search_insert(kd, static_cast<int>(entries), suffix);
 
         // Key exists
         if (idx >= 0) {
@@ -351,7 +389,7 @@ private:
         K*   kd = keys_(node);
         VST* vd = vals_mut_(node, ts);
 
-        int idx = jump_search<K>::search(kd, static_cast<int>(entries), suffix);
+        int idx = adaptive_search<K>::search(kd, static_cast<int>(entries), suffix);
         if (idx < 0) return {node, false};
 
         uint16_t nc = entries - 1;
@@ -415,7 +453,7 @@ private:
         K*   kd = keys_(node);
         VST* vd = vals_mut_(node, ts);
 
-        int idx = jump_search<K>::search_insert(kd, static_cast<int>(ts), suffix);
+        int idx = adaptive_search<K>::search_insert(kd, static_cast<int>(ts), suffix);
 
         // Key exists
         if (idx >= 0) {
@@ -469,7 +507,7 @@ private:
         K*   kd = keys_(node);
         VST* vd = vals_mut_(node, ts);
 
-        int idx = jump_search<K>::search(kd, static_cast<int>(ts), suffix);
+        int idx = adaptive_search<K>::search(kd, static_cast<int>(ts), suffix);
         if (idx < 0) return {node, false};
 
         uint16_t nc = entries - 1;
