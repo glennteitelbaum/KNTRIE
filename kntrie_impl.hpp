@@ -63,7 +63,6 @@ public:
         IK ik = KO::to_internal(key);
 
         const uint64_t* node = root_;
-        if (node == SENTINEL_NODE) [[unlikely]] return nullptr;
         node_header hdr = *get_header(node);
 
         while (true) {

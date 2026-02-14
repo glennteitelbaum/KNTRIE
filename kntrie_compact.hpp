@@ -18,6 +18,15 @@ namespace gteitelbaum {
 
 template<typename K>
 struct adaptive_search {
+    // Pure cmov loop — returns pointer to candidate.
+    // Caller checks *result == key. count must be power of 2.
+    static const K* find_base(const K* keys, int count, K key) noexcept {
+        const K* base = keys;
+        for (int step = count >> 1; step > 0; step >>= 1)
+            base = (base[step] <= key) ? base + step : base;
+        return base;
+    }
+
     // Returns index if found (>=0), or -1 if not found.
     // count must be a power of 2.
     static int search(const K* keys, int count, K key) noexcept {
@@ -65,7 +74,6 @@ struct compact_ops {
     // --- power-of-2 slot count for a given entry count ---
 
     static constexpr uint16_t slots_for(uint16_t entries) noexcept {
-        if (entries <= 1) return 1;
         return static_cast<uint16_t>(std::min<uint32_t>(
             std::bit_ceil(static_cast<unsigned>(entries)), COMPACT_MAX));
     }
@@ -87,11 +95,11 @@ struct compact_ops {
     static const VALUE* find(const uint64_t* node, node_header h,
                              K suffix) noexcept {
         uint16_t entries = h.entries();
-        if (entries == 0) [[unlikely]] return nullptr;
         uint16_t ts = slots_for(entries);
-        int idx = adaptive_search<K>::search(keys_(node), static_cast<int>(ts), suffix);
-        if (idx < 0) [[unlikely]] return nullptr;
-        return VT::as_ptr(vals_(node, ts)[idx]);
+        const K* keys = keys_(node);
+        const K* base = adaptive_search<K>::find_base(keys, static_cast<int>(ts), suffix);
+        if (*base != suffix) [[unlikely]] return nullptr;
+        return VT::as_ptr(vals_(node, ts)[base - keys]);
     }
 
     // ==================================================================
@@ -211,21 +219,9 @@ struct compact_ops {
         nh->set_entries(new_entries);
         nh->set_alloc_u64(static_cast<uint16_t>(au64));
 
-        // Build sorted real entries with new key, then seed
-        auto tmp_k = std::make_unique<K[]>(new_entries);
-        auto tmp_v = std::make_unique<VST[]>(new_entries);
-        dedup_into_(kd, vd, ts, entries, tmp_k.get(), tmp_v.get());
-        // Insert new key at sorted position
-        int real_ins = 0;
-        while (real_ins < entries && tmp_k[real_ins] < suffix) ++real_ins;
-        std::memmove(tmp_k.get() + real_ins + 1, tmp_k.get() + real_ins,
-                     (entries - real_ins) * sizeof(K));
-        std::memmove(tmp_v.get() + real_ins + 1, tmp_v.get() + real_ins,
-                     (entries - real_ins) * sizeof(VST));
-        tmp_k[real_ins] = suffix;
-        VT::write_slot(&tmp_v[real_ins], value);
-
-        seed_from_real_(nn, tmp_k.get(), tmp_v.get(), new_entries, new_ts);
+        // Single-pass: dedup old + inject new key + seed dups
+        seed_with_insert_(nn, kd, vd, ts, entries,
+                          suffix, value, new_entries, new_ts);
 
         dealloc_node(alloc, node, h->alloc_u64());
         return {nn, true, false};
@@ -309,22 +305,9 @@ private:
     }
 
     // ==================================================================
-    // Dedup: extract real entries from dup-seeded array
+    // Dedup + skip one key, writing into output arrays
     // ==================================================================
 
-    static void dedup_into_(const K* kd, const VST* vd, uint16_t ts,
-                             uint16_t entries,
-                             K* out_k, VST* out_v) {
-        int wi = 0;
-        for (int i = 0; i < ts; ++i) {
-            if (i > 0 && kd[i] == kd[i - 1]) continue;
-            out_k[wi] = kd[i];
-            out_v[wi] = vd[i];
-            wi++;
-        }
-    }
-
-    // Dedup + skip one key, writing into output arrays
     static void dedup_skip_into_(const K* kd, const VST* vd, uint16_t ts,
                                   K skip_suffix,
                                   K* out_k, VST* out_v, ALLOC& alloc) {
@@ -341,6 +324,112 @@ private:
             out_k[wi] = kd[i];
             out_v[wi] = vd[i];
             wi++;
+        }
+    }
+
+    // ==================================================================
+    // Single-pass: dedup old array + inject new key + seed dups into dest
+    // No temp arrays. One read pass, one write pass.
+    // ==================================================================
+
+    static void seed_with_insert_(uint64_t* dst,
+                                   const K* old_k, const VST* old_v,
+                                   uint16_t old_ts, uint16_t old_entries,
+                                   K new_suffix, VST new_val,
+                                   uint16_t new_entries, uint16_t new_ts) {
+        K*   dk = keys_(dst);
+        VST* dv = vals_mut_(dst, new_ts);
+
+        if (new_entries == new_ts) {
+            // No dups needed — straight copy with insert
+            bool inserted = false;
+            int wi = 0;
+            for (int i = 0; i < old_ts; ++i) {
+                if (i > 0 && old_k[i] == old_k[i - 1]) continue;
+                if (!inserted && new_suffix < old_k[i]) {
+                    dk[wi] = new_suffix;
+                    VT::write_slot(&dv[wi], new_val);
+                    wi++;
+                    inserted = true;
+                }
+                dk[wi] = old_k[i];
+                dv[wi] = old_v[i];
+                wi++;
+            }
+            if (!inserted) {
+                dk[wi] = new_suffix;
+                VT::write_slot(&dv[wi], new_val);
+            }
+            return;
+        }
+
+        // Dup seeding: distribute n_dups evenly among new_entries real entries
+        uint16_t n_dups = new_ts - new_entries;
+        uint16_t stride = new_entries / (n_dups + 1);
+        uint16_t remainder = new_entries % (n_dups + 1);
+
+        int wi = 0;         // write index into destination
+        int real_out = 0;   // count of real entries emitted
+        int placed = 0;     // dups placed so far
+        int group_size = stride + (0 < remainder ? 1 : 0);
+        int in_group = 0;   // entries written in current group
+
+        bool inserted = false;
+        for (int i = 0; i < old_ts; ++i) {
+            if (i > 0 && old_k[i] == old_k[i - 1]) continue;  // skip dup
+
+            // Inject new key at sorted position
+            if (!inserted && new_suffix < old_k[i]) {
+                dk[wi] = new_suffix;
+                VT::write_slot(&dv[wi], new_val);
+                wi++;
+                real_out++;
+                in_group++;
+                inserted = true;
+
+                // Check if group full → emit dup
+                if (placed < n_dups && in_group >= group_size) {
+                    dk[wi] = dk[wi - 1];
+                    dv[wi] = dv[wi - 1];
+                    wi++;
+                    placed++;
+                    in_group = 0;
+                    group_size = stride + (placed < remainder ? 1 : 0);
+                }
+            }
+
+            // Emit real entry from old array
+            dk[wi] = old_k[i];
+            dv[wi] = old_v[i];
+            wi++;
+            real_out++;
+            in_group++;
+
+            // Check if group full → emit dup
+            if (placed < n_dups && in_group >= group_size) {
+                dk[wi] = dk[wi - 1];
+                dv[wi] = dv[wi - 1];
+                wi++;
+                placed++;
+                in_group = 0;
+                group_size = stride + (placed < remainder ? 1 : 0);
+            }
+        }
+
+        // New key is largest — append at end
+        if (!inserted) {
+            dk[wi] = new_suffix;
+            VT::write_slot(&dv[wi], new_val);
+            wi++;
+            real_out++;
+            in_group++;
+
+            if (placed < n_dups && in_group >= group_size) {
+                dk[wi] = dk[wi - 1];
+                dv[wi] = dv[wi - 1];
+                wi++;
+                placed++;
+            }
         }
     }
 
