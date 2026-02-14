@@ -111,13 +111,13 @@ struct bitmap256 {
 // ==========================================================================
 // bitmask_ops  -- unified bitmask node + bitmap256 leaf operations
 //
-// Bitmask node (internal): [header(2)][bitmap(4)][sentinel(1)][children(n)]
-//   - sentinel at offset 6 = SENTINEL_NODE ptr for branchless miss
-//   - real children at offset 7
+// Bitmask node (internal): [header(1)][bitmap(4)][sentinel(1)][children(n)]
+//   - sentinel at offset 5 = SENTINEL_NODE ptr for branchless miss
+//   - real children at offset 6
 //   - No internal_bitmap — children are self-describing
 //
-// Bitmap256 leaf (suffix_type=0): [header(2)][bitmap(4)][values(n)]
-//   - values at offset 6
+// Bitmap256 leaf (suffix_type=0): [header(1)][bitmap(4)][values(n)]
+//   - values at offset 5
 //   - 8-bit suffix space, O(1) lookup via popcount
 // ==========================================================================
 
@@ -265,8 +265,7 @@ struct bitmask_ops {
 
     static uint64_t* make_bitmask(const uint8_t* indices,
                                    uint64_t* const* child_ptrs,
-                                   int n_children, uint8_t skip,
-                                   const uint8_t* prefix, ALLOC& alloc) {
+                                   int n_children, ALLOC& alloc) {
         bitmap256 bm = bitmap256::from_indices(indices, n_children);
 
         size_t needed = bitmask_size_u64(n_children);
@@ -275,9 +274,7 @@ struct bitmask_ops {
         auto* nh = get_header(nn);
         nh->set_entries(static_cast<uint16_t>(n_children));
         nh->set_alloc_u64(static_cast<uint16_t>(au64));
-        nh->set_skip(skip);
         nh->set_bitmask();
-        if (skip > 0) nh->set_prefix(prefix, skip);
 
         bm_mut_(nn) = bm;
         children_mut_(nn)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
@@ -523,7 +520,7 @@ private:
 
     // --- Bitmask node: children array (includes sentinel at [0]) ---
     static const uint64_t* children_(const uint64_t* n) noexcept {
-        return n + HEADER_U64 + BITMAP256_U64;  // offset 6
+        return n + HEADER_U64 + BITMAP256_U64;  // offset 5
     }
     static uint64_t* children_mut_(uint64_t* n) noexcept {
         return n + HEADER_U64 + BITMAP256_U64;
@@ -531,7 +528,7 @@ private:
 
     // --- Bitmask node: real children (past sentinel) ---
     static const uint64_t* real_children_(const uint64_t* n) noexcept {
-        return n + HEADER_U64 + BITMAP256_U64 + 1;  // offset 7
+        return n + HEADER_U64 + BITMAP256_U64 + 1;  // offset 6
     }
     static uint64_t* real_children_mut_(uint64_t* n) noexcept {
         return n + HEADER_U64 + BITMAP256_U64 + 1;
@@ -539,7 +536,7 @@ private:
 
     // --- Bitmap256 leaf: values after bitmap ---
     static const VST* bl_vals_(const uint64_t* n) noexcept {
-        return reinterpret_cast<const VST*>(n + HEADER_U64 + BITMAP256_U64);  // offset 6
+        return reinterpret_cast<const VST*>(n + HEADER_U64 + BITMAP256_U64);  // offset 5
     }
     static VST* bl_vals_mut_(uint64_t* n) noexcept {
         return reinterpret_cast<VST*>(n + HEADER_U64 + BITMAP256_U64);

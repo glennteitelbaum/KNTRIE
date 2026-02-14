@@ -19,7 +19,7 @@ namespace gteitelbaum {
 inline constexpr size_t BITMAP256_U64 = 4;   // 32 bytes
 inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
-inline constexpr size_t HEADER_U64    = 2;   // header is 2 u64 (16 bytes)
+inline constexpr size_t HEADER_U64    = 1;   // header is 1 u64 (8 bytes)
 
 // ==========================================================================
 // Allocation size classes
@@ -61,15 +61,13 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 }
 
 // ==========================================================================
-// Node Header  (16 bytes = 2 u64)
+// Node Header  (8 bytes = 1 u64)
 //
 // flags_:      [15] is_bitmask (0=leaf, 1=bitmask node)
 //              [1:0] suffix_type (leaf only: 0=bitmap256, 1=u16, 2=u32, 3=u64)
 // entries_:    entry count
 // alloc_u64_:  allocation size in u64s
-// skip_len_:   number of u8 prefix chunks (0-6)
-// prefix_[6]:  u8 skip chunks (outer first)
-// pad_[3]:     reserved (zeroed)
+// pad_[2]:     reserved (zeroed)
 //
 // Zeroed header -> is_leaf=true, suffix_type=0, entries=0. Sentinel-safe.
 // ==========================================================================
@@ -78,9 +76,7 @@ struct node_header {
     uint16_t flags_;
     uint16_t entries_;
     uint16_t alloc_u64_;
-    uint8_t  skip_len_;
-    uint8_t  prefix_[6];
-    uint8_t  pad_[3];
+    uint8_t  pad_[2];
 
     bool is_leaf() const noexcept { return !(flags_ & 0x8000); }
     void set_bitmask() noexcept { flags_ |= 0x8000; }
@@ -93,16 +89,8 @@ struct node_header {
 
     uint16_t alloc_u64() const noexcept { return alloc_u64_; }
     void set_alloc_u64(uint16_t n) noexcept { alloc_u64_ = n; }
-
-    uint8_t skip() const noexcept { return skip_len_; }
-    void set_skip(uint8_t s) noexcept { skip_len_ = s; }
-
-    const uint8_t* prefix_bytes() const noexcept { return prefix_; }
-    void set_prefix(const uint8_t* p, uint8_t len) noexcept {
-        for (uint8_t i = 0; i < len; ++i) prefix_[i] = p[i];
-    }
 };
-static_assert(sizeof(node_header) == 16);
+static_assert(sizeof(node_header) == 8);
 
 inline node_header*       get_header(uint64_t* n)       noexcept { return reinterpret_cast<node_header*>(n); }
 inline const node_header* get_header(const uint64_t* n) noexcept { return reinterpret_cast<const node_header*>(n); }
@@ -111,10 +99,10 @@ inline const node_header* get_header(const uint64_t* n) noexcept { return reinte
 // Global sentinel -- zeroed block, valid as:
 //   - Leaf with suffix_type=0, entries=0 -> bitmap_find returns nullptr
 //   - Branchless miss target -> bitmap all zeros -> FAST_EXIT returns -1
-// Must be large enough for safe bitmap read: header(2) + bitmap(4) = 6 u64s.
+// Must be large enough for safe bitmap read: header(1) + bitmap(4) = 5 u64s.
 // ==========================================================================
 
-alignas(64) inline constinit uint64_t SENTINEL_NODE[6] = {};
+alignas(64) inline constinit uint64_t SENTINEL_NODE[5] = {};
 
 // ==========================================================================
 // key_ops<KEY> -- internal key representation
