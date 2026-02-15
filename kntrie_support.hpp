@@ -68,7 +68,7 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 //   [1]      suffix_type (leaf only: 0=bitmap256, 1=u16, 2=u32, 3=u64)
 //   [2..3]   entries     (uint16_t)
 //   [4..5]   alloc_u64   (uint16_t)
-//   [6..7]   pad
+//   [6..7]   total_slots (uint16_t, compact leaf slot count)
 //
 // Zeroed header -> is_leaf=true, is_skip=false, suffix_type=0,
 //                  entries=0. Sentinel-safe.
@@ -88,7 +88,7 @@ struct node_header {
     uint8_t  suffix_type_ = 0;
     uint16_t entries_     = 0;
     uint16_t alloc_u64_   = 0;
-    uint16_t pad_         = 0;
+    uint16_t total_slots_ = 0;
 
     static constexpr uint8_t BITMASK_BIT = 1 << 0;
     static constexpr uint8_t SKIP_BIT    = 1 << 1;
@@ -107,6 +107,9 @@ struct node_header {
 
     unsigned alloc_u64() const noexcept { return alloc_u64_; }
     void set_alloc_u64(unsigned n) noexcept { alloc_u64_ = static_cast<uint16_t>(n); }
+
+    unsigned total_slots() const noexcept { return total_slots_; }
+    void set_total_slots(unsigned n) noexcept { total_slots_ = static_cast<uint16_t>(n); }
 
     // --- header2 accessors (node[1]) -- only valid via get_header(node)-> ---
 

@@ -75,8 +75,7 @@ struct compact_ops {
 
     static const VALUE* find(const uint64_t* node, node_header h,
                              K suffix) noexcept {
-        uint16_t entries = h.entries();
-        uint16_t ts = slots_for(entries);
+        unsigned ts = h.total_slots();
         const K* keys = keys_(node);
         const K* base = adaptive_search<K>::find_base(keys, ts, suffix);
         if (*base != suffix) [[unlikely]] return nullptr;
@@ -97,6 +96,7 @@ struct compact_ops {
         auto* h = get_header(node);
         h->set_entries(count);
         h->set_alloc_u64(au64);
+        h->set_total_slots(ts);
         h->set_suffix_type(STYPE);
         h->set_skip(skip);
         if (skip > 0) h->set_prefix(prefix, skip);
@@ -112,12 +112,11 @@ struct compact_ops {
 
     template<typename Fn>
     static void for_each(const uint64_t* node, const node_header* h, Fn&& cb) {
-        uint16_t entries = h->entries();
-        if (entries == 0) return;
-        uint16_t ts = slots_for(entries);
+        unsigned ts = h->total_slots();
+        if (ts == 0) return;
         const K*   kd = keys_(node);
         const VST* vd = vals_(node, ts);
-        for (uint16_t i = 0; i < ts; ++i) {
+        for (unsigned i = 0; i < ts; ++i) {
             if (i > 0 && kd[i] == kd[i - 1]) continue;
             cb(kd[i], vd[i]);
         }
@@ -130,12 +129,11 @@ struct compact_ops {
     static void destroy_and_dealloc(uint64_t* node, ALLOC& alloc) {
         auto* h = get_header(node);
         if constexpr (!VT::IS_INLINE) {
-            uint16_t entries = h->entries();
-            if (entries > 0) {
-                uint16_t ts = slots_for(entries);
+            unsigned ts = h->total_slots();
+            if (ts > 0) {
                 const K* kd = keys_(node);
                 VST* vd = vals_mut_(node, ts);
-                for (uint16_t i = 0; i < ts; ++i) {
+                for (unsigned i = 0; i < ts; ++i) {
                     if (i > 0 && kd[i] == kd[i - 1]) continue;
                     VT::destroy(vd[i], alloc);
                 }
@@ -156,7 +154,7 @@ struct compact_ops {
     static insert_result_t insert(uint64_t* node, node_header* h,
                                   K suffix, VST value, ALLOC& alloc) {
         unsigned entries = h->entries();
-        uint16_t ts = slots_for(entries);
+        unsigned ts = h->total_slots();
         K*   kd = keys_(node);
         VST* vd = vals_mut_(node, ts);
 
@@ -202,6 +200,7 @@ struct compact_ops {
         if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(new_entries);
         nh->set_alloc_u64(au64);
+        nh->set_total_slots(new_ts);
 
         // Single-pass: dedup old + inject new key + seed dups
         seed_with_insert_(nn, kd, vd, ts, entries,
@@ -218,7 +217,7 @@ struct compact_ops {
     static erase_result_t erase(uint64_t* node, node_header* h,
                                 K suffix, ALLOC& alloc) {
         unsigned entries = h->entries();
-        uint16_t ts = slots_for(entries);
+        unsigned ts = h->total_slots();
         K*   kd = keys_(node);
         VST* vd = vals_mut_(node, ts);
 
@@ -249,6 +248,7 @@ struct compact_ops {
             if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
             nh->set_entries(nc);
             nh->set_alloc_u64(au64);
+            nh->set_total_slots(new_ts);
 
             // Dedup old, skip erased key, seed into new
             auto tmp_k = std::make_unique<K[]>(nc);
