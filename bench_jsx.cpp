@@ -46,18 +46,19 @@ static void do_not_optimize(T const& val) {
     asm volatile("" : : "r,m"(val) : "memory");
 }
 
-template<typename KEY>
+using KEY = uint64_t;
+
 struct Workload {
-    std::vector<KEY> keys;
-    std::vector<KEY> erase_keys;
-    std::vector<KEY> find_keys;
+    std::vector<KEY> keys;          // insert keys
+    std::vector<KEY> erase_keys;    // N/2 keys to erase
+    std::vector<KEY> find_fnd;      // N keys, 100% found, shuffled
+    std::vector<KEY> find_mix;      // N+N/4 keys shuffled, first N used (75% hit)
     int find_iters;
 };
 
-template<typename KEY>
-static Workload<KEY> make_workload(size_t n, const std::string& pattern,
-                                    int find_iters, std::mt19937_64& rng) {
-    Workload<KEY> w;
+static Workload make_workload(size_t n, const std::string& pattern,
+                               int find_iters, std::mt19937_64& rng) {
+    Workload w;
     w.find_iters = find_iters;
 
     std::vector<KEY> raw(n);
@@ -75,8 +76,29 @@ static Workload<KEY> make_workload(size_t n, const std::string& pattern,
     for (size_t i = 0; i < n; i += 2)
         w.erase_keys.push_back(raw[i]);
 
-    w.find_keys = raw;
-    std::shuffle(w.find_keys.begin(), w.find_keys.end(), rng);
+    // FND: 100% hit
+    w.find_fnd = raw;
+    std::shuffle(w.find_fnd.begin(), w.find_fnd.end(), rng);
+
+    // MIX: N + N/4 keys, shuffled, use first N for lookup
+    size_t extra = n / 4;
+    w.find_mix = raw;
+    if (pattern == "sequential") {
+        for (size_t i = 0; i < extra; ++i)
+            w.find_mix.push_back(static_cast<KEY>(n + i));
+    } else {
+        std::set<KEY> existing(raw.begin(), raw.end());
+        while (w.find_mix.size() < n + extra) {
+            KEY k = static_cast<KEY>(rng());
+            if (!existing.count(k)) {
+                w.find_mix.push_back(k);
+                existing.insert(k);
+            }
+        }
+    }
+    std::shuffle(w.find_mix.begin(), w.find_mix.end(), rng);
+    w.find_mix.resize(n);  // use first N
+
     return w;
 }
 
@@ -89,11 +111,11 @@ static int iters_for(size_t n) {
 }
 
 struct Row {
-    const char* key_type;
     std::string pattern;
     size_t n;
     const char* container;
-    double find_ms;
+    double find_fnd_ms;
+    double find_mix_ms;
     double insert_ms;
     double erase_ms;
     size_t mem_bytes;
@@ -101,12 +123,11 @@ struct Row {
 
 constexpr int TRIALS = 3;
 
-template<typename KEY>
 static void bench_all(size_t target_n, const std::string& pattern,
-                      const char* key_type, std::vector<Row>& rows) {
+                      std::vector<Row>& rows) {
     std::mt19937_64 rng(42);
     int fi = iters_for(target_n);
-    auto w = make_workload<KEY>(target_n, pattern, fi, rng);
+    auto w = make_workload(target_n, pattern, fi, rng);
     size_t n = w.keys.size();
     bool do_map = (n <= 1000000);
 
@@ -138,15 +159,17 @@ static void bench_all(size_t target_n, const std::string& pattern,
     }
 
     // Pre-generate find orders (shared across containers)
-    std::vector<std::vector<KEY>> find_orders(fi);
+    std::vector<std::vector<KEY>> fnd_orders(fi), mix_orders(fi);
     for (int r = 0; r < fi; ++r) {
-        find_orders[r] = w.find_keys;
-        std::shuffle(find_orders[r].begin(), find_orders[r].end(), rng);
+        fnd_orders[r] = w.find_fnd;
+        std::shuffle(fnd_orders[r].begin(), fnd_orders[r].end(), rng);
+        mix_orders[r] = w.find_mix;
+        std::shuffle(mix_orders[r].begin(), mix_orders[r].end(), rng);
     }
 
-    double k_fnd = 1e18, k_ins = 1e18, k_ers = 1e18;
-    double m_fnd = 1e18, m_ins = 1e18, m_ers = 1e18;
-    double u_fnd = 1e18, u_ins = 1e18, u_ers = 1e18;
+    double k_fnd = 1e18, k_mix = 1e18, k_ins = 1e18, k_ers = 1e18;
+    double m_fnd = 1e18, m_mix = 1e18, m_ins = 1e18, m_ers = 1e18;
+    double u_fnd = 1e18, u_mix = 1e18, u_ins = 1e18, u_ers = 1e18;
 
     for (int t = 0; t < TRIALS; ++t) {
         // --- kntrie ---
@@ -160,8 +183,15 @@ static void bench_all(size_t target_n, const std::string& pattern,
             uint64_t cs = 0;
             double t1 = now_ms();
             for (int r = 0; r < fi; ++r)
-                for (auto k : find_orders[r]) { auto* v = trie.find_value(k); cs += v ? *v : 0; }
+                for (auto k : fnd_orders[r]) { auto* v = trie.find_value(k); cs += v ? *v : 0; }
             k_fnd = std::min(k_fnd, (now_ms() - t1) / fi);
+            do_not_optimize(cs);
+
+            cs = 0;
+            double t1m = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : mix_orders[r]) { auto* v = trie.find_value(k); cs += v ? *v : 0; }
+            k_mix = std::min(k_mix, (now_ms() - t1m) / fi);
             do_not_optimize(cs);
 
             std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
@@ -181,8 +211,15 @@ static void bench_all(size_t target_n, const std::string& pattern,
             uint64_t cs = 0;
             double t1 = now_ms();
             for (int r = 0; r < fi; ++r)
-                for (auto k : find_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
+                for (auto k : fnd_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
             m_fnd = std::min(m_fnd, (now_ms() - t1) / fi);
+            do_not_optimize(cs);
+
+            cs = 0;
+            double t1m = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : mix_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
+            m_mix = std::min(m_mix, (now_ms() - t1m) / fi);
             do_not_optimize(cs);
 
             std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
@@ -203,8 +240,15 @@ static void bench_all(size_t target_n, const std::string& pattern,
             uint64_t cs = 0;
             double t1 = now_ms();
             for (int r = 0; r < fi; ++r)
-                for (auto k : find_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
+                for (auto k : fnd_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
             u_fnd = std::min(u_fnd, (now_ms() - t1) / fi);
+            do_not_optimize(cs);
+
+            cs = 0;
+            double t1m = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : mix_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
+            u_mix = std::min(u_mix, (now_ms() - t1m) / fi);
             do_not_optimize(cs);
 
             std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
@@ -214,31 +258,28 @@ static void bench_all(size_t target_n, const std::string& pattern,
         }
     }
 
-    rows.push_back({key_type, pattern, n, "kntrie", k_fnd, k_ins, k_ers, kntrie_mem});
+    rows.push_back({pattern, n, "kntrie", k_fnd, k_mix, k_ins, k_ers, kntrie_mem});
     if (do_map)
-        rows.push_back({key_type, pattern, n, "map", m_fnd, m_ins, m_ers, map_mem});
-    rows.push_back({key_type, pattern, n, "umap", u_fnd, u_ins, u_ers, umap_mem});
+        rows.push_back({pattern, n, "map", m_fnd, m_mix, m_ins, m_ers, map_mem});
+    rows.push_back({pattern, n, "umap", u_fnd, u_mix, u_ins, u_ers, umap_mem});
 }
 
 // ==========================================================================
-// HTML output — self-contained page with React + Recharts from CDN
+// HTML output — self-contained page with Chart.js from CDN
 // ==========================================================================
 
 static void emit_html(const std::vector<Row>& rows) {
-    // Group by (pattern, N) — merge int32 and uint64 into one object
     struct DataPoint {
         std::string pattern;
         size_t N;
-        double vals[6][4]; // [container*keytype] x [find, insert, erase, mem]
-        bool has[6];
+        double vals[3][5]; // [kntrie=0, map=1, umap=2] x [fnd, mix, insert, erase, mem]
+        bool has[3];
     };
 
-    // container+keytype -> index: kntrie_i32=0, kntrie_u64=1, map_i32=2, map_u64=3, umap_i32=4, umap_u64=5
-    auto cidx = [](const char* c, const char* kt) -> int {
-        int base = 0;
-        if (std::strcmp(c, "map") == 0) base = 2;
-        else if (std::strcmp(c, "umap") == 0) base = 4;
-        return base + (std::strstr(kt, "uint64") ? 1 : 0);
+    auto cidx = [](const char* c) -> int {
+        if (std::strcmp(c, "kntrie") == 0) return 0;
+        if (std::strcmp(c, "map") == 0) return 1;
+        return 2; // umap
     };
 
     std::vector<DataPoint> points;
@@ -256,11 +297,12 @@ static void emit_html(const std::vector<Row>& rows) {
             std::memset(dp.has, 0, sizeof(dp.has));
             points.push_back(dp);
         }
-        int ci = cidx(r.container, r.key_type);
-        points[pi].vals[ci][0] = r.find_ms;
-        points[pi].vals[ci][1] = r.insert_ms;
-        points[pi].vals[ci][2] = r.erase_ms;
-        points[pi].vals[ci][3] = static_cast<double>(r.mem_bytes);
+        int ci = cidx(r.container);
+        points[pi].vals[ci][0] = r.find_fnd_ms;
+        points[pi].vals[ci][1] = r.find_mix_ms;
+        points[pi].vals[ci][2] = r.insert_ms;
+        points[pi].vals[ci][3] = r.erase_ms;
+        points[pi].vals[ci][4] = static_cast<double>(r.mem_bytes);
         points[pi].has[ci] = true;
     }
 
@@ -269,10 +311,10 @@ static void emit_html(const std::vector<Row>& rows) {
         return a.N < b.N;
     });
 
-    const char* names[] = {"kntrie_int32", "kntrie_uint64", "map_int32", "map_uint64", "umap_int32", "umap_uint64"};
-    const char* suffixes[] = {"find", "insert", "erase", "mem"};
+    const char* names[] = {"kntrie", "map", "umap"};
+    const char* suffixes[] = {"fnd", "mix", "insert", "erase", "mem"};
 
-    // HTML preamble — Chart.js from CDN, zero framework deps
+    // HTML preamble
     std::printf("%s", R"HTML(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -296,8 +338,8 @@ static void emit_html(const std::vector<Row>& rows) {
 </head>
 <body>
 <div class="wrap">
-  <h2>kntrie Benchmark</h2>
-  <p class="sub">Log-log · Per-entry · Lower is better · Solid = i32, Dashed = u64</p>
+  <h2>kntrie Benchmark (u64)</h2>
+  <p class="sub">Log-log · Per-entry · Lower is better · FND=100% hit, MIX=75% hit</p>
   <div class="btns">
     <button class="active" onclick="show('random')">random</button>
     <button onclick="show('sequential')">sequential</button>
@@ -314,10 +356,10 @@ static void emit_html(const std::vector<Row>& rows) {
     std::printf("const RAW_DATA = [\n");
     for (auto& p : points) {
         std::printf("  {pattern:\"%s\",N:%zu", p.pattern.c_str(), p.N);
-        for (int ci = 0; ci < 6; ++ci) {
+        for (int ci = 0; ci < 3; ++ci) {
             if (!p.has[ci]) continue;
-            for (int mi = 0; mi < 4; ++mi) {
-                if (mi == 3)
+            for (int mi = 0; mi < 5; ++mi) {
+                if (mi == 4)
                     std::printf(",%s_%s:%.0f", names[ci], suffixes[mi], p.vals[ci][mi]);
                 else
                     std::printf(",%s_%s:%.4f", names[ci], suffixes[mi], p.vals[ci][mi]);
@@ -327,42 +369,53 @@ static void emit_html(const std::vector<Row>& rows) {
     }
     std::printf("];\n\n");
 
-    // Chart.js template — plain JS, no framework
+    // Chart.js template
     std::printf("%s",
 R"JS(
-const LINES = [
-  { key: "kntrie_int32", color: "#3b82f6", dash: [], width: 2.5, label: "kntrie i32" },
-  { key: "kntrie_uint64", color: "#93c5fd", dash: [6,3], width: 1.5, label: "kntrie u64" },
-  { key: "map_int32", color: "#ef4444", dash: [], width: 2.5, label: "map i32" },
-  { key: "map_uint64", color: "#fca5a5", dash: [6,3], width: 1.5, label: "map u64" },
-  { key: "umap_int32", color: "#22c55e", dash: [], width: 2.5, label: "umap i32" },
-  { key: "umap_uint64", color: "#86efac", dash: [6,3], width: 1.5, label: "umap u64" },
+const LINES_FIND = [
+  { key: "kntrie", suffix: "fnd", color: "#3b82f6", dash: [],    width: 2.5, label: "kntrie FND" },
+  { key: "kntrie", suffix: "mix", color: "#93c5fd", dash: [6,3], width: 1.5, label: "kntrie MIX" },
+  { key: "map",    suffix: "fnd", color: "#ef4444", dash: [],    width: 2.5, label: "map FND" },
+  { key: "map",    suffix: "mix", color: "#fca5a5", dash: [6,3], width: 1.5, label: "map MIX" },
+  { key: "umap",   suffix: "fnd", color: "#22c55e", dash: [],    width: 2.5, label: "umap FND" },
+  { key: "umap",   suffix: "mix", color: "#86efac", dash: [6,3], width: 1.5, label: "umap MIX" },
 ];
 
-const MEM_LINES = [
-  ...LINES,
-  { key: "raw_int32", color: "#888", dash: [], width: 1, label: "raw i32" },
-  { key: "raw_uint64", color: "#555", dash: [3,3], width: 1, label: "raw u64" },
+const LINES_OP = [
+  { key: "kntrie", suffix: "insert", color: "#3b82f6", dash: [], width: 2.5, label: "kntrie" },
+  { key: "map",    suffix: "insert", color: "#ef4444", dash: [], width: 2.5, label: "map" },
+  { key: "umap",   suffix: "insert", color: "#22c55e", dash: [], width: 2.5, label: "umap" },
+];
+
+const LINES_ERASE = [
+  { key: "kntrie", suffix: "erase", color: "#3b82f6", dash: [], width: 2.5, label: "kntrie" },
+  { key: "map",    suffix: "erase", color: "#ef4444", dash: [], width: 2.5, label: "map" },
+  { key: "umap",   suffix: "erase", color: "#22c55e", dash: [], width: 2.5, label: "umap" },
+];
+
+const LINES_MEM = [
+  { key: "kntrie", suffix: "mem", color: "#3b82f6", dash: [], width: 2.5, label: "kntrie" },
+  { key: "map",    suffix: "mem", color: "#ef4444", dash: [], width: 2.5, label: "map" },
+  { key: "umap",   suffix: "mem", color: "#22c55e", dash: [], width: 2.5, label: "umap" },
+  { key: "raw",    suffix: "mem", color: "#888",    dash: [3,3], width: 1, label: "raw (16B)" },
 ];
 
 const METRICS = [
-  { id: "find", suffix: "find", convert: (ms, n) => (ms * 1e6) / n },
-  { id: "insert", suffix: "insert", convert: (ms, n) => (ms * 1e6) / n },
-  { id: "erase", suffix: "erase", convert: (ms, n) => (ms * 1e6) / (n / 2) },
-  { id: "mem", suffix: "mem", convert: (b, n) => b / n },
+  { id: "find",   lines: LINES_FIND,  convert: (ms, n) => (ms * 1e6) / n },
+  { id: "insert", lines: LINES_OP,    convert: (ms, n) => (ms * 1e6) / n },
+  { id: "erase",  lines: LINES_ERASE, convert: (ms, n) => (ms * 1e6) / (n / 2) },
+  { id: "mem",    lines: LINES_MEM,   convert: (b, n) => b / n },
 ];
 
 function buildData(pattern, metric) {
-  const lines = metric.id === "mem" ? MEM_LINES : LINES;
   return RAW_DATA
     .filter(r => r.pattern === pattern)
     .map(r => {
       const pt = { N: r.N };
-      for (const l of lines) {
-        if (l.key === "raw_int32") { pt[l.key] = 12; continue; }
-        if (l.key === "raw_uint64") { pt[l.key] = 16; continue; }
-        const raw = r[l.key + "_" + metric.suffix];
-        if (raw != null) pt[l.key] = metric.convert(raw, r.N);
+      for (const l of metric.lines) {
+        if (l.key === "raw") { pt["raw_mem"] = 16; continue; }
+        const raw = r[l.key + "_" + l.suffix];
+        if (raw != null) pt[l.key + "_" + l.suffix] = metric.convert(raw, r.N);
       }
       return pt;
     });
@@ -372,16 +425,15 @@ const charts = {};
 
 function makeChart(canvasId, metric) {
   const ctx = document.getElementById(canvasId).getContext("2d");
-  const lines = metric.id === "mem" ? MEM_LINES : LINES;
   const data = buildData("random", metric);
 
   charts[canvasId] = new Chart(ctx, {
     type: "line",
     data: {
       labels: data.map(d => d.N),
-      datasets: lines.map(l => ({
+      datasets: metric.lines.map(l => ({
         label: l.label,
-        data: data.map(d => d[l.key] ?? null),
+        data: data.map(d => d[l.key === "raw" ? "raw_mem" : l.key + "_" + l.suffix] ?? null),
         borderColor: l.color,
         backgroundColor: l.color + "33",
         borderWidth: l.width,
@@ -446,11 +498,10 @@ function show(pattern) {
   event.target.classList.add("active");
   for (const [id, chart] of Object.entries(charts)) {
     const m = chart._metric;
-    const lines = m.id === "mem" ? MEM_LINES : LINES;
     const data = buildData(pattern, m);
     chart.data.labels = data.map(d => d.N);
-    lines.forEach((l, i) => {
-      chart.data.datasets[i].data = data.map(d => d[l.key] ?? null);
+    m.lines.forEach((l, i) => {
+      chart.data.datasets[i].data = data.map(d => d[l.key === "raw" ? "raw_mem" : l.key + "_" + l.suffix] ?? null);
     });
     chart.update("none");
   }
@@ -469,16 +520,11 @@ int main(int argc, char* argv[]) {
 
     const char* patterns[] = {"random", "sequential"};
     std::vector<Row> rows;
-    size_t max_i32 = static_cast<size_t>(std::numeric_limits<int32_t>::max());
 
     for (auto* pat : patterns) {
         for (auto n : sizes) {
             std::fprintf(stderr, "u64 %s N=%zu...\n", pat, n);
-            bench_all<uint64_t>(n, pat, "uint64_t", rows);
-            if (n <= max_i32) {
-                std::fprintf(stderr, "i32 %s N=%zu...\n", pat, n);
-                bench_all<int32_t>(n, pat, "int32_t", rows);
-            }
+            bench_all(n, pat, rows);
         }
     }
 
