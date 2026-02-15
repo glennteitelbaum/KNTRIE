@@ -107,14 +107,14 @@ struct node_header {
     }
 
     uint16_t entries() const noexcept { return static_cast<uint16_t>(bits_ & ENTRIES_MASK); }
-    void set_entries(uint16_t n) noexcept {
+    void set_entries(unsigned n) noexcept {
         bits_ = (bits_ & ~ENTRIES_MASK) | (n & 0x3FFF);
     }
 
     uint16_t alloc_u64() const noexcept {
         return static_cast<uint16_t>((bits_ & ALLOC_MASK) >> ALLOC_SHIFT);
     }
-    void set_alloc_u64(uint16_t n) noexcept {
+    void set_alloc_u64(unsigned n) noexcept {
         bits_ = (bits_ & ~ALLOC_MASK) | (static_cast<uint64_t>(n & 0x3FFF) << ALLOC_SHIFT);
     }
 

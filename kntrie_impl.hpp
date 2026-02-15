@@ -406,7 +406,7 @@ private:
         nn[0] = node[0];  // copy header
         std::memcpy(nn + 2, node + 1, (old_au64 - 1) * 8);  // shift data
         auto* nh = get_header(nn);
-        nh->set_alloc_u64(static_cast<uint16_t>(new_au64));
+        nh->set_alloc_u64(new_au64);
         nh->set_skip(ns);
         nh->set_prefix(combined, ns);
         dealloc_node(alloc_, node, old_au64);
@@ -428,7 +428,7 @@ private:
         nn[0] = node[0];  // copy header
         nn[0] &= ~node_header::SKIP_BIT;  // clear skip bit
         std::memcpy(nn + 1, node + 2, (old_au64 - 2) * 8);  // shift data left
-        get_header(nn)->set_alloc_u64(static_cast<uint16_t>(new_au64));
+        get_header(nn)->set_alloc_u64(new_au64);
         dealloc_node(alloc_, node, old_au64);
         return nn;
     }

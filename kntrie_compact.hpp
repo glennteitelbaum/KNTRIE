@@ -59,13 +59,12 @@ struct compact_ops {
     // Sequence: 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, ...
     // Max waste: ~25% (down from ~50% with pure power-of-2).
 
-    static constexpr uint16_t slots_for(uint16_t entries) noexcept {
-        if (entries <= 4) return static_cast<uint16_t>(
-            std::bit_ceil(static_cast<unsigned>(entries)));
+    static constexpr uint16_t slots_for(unsigned entries) noexcept {
+        if (entries <= 4) return static_cast<uint16_t>(std::bit_ceil(entries));
         unsigned p = std::bit_ceil(entries);
         unsigned mid = p / 2 + p / 4;  // 3/4 point
         unsigned s = (entries <= mid) ? mid : p;
-        return static_cast<uint16_t>(std::min<unsigned>(s, COMPACT_MAX));
+        return static_cast<uint16_t>(std::min(s, unsigned(COMPACT_MAX)));
     }
 
     // --- exact u64 size for a given slot count ---
@@ -97,22 +96,21 @@ struct compact_ops {
     // ==================================================================
 
     static uint64_t* make_leaf(const K* sorted_keys, const VST* values,
-                               uint32_t count, uint8_t skip,
+                               unsigned count, uint8_t skip,
                                const uint8_t* prefix, ALLOC& alloc) {
-        uint16_t ts = slots_for(static_cast<uint16_t>(count));
+        uint16_t ts = slots_for(count);
         size_t hu = 1 + (skip > 0);
         size_t au64 = size_u64(ts, hu);
         uint64_t* node = alloc_node(alloc, au64);
         auto* h = get_header(node);
-        h->set_entries(static_cast<uint16_t>(count));
-        h->set_alloc_u64(static_cast<uint16_t>(au64));
+        h->set_entries(count);
+        h->set_alloc_u64(au64);
         h->set_suffix_type(STYPE);
         h->set_skip(skip);
         if (skip > 0) h->set_prefix(prefix, skip);
 
         if (count > 0)
-            seed_from_real_(node, sorted_keys, values,
-                            static_cast<uint16_t>(count), ts);
+            seed_from_real_(node, sorted_keys, values, count, ts);
         return node;
     }
 
@@ -165,7 +163,7 @@ struct compact_ops {
     requires (INSERT || ASSIGN)
     static insert_result_t insert(uint64_t* node, node_header* h,
                                   K suffix, VST value, ALLOC& alloc) {
-        uint16_t entries = h->entries();
+        unsigned entries = h->entries();
         uint16_t ts = slots_for(entries);
         K*   kd = keys_(node);
         VST* vd = vals_mut_(node, ts);
@@ -176,7 +174,7 @@ struct compact_ops {
         // Key exists
         if (*base == suffix) {
             if constexpr (ASSIGN) {
-                int idx = static_cast<int>(base - kd);
+                int idx = base - kd;
                 VT::destroy(vd[idx], alloc);
                 VT::write_slot(&vd[idx], value);
                 // Update all dup copies too
@@ -190,19 +188,19 @@ struct compact_ops {
         if (entries >= COMPACT_MAX)
             return {node, false, true};  // needs_split
 
-        int ins = static_cast<int>(base - kd) + (*base < suffix);
-        uint16_t dups = ts - entries;
+        int ins = (base - kd) + (*base < suffix);
+        unsigned dups = ts - entries;
 
         // Dups available: consume one in-place
         if (dups > 0) {
-            insert_consume_dup_(kd, vd, static_cast<int>(ts),
+            insert_consume_dup_(kd, vd, ts,
                                 ins, entries, suffix, value);
             h->set_entries(entries + 1);
             return {node, true, false};
         }
 
         // No dups: realloc to next slot count
-        uint16_t new_entries = entries + 1;
+        unsigned new_entries = entries + 1;
         uint16_t new_ts = slots_for(new_entries);
         size_t hu = hdr_u64(node);
         size_t au64 = size_u64(new_ts, hu);
@@ -211,7 +209,7 @@ struct compact_ops {
         *nh = *h;
         if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(new_entries);
-        nh->set_alloc_u64(static_cast<uint16_t>(au64));
+        nh->set_alloc_u64(au64);
 
         // Single-pass: dedup old + inject new key + seed dups
         seed_with_insert_(nn, kd, vd, ts, entries,
@@ -227,7 +225,7 @@ struct compact_ops {
 
     static erase_result_t erase(uint64_t* node, node_header* h,
                                 K suffix, ALLOC& alloc) {
-        uint16_t entries = h->entries();
+        unsigned entries = h->entries();
         uint16_t ts = slots_for(entries);
         K*   kd = keys_(node);
         VST* vd = vals_mut_(node, ts);
@@ -235,9 +233,9 @@ struct compact_ops {
         const K* base = adaptive_search<K>::find_base(
             kd, ts, suffix);
         if (*base != suffix) return {node, false};
-        int idx = static_cast<int>(base - kd);
+        unsigned idx = static_cast<unsigned>(base - kd);
 
-        uint16_t nc = entries - 1;
+        unsigned nc = entries - 1;
 
         // Last entry
         if (nc == 0) {
@@ -258,7 +256,7 @@ struct compact_ops {
             *nh = *h;
             if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
             nh->set_entries(nc);
-            nh->set_alloc_u64(static_cast<uint16_t>(au64));
+            nh->set_alloc_u64(au64);
 
             // Dedup old, skip erased key, seed into new
             auto tmp_k = std::make_unique<K[]>(nc);
@@ -271,7 +269,7 @@ struct compact_ops {
         }
 
         // In-place: convert erased entry's run to neighbor dups
-        erase_create_dup_(kd, vd, static_cast<int>(ts), idx, suffix, alloc);
+        erase_create_dup_(kd, vd, ts, idx, suffix, alloc);
         h->set_entries(nc);
         return {node, true};
     }
@@ -435,7 +433,7 @@ private:
     // ==================================================================
 
     static void insert_consume_dup_(
-            K* kd, VST* vd, int total, int ins, uint16_t entries,
+            K* kd, VST* vd, int total, int ins, unsigned entries,
             K suffix, VST value) {
         int dup_pos = -1;
 
@@ -449,8 +447,8 @@ private:
                 }
             }
         } else {
-            uint16_t dups = static_cast<uint16_t>(total - entries);
-            int band = static_cast<int>(entries / (dups + 1)) + 1;
+            unsigned dups = total - entries;
+            int band = entries / (dups + 1) + 1;
             int r_lo = ins, r_hi = ins;
             int l_hi = ins - 1, l_lo = ins - 1;
 
