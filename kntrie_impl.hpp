@@ -611,14 +611,21 @@ private:
         if (!cr.erased) return {tag_bitmask(node), false, 0};
 
         if (cr.tagged_ptr) {
-            // Child survived — decrement or skip if capped
+            // Child survived
             if (cr.tagged_ptr != lk.child)
                 BO::set_child(node, lk.slot, cr.tagged_ptr);
-            uint16_t d = hdr->descendants();
-            if (d == COALESCE_CAP)
+            // If child is still above COMPACT_MAX, so is parent — bail
+            if (cr.subtree_entries == COALESCE_CAP)
                 return {tag_bitmask(node), true, COALESCE_CAP};
-            --d;
-            hdr->set_descendants(d);
+            // Child returned exact count — decrement if exact, recompute if capped
+            uint16_t d = hdr->descendants();
+            if (d == COALESCE_CAP) {
+                d = sum_children_desc_(node, 0);
+                hdr->set_descendants(d);
+            } else {
+                --d;
+                hdr->set_descendants(d);
+            }
             if (d <= COMPACT_MAX)
                 return do_coalesce_(node, hdr, bits, d);
             return {tag_bitmask(node), true, d};
@@ -692,13 +699,18 @@ private:
         if (!cr.erased) return {tag_bitmask(node), false, 0};
 
         if (cr.tagged_ptr) {
-            // Child survived — decrement or skip if capped
+            // Child survived
             if (cr.tagged_ptr != old_child) real_ch[slot] = cr.tagged_ptr;
-            uint16_t d = hdr->descendants();
-            if (d == COALESCE_CAP)
+            if (cr.subtree_entries == COALESCE_CAP)
                 return {tag_bitmask(node), true, COALESCE_CAP};
-            --d;
-            hdr->set_descendants(d);
+            uint16_t d = hdr->descendants();
+            if (d == COALESCE_CAP) {
+                d = sum_children_desc_(node, sc);
+                hdr->set_descendants(d);
+            } else {
+                --d;
+                hdr->set_descendants(d);
+            }
             if (d <= COMPACT_MAX)
                 return do_coalesce_(node, hdr, orig_bits, d);
             return {tag_bitmask(node), true, d};
@@ -844,15 +856,20 @@ private:
     }
 
     // Sum immediate children's counts. Early exit when > COMPACT_MAX.
+    // Unchecked children assumed to have at least 1 entry each.
     static uint16_t sum_children_desc_(const uint64_t* node, uint8_t sc) noexcept {
         size_t fo = 1 + static_cast<size_t>(sc) * 6;
         const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + fo);
         const uint64_t* rch = node + fo + 5;
+        unsigned nc = get_header(node)->entries();
+        if (nc > COMPACT_MAX) return COALESCE_CAP;
         uint32_t total = 0;
+        unsigned remaining = nc;
         int slot = 0;
         for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1)) {
             total += tagged_count_(rch[slot++]);
-            if (total > COMPACT_MAX) return COALESCE_CAP;
+            --remaining;
+            if (total + remaining > COMPACT_MAX) return COALESCE_CAP;
         }
         return static_cast<uint16_t>(total);
     }
@@ -927,7 +944,7 @@ private:
         }
 
         dealloc_bitmask_subtree_(tagged);
-        return {tag_leaf(leaf), true, total_entries};
+        return {tag_leaf(leaf), true, COALESCE_CAP};
     }
 
     // prefix: accumulated bits so far, shifted into top of uint64_t
