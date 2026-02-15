@@ -129,6 +129,7 @@ public:
     auto   debug_stats() const noexcept  { return impl_.debug_stats(); }
     auto   debug_root_info() const       { return impl_.debug_root_info(); }
     const uint64_t* debug_root() const noexcept { return impl_.debug_root(); }
+    uint64_t debug_root_tagged() const noexcept { return 0; }  // Phase 1 stub
 
 private:
     kntrie_impl<KEY, VALUE, ALLOC> impl_;

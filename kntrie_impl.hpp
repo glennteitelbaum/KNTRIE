@@ -31,7 +31,7 @@ private:
     static constexpr int IK_BITS  = KO::IK_BITS;
     static constexpr int KEY_BITS = KO::KEY_BITS;
 
-    uint64_t* root_;
+    uint64_t  root_;      // tagged pointer (LEAF_BIT for leaf, raw for bitmask)
     size_t    size_;
     [[no_unique_address]] ALLOC alloc_;
 
@@ -40,14 +40,14 @@ public:
     // Constructor / Destructor
     // ==================================================================
 
-    kntrie_impl() : root_(SENTINEL_NODE), size_(0), alloc_() {}
+    kntrie_impl() : root_(SENTINEL_TAGGED), size_(0), alloc_() {}
 
     ~kntrie_impl() { remove_all_(); }
 
     kntrie_impl(const kntrie_impl&) = delete;
     kntrie_impl& operator=(const kntrie_impl&) = delete;
 
-    [[nodiscard]] bool      empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] bool      empty() const noexcept { return root_ == SENTINEL_TAGGED; }
     [[nodiscard]] size_type size()  const noexcept { return size_; }
 
     void clear() noexcept {
@@ -57,27 +57,39 @@ public:
 
     // ==================================================================
     // Find
+    //
+    // Hot loop: bitmask ptr is raw (no LEAF_BIT), use directly.
+    // Exit: leaf ptr has LEAF_BIT, strip unconditionally.
+    // No sentinel check — sentinel is a zeroed leaf, dispatch
+    // returns nullptr naturally for entries=0.
     // ==================================================================
 
     const VALUE* find_value(const KEY& key) const noexcept {
         IK ik = KO::to_internal(key);
+        uint64_t ptr = root_;
 
-        const uint64_t* node = root_;
-        node_header hdr = *get_header(node);
-
-        while (!hdr.is_leaf()) [[likely]] {
+        // Bitmask descent — ptr is raw usable pointer (no LEAF_BIT)
+        while (!(ptr & LEAF_BIT)) [[likely]] {
+            const uint64_t* bm = reinterpret_cast<const uint64_t*>(ptr);
             uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
             ik <<= 8;
-            node = BO::branchless_child(node, ti);
-            hdr = *get_header(node);
+            int slot = reinterpret_cast<const bitmap256*>(bm)->
+                           find_slot<slot_mode::BRANCHLESS>(ti);
+            ptr = bm[BITMAP256_U64 + slot];
         }
 
-        // Leaf skip check (leaves still have skip)
+        // Leaf — strip LEAF_BIT unconditionally (we know it's set)
+        const uint64_t* node = reinterpret_cast<const uint64_t*>(ptr ^ LEAF_BIT);
+        node_header hdr = *get_header(node);
+        // No sentinel check — sentinel is a valid zeroed leaf (entries=0,
+        // suffix_type=0). Leaf dispatch naturally returns nullptr.
+
+        // Leaf skip check
         size_t hs = 1;
         if (hdr.is_skip()) [[unlikely]] {
             hs = 2;
             const uint8_t* actual = reinterpret_cast<const uint8_t*>(&node[1]);
-            uint8_t skip = actual[7];
+            uint8_t skip = hdr.skip();
             uint8_t i = 0;
             do {
                 if (static_cast<uint8_t>(ik >> (IK_BITS - 8)) != actual[i]) [[unlikely]]
@@ -143,12 +155,12 @@ public:
     bool erase(const KEY& key) {
         IK ik = KO::to_internal(key);
 
-        if (root_ == SENTINEL_NODE) return false;
+        if (root_ == SENTINEL_TAGGED) return false;
 
-        auto [new_node, erased] = erase_node_(root_, ik, KEY_BITS);
+        auto [new_tagged, erased] = erase_node_(root_, ik, KEY_BITS);
         if (!erased) return false;
 
-        root_ = new_node ? new_node : SENTINEL_NODE;
+        root_ = new_tagged ? new_tagged : SENTINEL_TAGGED;
         --size_;
         return true;
     }
@@ -167,8 +179,8 @@ public:
 
     debug_stats_t debug_stats() const noexcept {
         debug_stats_t s{};
-        s.total_bytes = sizeof(uint64_t*);
-        if (root_ != SENTINEL_NODE)
+        s.total_bytes = sizeof(uint64_t);  // root_ pointer
+        if (root_ != SENTINEL_TAGGED)
             collect_stats_(root_, s);
         return s;
     }
@@ -181,12 +193,24 @@ public:
     };
 
     root_info_t debug_root_info() const {
-        if (root_ == SENTINEL_NODE) return {0, 0, false};
-        auto* hdr = get_header(root_);
-        return {hdr->entries(), hdr->skip(), hdr->is_leaf()};
+        if (root_ == SENTINEL_TAGGED) return {0, 0, false};
+        const uint64_t* node;
+        bool leaf;
+        if (root_ & LEAF_BIT) {
+            node = untag_leaf(root_);
+            leaf = true;
+        } else {
+            node = bm_to_node_const(root_);
+            leaf = false;
+        }
+        auto* hdr = get_header(node);
+        return {hdr->entries(), hdr->skip(), leaf};
     }
 
-    const uint64_t* debug_root() const noexcept { return root_; }
+    const uint64_t* debug_root() const noexcept {
+        if (root_ & LEAF_BIT) return untag_leaf(root_);
+        return bm_to_node_const(root_);
+    }
 
 private:
     // ==================================================================
@@ -199,32 +223,43 @@ private:
         VST sv = VT::store(value, alloc_);
 
         // Empty trie: create single-entry leaf
-        if (root_ == SENTINEL_NODE) {
+        if (root_ == SENTINEL_TAGGED) {
             if constexpr (!INSERT) { VT::destroy(sv, alloc_); return {true, false}; }
-            root_ = make_single_leaf_(ik, sv, KEY_BITS);
+            root_ = tag_leaf(make_single_leaf_(ik, sv, KEY_BITS));
             ++size_;
             return {true, true};
         }
 
         auto r = insert_node_<INSERT, ASSIGN>(root_, ik, sv, KEY_BITS);
-        if (r.node != root_) root_ = r.node;
+        if (r.tagged_ptr != root_) root_ = r.tagged_ptr;
         if (r.inserted) { ++size_; return {true, true}; }
         VT::destroy(sv, alloc_);
         return {true, false};
     }
 
     // ==================================================================
-    // insert_node (recursive)
+    // insert_node (recursive, tagged)
     //
+    // ptr: tagged pointer (LEAF_BIT for leaf, raw for bitmask)
     // ik: shifted so next byte is at (IK_BITS - 8)
     // bits: remaining KEY bits at this node's level
+    // Returns: insert_result_t with tagged_ptr
     // ==================================================================
 
     template<bool INSERT, bool ASSIGN>
-    insert_result_t insert_node_(uint64_t* node, IK ik, VST value, int bits) {
-        auto* hdr = get_header(node);
+    insert_result_t insert_node_(uint64_t ptr, IK ik, VST value, int bits) {
 
-        if (hdr->is_leaf()) {
+        // --- SENTINEL ---
+        if (ptr == SENTINEL_TAGGED) {
+            if constexpr (!INSERT) return {ptr, false, false};
+            return {tag_leaf(make_single_leaf_(ik, value, bits)), true, false};
+        }
+
+        // --- LEAF ---
+        if (ptr & LEAF_BIT) {
+            uint64_t* node = untag_leaf_mut(ptr);
+            auto* hdr = get_header(node);
+
             // Leaf skip check
             uint8_t skip = hdr->skip();
             if (skip) [[unlikely]] {
@@ -232,43 +267,51 @@ private:
                 for (uint8_t i = 0; i < skip; ++i) {
                     uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
                     if (expected != actual[i]) {
-                        if constexpr (!INSERT) return {node, false, false};
-                        return {split_on_prefix_(node, hdr, ik, value,
-                                                  actual, skip, i, bits), true, false};
+                        if constexpr (!INSERT) return {ptr, false, false};
+                        return {split_on_prefix_tagged_(node, hdr, ik, value,
+                                                         actual, skip, i, bits), true, false};
                     }
                     ik = static_cast<IK>(ik << 8);
                     bits -= 8;
                 }
             }
+
+            // leaf_insert_ returns tagged result (bitmap/compact ops tag internally)
             auto result = leaf_insert_<INSERT, ASSIGN>(node, hdr, ik, value, bits);
             if (result.needs_split) {
-                if constexpr (!INSERT) return {node, false, false};
-                return {convert_to_bitmask_(node, hdr, ik, value, bits), true, false};
+                if constexpr (!INSERT) return {ptr, false, false};
+                return {convert_to_bitmask_tagged_(node, hdr, ik, value, bits), true, false};
             }
             return result;
         }
 
-        // Bitmask node: no skip, just descend
+        // --- BITMASK ---
+        uint64_t* node = bm_to_node(ptr);
+        auto* hdr = get_header(node);
+
+        // Phase 1: no skip chain support yet (skip always 0 for bitmask)
+
         uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
         auto lk = BO::lookup(node, ti);
 
         if (!lk.found) {
-            if constexpr (!INSERT) return {node, false, false};
+            if constexpr (!INSERT) return {tag_bitmask(node), false, false};
             auto* leaf = make_single_leaf_(static_cast<IK>(ik << 8), value, bits - 8);
-            auto* nn = BO::add_child(node, hdr, ti, leaf, alloc_);
-            return {nn, true, false};
+            auto* nn = BO::add_child(node, hdr, ti, tag_leaf(leaf), alloc_);
+            return {tag_bitmask(nn), true, false};
         }
 
-        // Recurse into child
+        // Recurse into child (lk.child is already tagged)
         auto cr = insert_node_<INSERT, ASSIGN>(
             lk.child, static_cast<IK>(ik << 8), value, bits - 8);
-        if (cr.node != lk.child)
-            BO::set_child(node, lk.slot, cr.node);
-        return {node, cr.inserted, false};
+        if (cr.tagged_ptr != lk.child)
+            BO::set_child(node, lk.slot, cr.tagged_ptr);
+        return {tag_bitmask(node), cr.inserted, false};
     }
 
     // ==================================================================
     // leaf_insert: dispatch by suffix_type
+    // Returns tagged result (bitmap/compact ops tag internally now)
     // ==================================================================
 
     template<bool INSERT, bool ASSIGN>
@@ -300,67 +343,87 @@ private:
     }
 
     // ==================================================================
-    // erase_node (recursive)
+    // erase_node (recursive, tagged)
+    //
+    // ptr: tagged pointer
+    // Returns: erase_result_t with tagged_ptr (0 if fully erased)
     // ==================================================================
 
-    erase_result_t erase_node_(uint64_t* node, IK ik, int bits) {
-        auto* hdr = get_header(node);
+    erase_result_t erase_node_(uint64_t ptr, IK ik, int bits) {
 
-        if (hdr->is_leaf()) {
+        // --- SENTINEL ---
+        if (ptr == SENTINEL_TAGGED) return {ptr, false};
+
+        // --- LEAF ---
+        if (ptr & LEAF_BIT) {
+            uint64_t* node = untag_leaf_mut(ptr);
+            auto* hdr = get_header(node);
+
             // Leaf skip check
             uint8_t skip = hdr->skip();
             if (skip) [[unlikely]] {
                 const uint8_t* actual = hdr->prefix_bytes();
                 for (uint8_t i = 0; i < skip; ++i) {
                     uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-                    if (expected != actual[i]) return {node, false};
+                    if (expected != actual[i]) return {ptr, false};
                     ik = static_cast<IK>(ik << 8);
                     bits -= 8;
                 }
             }
+
+            // leaf_erase_ returns tagged result
             return leaf_erase_(node, hdr, ik);
         }
 
-        // Bitmask node: no skip, just descend
+        // --- BITMASK ---
+        uint64_t* node = bm_to_node(ptr);
+        auto* hdr = get_header(node);
+
+        // Phase 1: no skip chain support yet (skip always 0 for bitmask)
+
         uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
         auto lk = BO::lookup(node, ti);
-        if (!lk.found) return {node, false};
+        if (!lk.found) return {tag_bitmask(node), false};
 
-        // Recurse into child
+        // Recurse into child (lk.child is tagged)
         auto [new_child, erased] = erase_node_(
             lk.child, static_cast<IK>(ik << 8), bits - 8);
-        if (!erased) return {node, false};
+        if (!erased) return {tag_bitmask(node), false};
 
         if (new_child) {
             if (new_child != lk.child)
                 BO::set_child(node, lk.slot, new_child);
-            return {node, true};
+            return {tag_bitmask(node), true};
         }
 
         // Child fully erased — remove from bitmask
         auto* nn = BO::remove_child(node, hdr, lk.slot, ti, alloc_);
+        if (!nn) return {0, true};
 
         // Collapse: single-child bitmask whose child is a leaf → absorb byte
-        if (nn && get_header(nn)->entries() == 1) {
-            uint64_t* sole_child = nullptr;
+        if (get_header(nn)->entries() == 1) {
+            uint64_t sole_child = 0;
             uint8_t sole_idx = 0;
-            BO::for_each_child(nn, [&](uint8_t idx, int, uint64_t* child) {
-                sole_child = child;
+            BO::for_each_child(nn, [&](uint8_t idx, int, uint64_t tagged) {
+                sole_child = tagged;
                 sole_idx = idx;
             });
-            if (get_header(sole_child)->is_leaf()) {
+            if (sole_child & LEAF_BIT) {
+                uint64_t* leaf = untag_leaf_mut(sole_child);
                 uint8_t byte_arr[1] = {sole_idx};
-                sole_child = prepend_skip_(sole_child, 1, byte_arr);
+                leaf = prepend_skip_(leaf, 1, byte_arr);
                 size_t nn_au64 = get_header(nn)->alloc_u64();
                 dealloc_node(alloc_, nn, nn_au64);
-                nn = sole_child;
+                return {tag_leaf(leaf), true};
             }
+            // Phase 2/3 will handle bitmask-child collapse
         }
-        return {nn, true};
+        return {tag_bitmask(nn), true};
     }
 
     // ==================================================================
     // leaf_erase: dispatch by suffix_type
+    // Returns tagged result
     // ==================================================================
 
     erase_result_t leaf_erase_(uint64_t* node, node_header* hdr, IK ik) {
@@ -387,11 +450,9 @@ private:
     }
 
     // ==================================================================
-    // prepend_skip_: add or extend skip prefix on an existing node
+    // prepend_skip_: add or extend skip prefix on an existing leaf
     //
-    // If node has no skip: realloc with +1 u64, shift data right.
-    // If node already has skip: update prefix bytes in place.
-    // Returns (possibly new) node pointer.
+    // Receives/returns RAW (untagged) node pointer. Caller tags.
     // ==================================================================
 
     uint64_t* prepend_skip_(uint64_t* node, uint8_t new_len,
@@ -426,10 +487,9 @@ private:
     }
 
     // ==================================================================
-    // remove_skip_: strip the skip u64 from a node that no longer needs it
+    // remove_skip_: strip the skip u64 from a leaf
     //
-    // Realloc with -1 u64, shift data left, clear SKIP_BIT.
-    // Returns new node pointer.
+    // Receives/returns RAW (untagged) node pointer. Caller tags.
     // ==================================================================
 
     uint64_t* remove_skip_(uint64_t* node) {
@@ -438,7 +498,7 @@ private:
         size_t new_au64 = old_au64 - 1;
         uint64_t* nn = alloc_node(alloc_, new_au64);
         nn[0] = node[0];  // copy header
-        get_header(nn)->set_skip(0);  // clear skip bit
+        get_header(nn)->set_skip(0);  // clear skip
         std::memcpy(nn + 1, node + 2, (old_au64 - 2) * 8);  // shift data left
         get_header(nn)->set_alloc_u64(new_au64);
         dealloc_node(alloc_, node, old_au64);
@@ -448,20 +508,27 @@ private:
     // ==================================================================
     // wrap_bitmask_chain_: wrap child in single-child bitmask nodes
     //
-    // Each prefix byte becomes a bitmask node with one child.
-    // Built inside-out so bytes[0] is outermost.
+    // Phase 1: still creates standalone single-child bitmask nodes.
+    // Phase 2 will replace with embedded skip chains.
+    //
+    // child: RAW (untagged) bitmask node pointer (from build_bitmask).
+    // Returns: tagged bitmask pointer to outermost wrapper.
     // ==================================================================
 
-    uint64_t* wrap_bitmask_chain_(uint64_t* child, const uint8_t* bytes, uint8_t count) {
+    uint64_t wrap_bitmask_chain_(uint64_t* child, const uint8_t* bytes, uint8_t count) {
+        uint64_t child_tagged = tag_bitmask(child);
         for (int i = count - 1; i >= 0; --i) {
             uint8_t idx = bytes[i];
-            child = BO::make_bitmask(&idx, &child, 1, alloc_);
+            auto* wrapper = BO::make_bitmask(&idx, &child_tagged, 1, alloc_);
+            child_tagged = tag_bitmask(wrapper);
         }
-        return child;
+        return child_tagged;
     }
 
     // ==================================================================
     // make_single_leaf: create 1-entry leaf at given bits
+    //
+    // Returns RAW (untagged) node pointer. Caller tags.
     // ==================================================================
 
     uint64_t* make_single_leaf_(IK ik, VST value, int bits) {
@@ -488,14 +555,13 @@ private:
     }
 
     // ==================================================================
-    // convert_to_bitmask: compact leaf overflow → bitmask node
+    // convert_to_bitmask_tagged_: compact leaf overflow → new tree
     //
-    // Collects all entries + new entry into bit-63-aligned working arrays,
-    // builds node tree via build_node_from_arrays.
+    // Returns tagged uint64_t.
     // ==================================================================
 
-    uint64_t* convert_to_bitmask_(uint64_t* node, node_header* hdr,
-                                   IK ik, VST value, int bits) {
+    uint64_t convert_to_bitmask_tagged_(uint64_t* node, node_header* hdr,
+                                         IK ik, VST value, int bits) {
         uint16_t old_count = hdr->entries();
         size_t total = old_count + 1;
         auto wk = std::make_unique<uint64_t[]>(total);
@@ -513,19 +579,26 @@ private:
         });
         if (!ins) { wk[wi] = new_suf; wv[wi] = value; }
 
-        auto* child = build_node_from_arrays_(wk.get(), wv.get(), total, bits);
+        uint64_t child_tagged = build_node_from_arrays_tagged_(
+            wk.get(), wv.get(), total, bits);
 
         // Propagate old skip/prefix to new child
         uint8_t ps = hdr->skip();
         if (ps > 0) {
-            if (get_header(child)->is_leaf())
-                child = prepend_skip_(child, ps, hdr->prefix_bytes());
-            else
-                child = wrap_bitmask_chain_(child, hdr->prefix_bytes(), ps);
+            const uint8_t* pfx = hdr->prefix_bytes();
+            if (child_tagged & LEAF_BIT) {
+                uint64_t* leaf = untag_leaf_mut(child_tagged);
+                leaf = prepend_skip_(leaf, ps, pfx);
+                child_tagged = tag_leaf(leaf);
+            } else {
+                // Wrap bitmask in chain
+                uint64_t* bm_node = bm_to_node(child_tagged);
+                child_tagged = wrap_bitmask_chain_(bm_node, pfx, ps);
+            }
         }
 
         dealloc_node(alloc_, node, hdr->alloc_u64());
-        return child;
+        return child_tagged;
     }
 
     // ==================================================================
@@ -558,46 +631,49 @@ private:
     }
 
     // ==================================================================
-    // build_node_from_arrays
+    // build_node_from_arrays_tagged_
     //
     // suf[]: bit-63-aligned uint64_t, sorted ascending.
     // bits: remaining KEY bits.
+    // Returns: tagged uint64_t.
     // ==================================================================
 
-    uint64_t* build_node_from_arrays_(uint64_t* suf, VST* vals,
-                                       size_t count, int bits) {
+    uint64_t build_node_from_arrays_tagged_(uint64_t* suf, VST* vals,
+                                             size_t count, int bits) {
         // Leaf case
         if (count <= COMPACT_MAX) {
             uint8_t st = suffix_type_for(bits);
+            uint64_t* leaf;
             if (st == 0) {
                 auto bk = std::make_unique<uint8_t[]>(count);
                 for (size_t i = 0; i < count; ++i)
                     bk[i] = static_cast<uint8_t>(suf[i] >> 56);
-                return BO::make_bitmap_leaf(bk.get(), vals,
+                leaf = BO::make_bitmap_leaf(bk.get(), vals,
                     static_cast<uint32_t>(count), alloc_);
-            }
-            if (st == 1) {
+            } else if (st == 1) {
                 auto tk = std::make_unique<uint16_t[]>(count);
                 for (size_t i = 0; i < count; ++i)
                     tk[i] = static_cast<uint16_t>(suf[i] >> 48);
-                return CO16::make_leaf(tk.get(), vals,
+                leaf = CO16::make_leaf(tk.get(), vals,
                     static_cast<uint32_t>(count), 0, nullptr, alloc_);
-            }
-            if constexpr (KEY_BITS > 16) {
+            } else if constexpr (KEY_BITS > 16) {
                 if (st == 2) {
                     auto tk = std::make_unique<uint32_t[]>(count);
                     for (size_t i = 0; i < count; ++i)
                         tk[i] = static_cast<uint32_t>(suf[i] >> 32);
-                    return CO32::make_leaf(tk.get(), vals,
+                    leaf = CO32::make_leaf(tk.get(), vals,
                         static_cast<uint32_t>(count), 0, nullptr, alloc_);
+                } else if constexpr (KEY_BITS > 32) {
+                    // st == 3
+                    leaf = CO64::make_leaf(suf, vals,
+                        static_cast<uint32_t>(count), 0, nullptr, alloc_);
+                } else {
+                    __builtin_unreachable();
                 }
+            } else {
+                __builtin_unreachable();
             }
-            if constexpr (KEY_BITS > 32) {
-                // st == 3
-                return CO64::make_leaf(suf, vals,
-                    static_cast<uint32_t>(count), 0, nullptr, alloc_);
-            }
-            __builtin_unreachable();
+            return tag_leaf(leaf);
         }
 
         // Skip compression: all entries share same top byte?
@@ -612,31 +688,36 @@ private:
                 // Strip top byte: shift left by 8
                 for (size_t i = 0; i < count; ++i) suf[i] <<= 8;
 
-                uint64_t* child = build_node_from_arrays_(suf, vals, count, bits - 8);
+                uint64_t child_tagged = build_node_from_arrays_tagged_(
+                    suf, vals, count, bits - 8);
 
                 // Leaf gets skip prefix, bitmask gets chain wrapper
                 uint8_t byte_arr[1] = {first_top};
-                if (get_header(child)->is_leaf())
-                    return prepend_skip_(child, 1, byte_arr);
-                else
-                    return wrap_bitmask_chain_(child, byte_arr, 1);
+                if (child_tagged & LEAF_BIT) {
+                    uint64_t* leaf = untag_leaf_mut(child_tagged);
+                    return tag_leaf(prepend_skip_(leaf, 1, byte_arr));
+                } else {
+                    uint64_t* bm_node = bm_to_node(child_tagged);
+                    return wrap_bitmask_chain_(bm_node, byte_arr, 1);
+                }
             }
         }
 
-        return build_bitmask_from_arrays_(suf, vals, count, bits);
+        return build_bitmask_from_arrays_tagged_(suf, vals, count, bits);
     }
 
     // ==================================================================
-    // build_bitmask_from_arrays
+    // build_bitmask_from_arrays_tagged_
     //
     // Groups by top byte, recurses, creates bitmask node.
+    // Returns: tagged bitmask uint64_t.
     // ==================================================================
 
-    uint64_t* build_bitmask_from_arrays_(uint64_t* suf, VST* vals,
-                                          size_t count, int bits) {
-        uint8_t   indices[256];
-        uint64_t* child_ptrs[256];
-        int       n_children = 0;
+    uint64_t build_bitmask_from_arrays_tagged_(uint64_t* suf, VST* vals,
+                                                size_t count, int bits) {
+        uint8_t  indices[256];
+        uint64_t child_tagged[256];
+        int      n_children = 0;
 
         size_t i = 0;
         while (i < count) {
@@ -650,28 +731,26 @@ private:
             for (size_t j = 0; j < cc; ++j)
                 cs[j] = suf[start + j] << 8;
 
-            indices[n_children]    = ti;
-            child_ptrs[n_children] = build_node_from_arrays_(
+            indices[n_children]      = ti;
+            child_tagged[n_children] = build_node_from_arrays_tagged_(
                 cs.get(), vals + start, cc, bits - 8);
             n_children++;
         }
 
-        return BO::make_bitmask(indices, child_ptrs, n_children, alloc_);
+        auto* node = BO::make_bitmask(indices, child_tagged, n_children, alloc_);
+        return tag_bitmask(node);
     }
 
     // ==================================================================
-    // split_on_prefix
+    // split_on_prefix_tagged_
     //
-    // At entry: ik has been shifted past `common` matching prefix bytes.
-    // ik >> (IK_BITS-8) = diverging expected byte.
-    // actual[common] = diverging actual byte.
-    // bits = original_bits_at_node - 8*common.
+    // Returns: tagged uint64_t.
     // ==================================================================
 
-    uint64_t* split_on_prefix_(uint64_t* node, node_header* hdr,
-                                IK ik, VST value,
-                                const uint8_t* actual, uint8_t skip,
-                                uint8_t common, int bits) {
+    uint64_t split_on_prefix_tagged_(uint64_t* node, node_header* hdr,
+                                      IK ik, VST value,
+                                      const uint8_t* actual, uint8_t skip,
+                                      uint8_t common, int bits) {
         uint8_t new_idx = static_cast<uint8_t>(ik >> (IK_BITS - 8));
         uint8_t old_idx = actual[common];
         uint8_t old_rem = skip - 1 - common;
@@ -707,42 +786,46 @@ private:
         if (old_rem > 0)
             new_leaf = prepend_skip_(new_leaf, old_rem, new_prefix);
 
-        // Create parent bitmask with 2 children
+        // Create parent bitmask with 2 children (both leaves → tagged)
         uint8_t   bi[2];
-        uint64_t* cp[2];
+        uint64_t  cp[2];
         if (new_idx < old_idx) {
-            bi[0] = new_idx; cp[0] = new_leaf;
-            bi[1] = old_idx; cp[1] = node;
+            bi[0] = new_idx; cp[0] = tag_leaf(new_leaf);
+            bi[1] = old_idx; cp[1] = tag_leaf(node);
         } else {
-            bi[0] = old_idx; cp[0] = node;
-            bi[1] = new_idx; cp[1] = new_leaf;
+            bi[0] = old_idx; cp[0] = tag_leaf(node);
+            bi[1] = new_idx; cp[1] = tag_leaf(new_leaf);
         }
 
         auto* bm_node = BO::make_bitmask(bi, cp, 2, alloc_);
         if (common > 0)
-            bm_node = wrap_bitmask_chain_(bm_node, saved_prefix, common);
-        return bm_node;
+            return wrap_bitmask_chain_(bm_node, saved_prefix, common);
+        return tag_bitmask(bm_node);
     }
 
     // ==================================================================
-    // Remove all
+    // Remove all (tagged)
     // ==================================================================
 
     void remove_all_() noexcept {
-        if (root_ != SENTINEL_NODE) {
+        if (root_ != SENTINEL_TAGGED) {
             remove_node_(root_);
-            root_ = SENTINEL_NODE;
+            root_ = SENTINEL_TAGGED;
         }
         size_ = 0;
     }
 
-    void remove_node_(uint64_t* node) noexcept {
-        auto* hdr = get_header(node);
-        if (hdr->is_leaf()) {
+    void remove_node_(uint64_t tagged) noexcept {
+        if (tagged == SENTINEL_TAGGED) return;
+
+        if (tagged & LEAF_BIT) {
+            uint64_t* node = untag_leaf_mut(tagged);
+            auto* hdr = get_header(node);
             destroy_leaf_(node, hdr);
         } else {
-            BO::for_each_child(node, [&](uint8_t, int, uint64_t* child) {
-                remove_node_(child);
+            uint64_t* node = bm_to_node(tagged);
+            BO::for_each_child(node, [&](uint8_t, int, uint64_t child_tagged) {
+                remove_node_(child_tagged);
             });
             BO::dealloc_bitmask(node, alloc_);
         }
@@ -764,23 +847,26 @@ private:
     }
 
     // ==================================================================
-    // Stats collection
+    // Stats collection (tagged)
     // ==================================================================
 
-    void collect_stats_(const uint64_t* node, debug_stats_t& s) const noexcept {
-        auto* hdr = get_header(node);
-        s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
-
-        if (hdr->is_leaf()) {
+    void collect_stats_(uint64_t tagged, debug_stats_t& s) const noexcept {
+        if (tagged & LEAF_BIT) {
+            const uint64_t* node = untag_leaf(tagged);
+            auto* hdr = get_header(node);
+            s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
             s.total_entries += hdr->entries();
             if (hdr->suffix_type() == 0)
                 s.bitmap_leaves++;
             else
                 s.compact_leaves++;
         } else {
+            const uint64_t* node = bm_to_node_const(tagged);
+            auto* hdr = get_header(node);
+            s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
             s.bitmask_nodes++;
-            BO::for_each_child(node, [&](uint8_t, int, uint64_t* child) {
-                collect_stats_(child, s);
+            BO::for_each_child(node, [&](uint8_t, int, uint64_t child_tagged) {
+                collect_stats_(child_tagged, s);
             });
         }
     }

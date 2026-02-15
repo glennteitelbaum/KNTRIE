@@ -21,6 +21,9 @@ inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
 inline constexpr size_t HEADER_U64    = 1;   // base header is 1 u64 (8 bytes), +1 if skip
 
+// Tagged pointer: bit 63 = leaf (sign bit for fast test)
+static constexpr uint64_t LEAF_BIT = uint64_t(1) << 63;
+
 // ==========================================================================
 // Allocation size classes
 //
@@ -64,23 +67,21 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 // Node Header  (8 bytes = 1 u64)
 //
 // Struct layout (little-endian):
-//   [0]      flags       (bit 0: is_bitmask, bit 1: is_skip)
+//   [0]      flags       (bit 0: is_bitmask, bits 1-3: skip count 0-7)
 //   [1]      suffix_type (leaf only: 0=bitmap256, 1=u16, 2=u32, 3=u64)
 //   [2..3]   entries     (uint16_t)
 //   [4..5]   alloc_u64   (uint16_t)
 //   [6..7]   total_slots (uint16_t, compact leaf slot count)
 //
-// Zeroed header -> is_leaf=true, is_skip=false, suffix_type=0,
+// Skip semantics (via skip() / set_skip()):
+//   - Leaf: # prefix bytes stored in node[1] bytes 0-5
+//   - Bitmask: # embedded bo<1> nodes (skip chain length)
+//
+// Leaf skip data in node[1]: bytes [0..5] prefix (outer first).
+// Count now in header, NOT in node[1] byte 7.
+//
+// Zeroed header -> is_leaf=true, skip=0, suffix_type=0,
 //                  entries=0. Sentinel-safe.
-//
-// Skip data lives in node[1] (header2, only when is_skip=1):
-//   bytes [0..5]  prefix[6]   -- skip prefix chunks (outer first)
-//   byte  [6]     pad
-//   byte  [7]     skip_len    -- number of valid prefix bytes (1-6)
-//
-// skip()/prefix_bytes()/set_skip()/set_prefix() access node[1]
-// via this-pointer arithmetic. Only valid through get_header(node)->
-// NOT on value copies.
 // ==========================================================================
 
 struct node_header {
@@ -91,14 +92,28 @@ struct node_header {
     uint16_t total_slots_ = 0;
 
     static constexpr uint8_t BITMASK_BIT = 1 << 0;
-    static constexpr uint8_t SKIP_BIT    = 1 << 1;
 
-    // --- header1 accessors (safe on value copies) ---
-
+    // --- type ---
     bool is_leaf()    const noexcept { return !(flags_ & BITMASK_BIT); }
-    bool is_skip()    const noexcept { return flags_ & SKIP_BIT; }
     void set_bitmask()      noexcept { flags_ |= BITMASK_BIT; }
 
+    // --- skip (bits 1-3 of flags_) ---
+    uint8_t skip()    const noexcept { return (flags_ >> 1) & 0x07; }
+    bool    is_skip() const noexcept { return flags_ & 0x0E; }
+    void set_skip(uint8_t s) noexcept { flags_ = (flags_ & 0x01) | ((s & 0x07) << 1); }
+
+    // --- leaf prefix bytes (in node[1], only valid via get_header(node)->) ---
+    const uint8_t* prefix_bytes() const noexcept {
+        auto* p = reinterpret_cast<const uint64_t*>(this);
+        return reinterpret_cast<const uint8_t*>(p + 1);
+    }
+    void set_prefix(const uint8_t* pfx, uint8_t len) noexcept {
+        auto* p = reinterpret_cast<uint64_t*>(this);
+        uint8_t* dst = reinterpret_cast<uint8_t*>(p + 1);
+        for (uint8_t i = 0; i < len; ++i) dst[i] = pfx[i];
+    }
+
+    // --- entries / alloc ---
     uint8_t suffix_type() const noexcept { return suffix_type_; }
     void set_suffix_type(uint8_t t) noexcept { suffix_type_ = t; }
 
@@ -110,40 +125,34 @@ struct node_header {
 
     unsigned total_slots() const noexcept { return total_slots_; }
     void set_total_slots(unsigned n) noexcept { total_slots_ = static_cast<uint16_t>(n); }
-
-    // --- header2 accessors (node[1]) -- only valid via get_header(node)-> ---
-
-    uint8_t skip() const noexcept {
-        if (!(flags_ & SKIP_BIT)) return 0;
-        auto* p = reinterpret_cast<const uint64_t*>(this);
-        return reinterpret_cast<const uint8_t*>(p + 1)[7];
-    }
-
-    const uint8_t* prefix_bytes() const noexcept {
-        auto* p = reinterpret_cast<const uint64_t*>(this);
-        return reinterpret_cast<const uint8_t*>(p + 1);
-    }
-
-    void set_skip(uint8_t s) noexcept {
-        if (s > 0) {
-            flags_ |= SKIP_BIT;
-            auto* p = reinterpret_cast<uint64_t*>(this);
-            reinterpret_cast<uint8_t*>(p + 1)[7] = s;
-        } else {
-            flags_ &= ~SKIP_BIT;
-        }
-    }
-
-    void set_prefix(const uint8_t* pfx, uint8_t len) noexcept {
-        auto* p = reinterpret_cast<uint64_t*>(this);
-        uint8_t* dst = reinterpret_cast<uint8_t*>(p + 1);
-        for (uint8_t i = 0; i < len; ++i) dst[i] = pfx[i];
-    }
 };
 static_assert(sizeof(node_header) == 8);
 
 inline node_header*       get_header(uint64_t* n)       noexcept { return reinterpret_cast<node_header*>(n); }
 inline const node_header* get_header(const uint64_t* n) noexcept { return reinterpret_cast<const node_header*>(n); }
+
+// --- Tagged pointer helpers ---
+// Bitmask ptr: points to bitmap (node+1), no LEAF_BIT. Use directly.
+// Leaf ptr: points to header (node+0), has LEAF_BIT. Strip unconditionally.
+
+inline uint64_t tag_leaf(const uint64_t* node) noexcept {
+    return reinterpret_cast<uint64_t>(node) | LEAF_BIT;
+}
+inline uint64_t tag_bitmask(const uint64_t* node) noexcept {
+    return reinterpret_cast<uint64_t>(node + 1);  // skip header, point at bitmap
+}
+inline const uint64_t* untag_leaf(uint64_t tagged) noexcept {
+    return reinterpret_cast<const uint64_t*>(tagged ^ LEAF_BIT);
+}
+inline uint64_t* untag_leaf_mut(uint64_t tagged) noexcept {
+    return reinterpret_cast<uint64_t*>(tagged ^ LEAF_BIT);
+}
+inline uint64_t* bm_to_node(uint64_t ptr) noexcept {
+    return reinterpret_cast<uint64_t*>(ptr) - 1;  // back up from bitmap to header
+}
+inline const uint64_t* bm_to_node_const(uint64_t ptr) noexcept {
+    return reinterpret_cast<const uint64_t*>(ptr) - 1;
+}
 
 // Dynamic header size: 1 (base) + 1 (if skip present)
 inline size_t hdr_u64(const uint64_t* n) noexcept {
@@ -158,6 +167,10 @@ inline size_t hdr_u64(const uint64_t* n) noexcept {
 // ==========================================================================
 
 alignas(64) inline constinit uint64_t SENTINEL_NODE[8] = {};
+
+// Tagged sentinel: SENTINEL_NODE with LEAF_BIT set (valid zeroed leaf)
+inline const uint64_t SENTINEL_TAGGED =
+    reinterpret_cast<uint64_t>(&SENTINEL_NODE[0]) | LEAF_BIT;
 
 // ==========================================================================
 // key_ops<KEY> -- internal key representation
@@ -270,13 +283,13 @@ inline void dealloc_node(ALLOC& a, uint64_t* p, size_t u64_count) noexcept {
 // ==========================================================================
 
 struct insert_result_t {
-    uint64_t* node;
+    uint64_t tagged_ptr;    // tagged pointer (LEAF_BIT for leaf, raw for bitmask)
     bool inserted;
     bool needs_split;
 };
 
 struct erase_result_t {
-    uint64_t* node;
+    uint64_t tagged_ptr;    // tagged pointer, or 0 if fully erased
     bool erased;
 };
 

@@ -174,12 +174,12 @@ struct compact_ops {
                 for (int i = idx - 1; i >= 0 && kd[i] == suffix; --i)
                     VT::write_slot(&vd[i], value);
             }
-            return {node, false, false};
+            return {tag_leaf(node), false, false};
         }
-        if constexpr (!INSERT) return {node, false, false};
+        if constexpr (!INSERT) return {tag_leaf(node), false, false};
 
         if (entries >= COMPACT_MAX)
-            return {node, false, true};  // needs_split
+            return {tag_leaf(node), false, true};  // needs_split
 
         int ins = (base - kd) + (*base < suffix);
         unsigned dups = ts - entries;
@@ -189,7 +189,7 @@ struct compact_ops {
             insert_consume_dup_(kd, vd, ts,
                                 ins, entries, suffix, value);
             h->set_entries(entries + 1);
-            return {node, true, false};
+            return {tag_leaf(node), true, false};
         }
 
         // No dups: realloc to next slot count
@@ -209,7 +209,7 @@ struct compact_ops {
                           suffix, value, new_entries, new_ts, hs);
 
         dealloc_node(alloc, node, h->alloc_u64());
-        return {nn, true, false};
+        return {tag_leaf(nn), true, false};
     }
 
     // ==================================================================
@@ -226,7 +226,7 @@ struct compact_ops {
 
         const K* base = adaptive_search<K>::find_base(
             kd, ts, suffix);
-        if (*base != suffix) return {node, false};
+        if (*base != suffix) return {tag_leaf(node), false};
         unsigned idx = static_cast<unsigned>(base - kd);
 
         unsigned nc = entries - 1;
@@ -236,7 +236,7 @@ struct compact_ops {
             if constexpr (!VT::IS_INLINE)
                 VT::destroy(vd[idx], alloc);
             dealloc_node(alloc, node, h->alloc_u64());
-            return {nullptr, true};
+            return {0, true};
         }
 
         // Shrink check: if entries-1 fits in half the slots, realloc
@@ -259,13 +259,13 @@ struct compact_ops {
             seed_from_real_(nn, tmp_k.get(), tmp_v.get(), nc, new_ts, hs);
 
             dealloc_node(alloc, node, h->alloc_u64());
-            return {nn, true};
+            return {tag_leaf(nn), true};
         }
 
         // In-place: convert erased entry's run to neighbor dups
         erase_create_dup_(kd, vd, ts, idx, suffix, alloc);
         h->set_entries(nc);
-        return {node, true};
+        return {tag_leaf(node), true};
     }
 
 private:
