@@ -102,105 +102,31 @@ struct Row {
 constexpr int TRIALS = 3;
 
 template<typename KEY>
-static Row bench_kntrie(Workload<KEY>& w, size_t n, int fi,
-                        const char* key_type, const std::string& pattern,
-                        std::mt19937_64& rng) {
-    double best_fnd = 1e18, best_ins = 1e18, best_ers = 1e18;
+static void bench_all(size_t target_n, const std::string& pattern,
+                      const char* key_type, std::vector<Row>& rows) {
+    std::mt19937_64 rng(42);
+    int fi = iters_for(target_n);
+    auto w = make_workload<KEY>(target_n, pattern, fi, rng);
+    size_t n = w.keys.size();
+    bool do_map = (n <= 1000000);
 
-    // Memory: one tracked run with counting allocator
-    size_t mem;
+    // Memory: one tracked run per container
+    size_t kntrie_mem, map_mem = 0, umap_mem;
     {
         using TrieT = gteitelbaum::kntrie<KEY, uint64_t, TrackingAlloc<uint64_t>>;
         g_alloc_total = 0;
         TrieT trie;
         for (auto k : w.keys) trie.insert(k, static_cast<uint64_t>(k));
-        mem = g_alloc_total;
+        kntrie_mem = g_alloc_total;
     }
-
-    // Pre-generate shuffled find orders
-    std::vector<std::vector<KEY>> find_orders(fi);
-    for (int r = 0; r < fi; ++r) {
-        find_orders[r] = w.find_keys;
-        std::shuffle(find_orders[r].begin(), find_orders[r].end(), rng);
-    }
-
-    // Speed trials with default allocator
-    for (int t = 0; t < TRIALS; ++t) {
-        std::shuffle(w.keys.begin(), w.keys.end(), rng);
-        gteitelbaum::kntrie<KEY, uint64_t> trie;
-        double t0 = now_ms();
-        for (auto k : w.keys) trie.insert(k, static_cast<uint64_t>(k));
-        best_ins = std::min(best_ins, now_ms() - t0);
-
-        uint64_t cs = 0;
-        double t1 = now_ms();
-        for (int r = 0; r < fi; ++r)
-            for (auto k : find_orders[r]) { auto* v = trie.find_value(k); cs += v ? *v : 0; }
-        best_fnd = std::min(best_fnd, (now_ms() - t1) / fi);
-        do_not_optimize(cs);
-
-        std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
-        double t2 = now_ms();
-        for (auto k : w.erase_keys) trie.erase(k);
-        best_ers = std::min(best_ers, now_ms() - t2);
-    }
-    return {key_type, pattern, n, "kntrie", best_fnd, best_ins, best_ers, mem};
-}
-
-template<typename KEY>
-static Row bench_map(Workload<KEY>& w, size_t n, int fi,
-                     const char* key_type, const std::string& pattern,
-                     std::mt19937_64& rng) {
-    double best_fnd = 1e18, best_ins = 1e18, best_ers = 1e18;
-
-    // Memory: one tracked run
-    size_t mem;
-    {
+    if (do_map) {
         using MapT = std::map<KEY, uint64_t, std::less<KEY>,
                               TrackingAlloc<std::pair<const KEY, uint64_t>>>;
         g_alloc_total = 0;
         MapT m;
         for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
-        mem = g_alloc_total;
+        map_mem = g_alloc_total;
     }
-
-    // Pre-generate shuffled find orders
-    std::vector<std::vector<KEY>> find_orders(fi);
-    for (int r = 0; r < fi; ++r) {
-        find_orders[r] = w.find_keys;
-        std::shuffle(find_orders[r].begin(), find_orders[r].end(), rng);
-    }
-
-    for (int t = 0; t < TRIALS; ++t) {
-        std::shuffle(w.keys.begin(), w.keys.end(), rng);
-        std::map<KEY, uint64_t> m;
-        double t0 = now_ms();
-        for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
-        best_ins = std::min(best_ins, now_ms() - t0);
-
-        uint64_t cs = 0;
-        double t1 = now_ms();
-        for (int r = 0; r < fi; ++r)
-            for (auto k : find_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
-        best_fnd = std::min(best_fnd, (now_ms() - t1) / fi);
-        do_not_optimize(cs);
-
-        std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
-        double t2 = now_ms();
-        for (auto k : w.erase_keys) m.erase(k);
-        best_ers = std::min(best_ers, now_ms() - t2);
-    }
-    return {key_type, pattern, n, "map", best_fnd, best_ins, best_ers, mem};
-}
-
-template<typename KEY>
-static Row bench_umap(Workload<KEY>& w, size_t n, int fi,
-                      const char* key_type, const std::string& pattern,
-                      std::mt19937_64& rng) {
-    double best_fnd = 1e18, best_ins = 1e18, best_ers = 1e18;
-
-    // Memory: one tracked run
-    size_t mem;
     {
         using UMapT = std::unordered_map<KEY, uint64_t, std::hash<KEY>, std::equal_to<KEY>,
                                           TrackingAlloc<std::pair<const KEY, uint64_t>>>;
@@ -208,51 +134,90 @@ static Row bench_umap(Workload<KEY>& w, size_t n, int fi,
         UMapT m;
         m.reserve(w.keys.size());
         for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
-        mem = g_alloc_total;
+        umap_mem = g_alloc_total;
     }
 
-    // Pre-generate shuffled find orders
+    // Pre-generate find orders (shared across containers)
     std::vector<std::vector<KEY>> find_orders(fi);
     for (int r = 0; r < fi; ++r) {
         find_orders[r] = w.find_keys;
         std::shuffle(find_orders[r].begin(), find_orders[r].end(), rng);
     }
 
+    double k_fnd = 1e18, k_ins = 1e18, k_ers = 1e18;
+    double m_fnd = 1e18, m_ins = 1e18, m_ers = 1e18;
+    double u_fnd = 1e18, u_ins = 1e18, u_ers = 1e18;
+
     for (int t = 0; t < TRIALS; ++t) {
+        // --- kntrie ---
         std::shuffle(w.keys.begin(), w.keys.end(), rng);
-        std::unordered_map<KEY, uint64_t> m;
-        m.reserve(w.keys.size());
-        double t0 = now_ms();
-        for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
-        best_ins = std::min(best_ins, now_ms() - t0);
+        {
+            gteitelbaum::kntrie<KEY, uint64_t> trie;
+            double t0 = now_ms();
+            for (auto k : w.keys) trie.insert(k, static_cast<uint64_t>(k));
+            k_ins = std::min(k_ins, now_ms() - t0);
 
-        uint64_t cs = 0;
-        double t1 = now_ms();
-        for (int r = 0; r < fi; ++r)
-            for (auto k : find_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
-        best_fnd = std::min(best_fnd, (now_ms() - t1) / fi);
-        do_not_optimize(cs);
+            uint64_t cs = 0;
+            double t1 = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : find_orders[r]) { auto* v = trie.find_value(k); cs += v ? *v : 0; }
+            k_fnd = std::min(k_fnd, (now_ms() - t1) / fi);
+            do_not_optimize(cs);
 
-        std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
-        double t2 = now_ms();
-        for (auto k : w.erase_keys) m.erase(k);
-        best_ers = std::min(best_ers, now_ms() - t2);
+            std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
+            double t2 = now_ms();
+            for (auto k : w.erase_keys) trie.erase(k);
+            k_ers = std::min(k_ers, now_ms() - t2);
+        }
+
+        // --- map ---
+        if (do_map) {
+            std::shuffle(w.keys.begin(), w.keys.end(), rng);
+            std::map<KEY, uint64_t> m;
+            double t0 = now_ms();
+            for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
+            m_ins = std::min(m_ins, now_ms() - t0);
+
+            uint64_t cs = 0;
+            double t1 = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : find_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
+            m_fnd = std::min(m_fnd, (now_ms() - t1) / fi);
+            do_not_optimize(cs);
+
+            std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
+            double t2 = now_ms();
+            for (auto k : w.erase_keys) m.erase(k);
+            m_ers = std::min(m_ers, now_ms() - t2);
+        }
+
+        // --- umap ---
+        std::shuffle(w.keys.begin(), w.keys.end(), rng);
+        {
+            std::unordered_map<KEY, uint64_t> m;
+            m.reserve(w.keys.size());
+            double t0 = now_ms();
+            for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
+            u_ins = std::min(u_ins, now_ms() - t0);
+
+            uint64_t cs = 0;
+            double t1 = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : find_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
+            u_fnd = std::min(u_fnd, (now_ms() - t1) / fi);
+            do_not_optimize(cs);
+
+            std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
+            double t2 = now_ms();
+            for (auto k : w.erase_keys) m.erase(k);
+            u_ers = std::min(u_ers, now_ms() - t2);
+        }
     }
-    return {key_type, pattern, n, "umap", best_fnd, best_ins, best_ers, mem};
-}
 
-template<typename KEY>
-static void bench_all(size_t target_n, const std::string& pattern,
-                      const char* key_type, std::vector<Row>& rows) {
-    std::mt19937_64 rng(42);
-    int fi = iters_for(target_n);
-    auto w = make_workload<KEY>(target_n, pattern, fi, rng);
-    size_t n = w.keys.size();
-
-    rows.push_back(bench_kntrie(w, n, fi, key_type, pattern, rng));
-    if (n <= 1000000)
-        rows.push_back(bench_map(w, n, fi, key_type, pattern, rng));
-    rows.push_back(bench_umap(w, n, fi, key_type, pattern, rng));
+    rows.push_back({key_type, pattern, n, "kntrie", k_fnd, k_ins, k_ers, kntrie_mem});
+    if (do_map)
+        rows.push_back({key_type, pattern, n, "map", m_fnd, m_ins, m_ers, map_mem});
+    rows.push_back({key_type, pattern, n, "umap", u_fnd, u_ins, u_ers, umap_mem});
 }
 
 // ==========================================================================
@@ -495,37 +460,25 @@ function show(pattern) {
     std::printf("</script>\n</body>\n</html>\n");
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     std::vector<size_t> sizes;
-    constexpr double MAX_N = 3000000;  // change to 10000 for quick test
+    double MAX_N = 3000000;
+    if (argc > 1) MAX_N = std::atof(argv[1]);
     for (double n = 100; n < MAX_N; n *= 1.5)
         sizes.push_back(static_cast<size_t>(n));
 
-    auto capped_sizes = [&](auto key_tag) {
-        using KEY = decltype(key_tag);
-        size_t max_n = static_cast<size_t>(std::numeric_limits<KEY>::max());
-        std::vector<size_t> result;
-        for (auto n : sizes) {
-            if (n >= max_n) {
-                result.push_back(max_n);
-                break;
-            }
-            result.push_back(n);
-        }
-        return result;
-    };
-
     const char* patterns[] = {"random", "sequential"};
     std::vector<Row> rows;
+    size_t max_i32 = static_cast<size_t>(std::numeric_limits<int32_t>::max());
 
     for (auto* pat : patterns) {
         for (auto n : sizes) {
             std::fprintf(stderr, "u64 %s N=%zu...\n", pat, n);
             bench_all<uint64_t>(n, pat, "uint64_t", rows);
-        }
-        for (auto n : capped_sizes(int32_t{})) {
-            std::fprintf(stderr, "i32 %s N=%zu...\n", pat, n);
-            bench_all<int32_t>(n, pat, "int32_t", rows);
+            if (n <= max_i32) {
+                std::fprintf(stderr, "i32 %s N=%zu...\n", pat, n);
+                bench_all<int32_t>(n, pat, "int32_t", rows);
+            }
         }
     }
 
