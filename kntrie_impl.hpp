@@ -611,10 +611,14 @@ private:
         if (!cr.erased) return {tag_bitmask(node), false, 0};
 
         if (cr.tagged_ptr) {
-            // Child survived — update pointer, decrement descendants
+            // Child survived — decrement or skip if capped
             if (cr.tagged_ptr != lk.child)
                 BO::set_child(node, lk.slot, cr.tagged_ptr);
-            uint16_t d = dec_or_recompute_desc_(node, 0);
+            uint16_t d = hdr->descendants();
+            if (d == COALESCE_CAP)
+                return {tag_bitmask(node), true, COALESCE_CAP};
+            --d;
+            hdr->set_descendants(d);
             if (d <= COMPACT_MAX)
                 return do_coalesce_(node, hdr, bits, d);
             return {tag_bitmask(node), true, d};
@@ -688,9 +692,13 @@ private:
         if (!cr.erased) return {tag_bitmask(node), false, 0};
 
         if (cr.tagged_ptr) {
-            // Child survived — update pointer, decrement descendants
+            // Child survived — decrement or skip if capped
             if (cr.tagged_ptr != old_child) real_ch[slot] = cr.tagged_ptr;
-            uint16_t d = dec_or_recompute_desc_(node, sc);
+            uint16_t d = hdr->descendants();
+            if (d == COALESCE_CAP)
+                return {tag_bitmask(node), true, COALESCE_CAP};
+            --d;
+            hdr->set_descendants(d);
             if (d <= COMPACT_MAX)
                 return do_coalesce_(node, hdr, orig_bits, d);
             return {tag_bitmask(node), true, d};
