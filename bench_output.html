@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>kntrie Benchmark</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  body { margin:0; background:#0f0f1a; color:#ddd; font-family:system-ui,sans-serif; }
+  .wrap { max-width:700px; margin:0 auto; padding:16px 12px; }
+  h2 { margin:0 0 4px; font-size:18px; font-weight:700; text-align:center; }
+  .sub { text-align:center; color:#777; font-size:12px; margin:0 0 12px; }
+  .btns { display:flex; justify-content:center; gap:8px; margin-bottom:16px; }
+  .btns button { padding:6px 16px; border-radius:6px; border:1px solid #444;
+    background:#1a1a2e; color:#aaa; cursor:pointer; font-size:13px; font-weight:600; }
+  .btns button.active { background:#3b82f6; color:#fff; }
+  .chart-box { margin-bottom:24px; }
+  .chart-box h3 { margin:0 0 6px; font-size:14px; font-weight:600; text-align:center; }
+  canvas { background:#12122a; border-radius:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>kntrie Benchmark</h2>
+  <p class="sub">Log-log · Per-entry · Lower is better · Solid = i32, Dashed = u64</p>
+  <div class="btns">
+    <button class="active" onclick="show('random')">random</button>
+    <button onclick="show('sequential')">sequential</button>
+  </div>
+  <div class="chart-box"><h3>Find (ns/entry)</h3><canvas id="c_find"></canvas></div>
+  <div class="chart-box"><h3>Insert (ns/entry)</h3><canvas id="c_insert"></canvas></div>
+  <div class="chart-box"><h3>Erase N/2 (ns/entry)</h3><canvas id="c_erase"></canvas></div>
+  <div class="chart-box"><h3>Memory (B/entry)</h3><canvas id="c_mem"></canvas></div>
+</div>
+<script>
+const RAW_DATA = [
+  {pattern:"random",N:100,kntrie_int32_find:0.0007,kntrie_int32_insert:0.0081,kntrie_int32_erase:0.0031,kntrie_int32_mem:1544,kntrie_uint64_find:0.0007,kntrie_uint64_insert:0.0115,kntrie_uint64_erase:0.0049,kntrie_uint64_mem:2056,map_int32_find:0.0036,map_int32_insert:0.0094,map_int32_erase:0.0054,map_int32_mem:4800,map_uint64_find:0.0033,map_uint64_insert:0.0109,map_uint64_erase:0.0073,map_uint64_mem:4800,umap_int32_find:0.0011,umap_int32_insert:0.0032,umap_int32_erase:0.0016,umap_int32_mem:3224,umap_uint64_find:0.0012,umap_uint64_insert:0.0040,umap_uint64_erase:0.0024,umap_uint64_mem:3224},
+  {pattern:"random",N:150,kntrie_int32_find:0.0011,kntrie_int32_insert:0.0131,kntrie_int32_erase:0.0058,kntrie_int32_mem:3080,kntrie_uint64_find:0.0012,kntrie_uint64_insert:0.0139,kntrie_uint64_erase:0.0066,kntrie_uint64_mem:4104,map_int32_find:0.0060,map_int32_insert:0.0151,map_int32_erase:0.0087,map_int32_mem:7200,map_uint64_find:0.0053,map_uint64_insert:0.0170,map_uint64_erase:0.0106,map_uint64_mem:7200,umap_int32_find:0.0019,umap_int32_insert:0.0059,umap_int32_erase:0.0027,umap_int32_mem:4856,umap_uint64_find:0.0017,umap_uint64_insert:0.0060,umap_uint64_erase:0.0032,umap_uint64_mem:4856},
+  {pattern:"random",N:225,kntrie_int32_find:0.0016,kntrie_int32_insert:0.0135,kntrie_int32_erase:0.0049,kntrie_int32_mem:3080,kntrie_uint64_find:0.0016,kntrie_uint64_insert:0.0137,kntrie_uint64_erase:0.0060,kntrie_uint64_mem:4104,map_int32_find:0.0096,map_int32_insert:0.0209,map_int32_erase:0.0103,map_int32_mem:10800,map_uint64_find:0.0083,map_uint64_insert:0.0222,map_uint64_erase:0.0118,map_uint64_mem:10800,umap_int32_find:0.0031,umap_int32_insert:0.0080,umap_int32_erase:0.0034,umap_int32_mem:7216,umap_uint64_find:0.0029,umap_uint64_insert:0.0076,umap_uint64_erase:0.0034,umap_uint64_mem:7216},
+  {pattern:"random",N:337,kntrie_int32_find:0.0028,kntrie_int32_insert:0.0238,kntrie_int32_erase:0.0079,kntrie_int32_mem:6152,kntrie_uint64_find:0.0027,kntrie_uint64_insert:0.0239,kntrie_uint64_erase:0.0103,kntrie_uint64_mem:8200,map_int32_find:0.0156,map_int32_insert:0.0341,map_int32_erase:0.0156,map_int32_mem:16176,map_uint64_find:0.0136,map_uint64_insert:0.0342,map_uint64_erase:0.0186,map_uint64_mem:16176,umap_int32_find:0.0041,umap_int32_insert:0.0108,umap_int32_erase:0.0044,umap_int32_mem:10784,umap_uint64_find:0.0039,umap_uint64_insert:0.0112,umap_uint64_erase:0.0044,umap_uint64_mem:10784},
+  {pattern:"random",N:506,kntrie_int32_find:0.0049,kntrie_int32_insert:0.0455,kntrie_int32_erase:0.0124,kntrie_int32_mem:6152,kntrie_uint64_find:0.0040,kntrie_uint64_insert:0.0341,kntrie_uint64_erase:0.0141,kntrie_uint64_mem:8200,map_int32_find:0.0268,map_int32_insert:0.0525,map_int32_erase:0.0273,map_int32_mem:24288,map_uint64_find:0.0221,map_uint64_insert:0.0528,map_uint64_erase:0.0277,map_uint64_mem:24288,umap_int32_find:0.0059,umap_int32_insert:0.0153,umap_int32_erase:0.0072,umap_int32_mem:16472,umap_uint64_find:0.0056,umap_uint64_insert:0.0156,umap_uint64_erase:0.0070,umap_uint64_mem:16472},
+  {pattern:"random",N:759,kntrie_int32_find:0.0073,kntrie_int32_insert:0.0493,kntrie_int32_erase:0.0195,kntrie_int32_mem:12296,kntrie_uint64_find:0.0069,kntrie_uint64_insert:0.0520,kntrie_uint64_erase:0.0231,kntrie_uint64_mem:16392,map_int32_find:0.0410,map_int32_insert:0.0797,map_int32_erase:0.0410,map_int32_mem:36432,map_uint64_find:0.0369,map_uint64_insert:0.0782,map_uint64_erase:0.0422,map_uint64_mem:36432,umap_int32_find:0.0091,umap_int32_insert:0.0229,umap_int32_erase:0.0105,umap_int32_mem:24304,umap_uint64_find:0.0089,umap_uint64_insert:0.0226,umap_uint64_erase:0.0104,umap_uint64_mem:24304},
+  {pattern:"random",N:1139,kntrie_int32_find:0.0133,kntrie_int32_insert:0.0962,kntrie_int32_erase:0.0215,kntrie_int32_mem:24584,kntrie_uint64_find:0.0115,kntrie_uint64_insert:0.0900,kntrie_uint64_erase:0.0265,kntrie_uint64_mem:32776,map_int32_find:0.0736,map_int32_insert:0.1244,map_int32_erase:0.0620,map_int32_mem:54672,map_uint64_find:0.0641,map_uint64_insert:0.1158,map_uint64_erase:0.0721,map_uint64_mem:54672,umap_int32_find:0.0143,umap_int32_insert:0.0319,umap_int32_erase:0.0153,umap_int32_mem:36880,umap_uint64_find:0.0131,umap_uint64_insert:0.0300,umap_uint64_erase:0.0140,umap_uint64_mem:36880},
+  {pattern:"random",N:1708,kntrie_int32_find:0.0185,kntrie_int32_insert:0.1238,kntrie_int32_erase:0.0363,kntrie_int32_mem:24584,kntrie_uint64_find:0.0177,kntrie_uint64_insert:0.1184,kntrie_uint64_erase:0.0448,kntrie_uint64_mem:32776,map_int32_find:0.1132,map_int32_insert:0.1893,map_int32_erase:0.0987,map_int32_mem:81984,map_uint64_find:0.1073,map_uint64_insert:0.1835,map_uint64_erase:0.0983,map_uint64_mem:81984,umap_int32_find:0.0225,umap_int32_insert:0.0471,umap_int32_erase:0.0228,umap_int32_mem:54920,umap_uint64_find:0.0219,umap_uint64_insert:0.0545,umap_uint64_erase:0.0229,umap_uint64_mem:54920},
+  {pattern:"random",N:2562,kntrie_int32_find:0.0325,kntrie_int32_insert:0.1769,kntrie_int32_erase:0.0545,kntrie_int32_mem:49160,kntrie_uint64_find:0.0332,kntrie_uint64_insert:0.1952,kntrie_uint64_erase:0.0730,kntrie_uint64_mem:65544,map_int32_find:0.1925,map_int32_insert:0.2881,map_int32_erase:0.1527,map_int32_mem:122976,map_uint64_find:0.1836,map_uint64_insert:0.2874,map_uint64_erase:0.1696,map_uint64_mem:122976,umap_int32_find:0.0334,umap_int32_insert:0.0664,umap_int32_erase:0.0349,umap_int32_mem:83512,umap_uint64_find:0.0334,umap_uint64_insert:0.0695,umap_uint64_erase:0.0344,umap_uint64_mem:83512},
+  {pattern:"random",N:3844,kntrie_int32_find:0.0479,kntrie_int32_insert:0.2801,kntrie_int32_erase:0.0797,kntrie_int32_mem:49160,kntrie_uint64_find:0.0487,kntrie_uint64_insert:0.2782,kntrie_uint64_erase:0.1100,kntrie_uint64_mem:65544,map_int32_find:0.3003,map_int32_insert:0.4437,map_int32_erase:0.2393,map_int32_mem:184512,map_uint64_find:0.3076,map_uint64_insert:0.4599,map_uint64_erase:0.2515,map_uint64_mem:184512,umap_int32_find:0.0525,umap_int32_insert:0.0979,umap_int32_erase:0.0536,umap_int32_mem:124472,umap_uint64_find:0.0546,umap_uint64_insert:0.1036,umap_uint64_erase:0.0555,umap_uint64_mem:124472},
+  {pattern:"random",N:5766,kntrie_int32_find:0.0647,kntrie_int32_insert:0.4918,kntrie_int32_erase:0.1558,kntrie_int32_mem:100560,kntrie_uint64_find:0.0677,kntrie_uint64_insert:0.5602,kntrie_uint64_erase:0.1789,kntrie_uint64_mem:131600,map_int32_find:0.5213,map_int32_insert:0.7175,map_int32_erase:0.3882,map_int32_mem:276768,map_uint64_find:0.4838,map_uint64_insert:0.7152,map_uint64_erase:0.3950,map_uint64_mem:276768,umap_int32_find:0.0827,umap_int32_insert:0.1603,umap_int32_erase:0.0835,umap_int32_mem:186008,umap_uint64_find:0.0831,umap_uint64_insert:0.1598,umap_uint64_erase:0.0868,umap_uint64_mem:186008},
+  {pattern:"random",N:8649,kntrie_int32_find:0.1361,kntrie_int32_insert:0.6876,kntrie_int32_erase:0.2147,kntrie_int32_mem:157968,kntrie_uint64_find:0.1394,kntrie_uint64_insert:0.7039,kntrie_uint64_erase:0.2260,kntrie_uint64_mem:214544,map_int32_find:0.8530,map_int32_insert:1.1629,map_int32_erase:0.6296,map_int32_mem:415152,map_uint64_find:0.8380,map_uint64_insert:1.1612,map_uint64_erase:0.6645,map_uint64_mem:415152,umap_int32_find:0.1284,umap_int32_insert:0.2429,umap_int32_erase:0.1290,umap_int32_mem:277840,umap_uint64_find:0.1263,umap_uint64_insert:0.2460,umap_uint64_erase:0.1300,umap_uint64_mem:277840},
+  {pattern:"random",N:12974,kntrie_int32_find:0.1675,kntrie_int32_insert:0.9078,kntrie_int32_erase:0.3152,kntrie_int32_mem:207888,kntrie_uint64_find:0.1825,kntrie_uint64_insert:0.9691,kntrie_uint64_erase:0.3448,kntrie_uint64_mem:274960,map_int32_find:1.4134,map_int32_insert:1.8336,map_int32_erase:1.0148,map_int32_mem:622752,map_uint64_find:1.4573,map_uint64_insert:1.8698,map_uint64_erase:1.1014,map_uint64_mem:622752,umap_int32_find:0.2043,umap_int32_insert:0.3688,umap_int32_erase:0.2031,umap_int32_mem:415240,umap_uint64_find:0.1978,umap_uint64_insert:0.3841,umap_uint64_erase:0.2012,umap_uint64_mem:415240},
+  {pattern:"random",N:19461,kntrie_int32_find:0.3002,kntrie_int32_insert:1.3439,kntrie_int32_erase:0.4615,kntrie_int32_mem:380688,kntrie_uint64_find:0.3160,kntrie_uint64_insert:1.3840,kntrie_uint64_erase:0.5068,kntrie_uint64_mem:503824,map_int32_find:2.3516,map_int32_insert:2.8846,map_int32_erase:1.6462,map_int32_mem:934128,map_uint64_find:2.4731,map_uint64_insert:2.9409,map_uint64_erase:1.7208,map_uint64_mem:934128,umap_int32_find:0.3016,umap_int32_insert:0.5425,umap_int32_erase:0.2948,umap_int32_mem:633088,umap_uint64_find:0.2939,umap_uint64_insert:0.5572,umap_uint64_erase:0.3111,umap_uint64_mem:633088},
+  {pattern:"random",N:29192,kntrie_int32_find:0.4776,kntrie_int32_insert:2.0297,kntrie_int32_erase:0.6972,kntrie_int32_mem:444432,kntrie_uint64_find:0.4916,kntrie_uint64_insert:2.1724,kntrie_uint64_erase:0.7649,kntrie_uint64_mem:568336,map_int32_find:4.8043,map_int32_insert:4.7361,map_int32_erase:2.9235,map_int32_mem:1401216,map_uint64_find:4.7632,map_uint64_insert:4.9269,map_uint64_erase:3.0962,map_uint64_mem:1401216,umap_int32_find:0.4622,umap_int32_insert:0.8310,umap_int32_erase:0.4689,umap_int32_mem:946424,umap_uint64_find:0.4894,umap_uint64_insert:0.8872,umap_uint64_erase:0.4733,umap_uint64_mem:946424},
+  {pattern:"random",N:43789,kntrie_int32_find:0.8061,kntrie_int32_insert:3.0767,kntrie_int32_erase:1.1583,kntrie_int32_mem:791568,kntrie_uint64_find:0.8495,kntrie_uint64_insert:3.1996,kntrie_uint64_erase:1.2619,kntrie_uint64_mem:1053712,map_int32_find:9.4874,map_int32_insert:8.5202,map_int32_erase:5.5687,map_int32_mem:2101872,map_uint64_find:9.6257,map_uint64_insert:9.0367,map_uint64_erase:5.6853,map_uint64_mem:2101872,umap_int32_find:0.8308,umap_int32_insert:1.4534,umap_int32_erase:0.9553,umap_int32_mem:1414784,umap_uint64_find:0.7863,umap_uint64_insert:1.3303,umap_uint64_erase:0.8644,umap_uint64_mem:1414784},
+  {pattern:"random",N:65684,kntrie_int32_find:1.5100,kntrie_int32_insert:5.2160,kntrie_int32_erase:1.7797,kntrie_int32_mem:1163280,kntrie_uint64_find:1.9827,kntrie_uint64_insert:5.4626,kntrie_uint64_erase:2.1558,kntrie_uint64_mem:1573904,map_int32_find:17.8089,map_int32_insert:15.0189,map_int32_erase:9.7859,map_int32_mem:3152832,map_uint64_find:18.1032,map_uint64_insert:15.5369,map_uint64_erase:11.2135,map_uint64_mem:3152832,umap_int32_find:1.4614,umap_int32_insert:2.6787,umap_int32_erase:1.7907,umap_int32_mem:2114872,umap_uint64_find:1.4488,umap_uint64_insert:2.6830,umap_uint64_erase:1.9170,umap_uint64_mem:2114872},
+  {pattern:"random",N:98523,kntrie_int32_find:2.4601,kntrie_int32_insert:7.6069,kntrie_int32_erase:31.0583,kntrie_int32_mem:1578000,map_int32_find:35.8017,map_int32_insert:28.4268,map_int32_erase:19.6474,map_int32_mem:4729104,umap_int32_find:2.4848,umap_int32_insert:4.9430,umap_int32_erase:3.4187,umap_int32_mem:3162416},
+  {pattern:"random",N:98526,kntrie_uint64_find:3.9939,kntrie_uint64_insert:8.0465,kntrie_uint64_erase:33.3383,kntrie_uint64_mem:2102288,map_uint64_find:37.5916,map_uint64_insert:28.6422,map_uint64_erase:19.2698,map_uint64_mem:4729248,umap_uint64_find:2.4634,umap_uint64_insert:5.3567,umap_uint64_erase:3.4831,umap_uint64_mem:3162488},
+  {pattern:"sequential",N:100,kntrie_int32_find:0.0007,kntrie_int32_insert:0.0084,kntrie_int32_erase:0.0024,kntrie_int32_mem:1544,kntrie_uint64_find:0.0006,kntrie_uint64_insert:0.0091,kntrie_uint64_erase:0.0034,kntrie_uint64_mem:2056,map_int32_find:0.0035,map_int32_insert:0.0097,map_int32_erase:0.0053,map_int32_mem:4800,map_uint64_find:0.0032,map_uint64_insert:0.0105,map_uint64_erase:0.0067,map_uint64_mem:4800,umap_int32_find:0.0003,umap_int32_insert:0.0021,umap_int32_erase:0.0007,umap_int32_mem:3224,umap_uint64_find:0.0003,umap_uint64_insert:0.0022,umap_uint64_erase:0.0012,umap_uint64_mem:3224},
+  {pattern:"sequential",N:150,kntrie_int32_find:0.0011,kntrie_int32_insert:0.0131,kntrie_int32_erase:0.0047,kntrie_int32_mem:3080,kntrie_uint64_find:0.0011,kntrie_uint64_insert:0.0123,kntrie_uint64_erase:0.0057,kntrie_uint64_mem:4104,map_int32_find:0.0060,map_int32_insert:0.0145,map_int32_erase:0.0092,map_int32_mem:7200,map_uint64_find:0.0052,map_uint64_insert:0.0171,map_uint64_erase:0.0090,map_uint64_mem:7200,umap_int32_find:0.0005,umap_int32_insert:0.0042,umap_int32_erase:0.0014,umap_int32_mem:4856,umap_uint64_find:0.0005,umap_uint64_insert:0.0045,umap_uint64_erase:0.0019,umap_uint64_mem:4856},
+  {pattern:"sequential",N:225,kntrie_int32_find:0.0017,kntrie_int32_insert:0.0152,kntrie_int32_erase:0.0048,kntrie_int32_mem:3080,kntrie_uint64_find:0.0016,kntrie_uint64_insert:0.0132,kntrie_uint64_erase:0.0056,kntrie_uint64_mem:4104,map_int32_find:0.0095,map_int32_insert:0.0227,map_int32_erase:0.0103,map_int32_mem:10800,map_uint64_find:0.0086,map_uint64_insert:0.0230,map_uint64_erase:0.0113,map_uint64_mem:10800,umap_int32_find:0.0007,umap_int32_insert:0.0052,umap_int32_erase:0.0012,umap_int32_mem:7216,umap_uint64_find:0.0007,umap_uint64_insert:0.0054,umap_uint64_erase:0.0015,umap_uint64_mem:7216},
+  {pattern:"sequential",N:337,kntrie_int32_find:0.0029,kntrie_int32_insert:0.0202,kntrie_int32_erase:0.0088,kntrie_int32_mem:6152,kntrie_uint64_find:0.0027,kntrie_uint64_insert:0.0247,kntrie_uint64_erase:0.0094,kntrie_uint64_mem:8200,map_int32_find:0.0162,map_int32_insert:0.0346,map_int32_erase:0.0184,map_int32_mem:16176,map_uint64_find:0.0144,map_uint64_insert:0.0342,map_uint64_erase:0.0190,map_uint64_mem:16176,umap_int32_find:0.0010,umap_int32_insert:0.0079,umap_int32_erase:0.0023,umap_int32_mem:10784,umap_uint64_find:0.0011,umap_uint64_insert:0.0081,umap_uint64_erase:0.0028,umap_uint64_mem:10784},
+  {pattern:"sequential",N:506,kntrie_int32_find:0.0042,kntrie_int32_insert:0.0352,kntrie_int32_erase:0.0110,kntrie_int32_mem:6152,kntrie_uint64_find:0.0043,kntrie_uint64_insert:0.0353,kntrie_uint64_erase:0.0151,kntrie_uint64_mem:8200,map_int32_find:0.0247,map_int32_insert:0.0529,map_int32_erase:0.0261,map_int32_mem:24288,map_uint64_find:0.0225,map_uint64_insert:0.0555,map_uint64_erase:0.0289,map_uint64_mem:24288,umap_int32_find:0.0016,umap_int32_insert:0.0111,umap_int32_erase:0.0031,umap_int32_mem:16472,umap_uint64_find:0.0016,umap_uint64_insert:0.0115,umap_uint64_erase:0.0038,umap_uint64_mem:16472},
+  {pattern:"sequential",N:759,kntrie_int32_find:0.0072,kntrie_int32_insert:0.0471,kntrie_int32_erase:0.0204,kntrie_int32_mem:12296,kntrie_uint64_find:0.0068,kntrie_uint64_insert:0.0494,kntrie_uint64_erase:0.0235,kntrie_uint64_mem:16392,map_int32_find:0.0419,map_int32_insert:0.0868,map_int32_erase:0.0427,map_int32_mem:36432,map_uint64_find:0.0370,map_uint64_insert:0.0846,map_uint64_erase:0.0467,map_uint64_mem:36432,umap_int32_find:0.0023,umap_int32_insert:0.0155,umap_int32_erase:0.0047,umap_int32_mem:24304,umap_uint64_find:0.0024,umap_uint64_insert:0.0152,umap_uint64_erase:0.0049,umap_uint64_mem:24304},
+  {pattern:"sequential",N:1139,kntrie_int32_find:0.0123,kntrie_int32_insert:0.0843,kntrie_int32_erase:0.0196,kntrie_int32_mem:24584,kntrie_uint64_find:0.0119,kntrie_uint64_insert:0.0881,kntrie_uint64_erase:0.0270,kntrie_uint64_mem:32776,map_int32_find:0.0685,map_int32_insert:0.1230,map_int32_erase:0.0585,map_int32_mem:54672,map_uint64_find:0.0652,map_uint64_insert:0.1245,map_uint64_erase:0.0692,map_uint64_mem:54672,umap_int32_find:0.0035,umap_int32_insert:0.0213,umap_int32_erase:0.0064,umap_int32_mem:36880,umap_uint64_find:0.0035,umap_uint64_insert:0.0223,umap_uint64_erase:0.0072,umap_uint64_mem:36880},
+  {pattern:"sequential",N:1708,kntrie_int32_find:0.0184,kntrie_int32_insert:0.1104,kntrie_int32_erase:0.0362,kntrie_int32_mem:24584,kntrie_uint64_find:0.0179,kntrie_uint64_insert:0.1082,kntrie_uint64_erase:0.0453,kntrie_uint64_mem:32776,map_int32_find:0.1125,map_int32_insert:0.1881,map_int32_erase:0.0923,map_int32_mem:81984,map_uint64_find:0.1120,map_uint64_insert:0.1998,map_uint64_erase:0.1055,map_uint64_mem:81984,umap_int32_find:0.0052,umap_int32_insert:0.0312,umap_int32_erase:0.0101,umap_int32_mem:54920,umap_uint64_find:0.0052,umap_uint64_insert:0.0308,umap_uint64_erase:0.0106,umap_uint64_mem:54920},
+  {pattern:"sequential",N:2562,kntrie_int32_find:0.0326,kntrie_int32_insert:0.1718,kntrie_int32_erase:0.0520,kntrie_int32_mem:49160,kntrie_uint64_find:0.0333,kntrie_uint64_insert:0.1784,kntrie_uint64_erase:0.0716,kntrie_uint64_mem:65544,map_int32_find:0.1858,map_int32_insert:0.2988,map_int32_erase:0.1478,map_int32_mem:122976,map_uint64_find:0.1849,map_uint64_insert:0.3001,map_uint64_erase:0.1578,map_uint64_mem:122976,umap_int32_find:0.0082,umap_int32_insert:0.0455,umap_int32_erase:0.0158,umap_int32_mem:83512,umap_uint64_find:0.0079,umap_uint64_insert:0.0433,umap_uint64_erase:0.0154,umap_uint64_mem:83512},
+  {pattern:"sequential",N:3844,kntrie_int32_find:0.0486,kntrie_int32_insert:0.2591,kntrie_int32_erase:0.0819,kntrie_int32_mem:49160,kntrie_uint64_find:0.0489,kntrie_uint64_insert:0.2625,kntrie_uint64_erase:0.1090,kntrie_uint64_mem:65544,map_int32_find:0.3042,map_int32_insert:0.4561,map_int32_erase:0.2499,map_int32_mem:184512,map_uint64_find:0.2976,map_uint64_insert:0.4668,map_uint64_erase:0.2455,map_uint64_mem:184512,umap_int32_find:0.0119,umap_int32_insert:0.0633,umap_int32_erase:0.0252,umap_int32_mem:124472,umap_uint64_find:0.0123,umap_uint64_insert:0.0640,umap_uint64_erase:0.0259,umap_uint64_mem:124472},
+  {pattern:"sequential",N:5766,kntrie_int32_find:0.0771,kntrie_int32_insert:0.4875,kntrie_int32_erase:0.1358,kntrie_int32_mem:69888,kntrie_uint64_find:0.1913,kntrie_uint64_insert:0.5393,kntrie_uint64_erase:0.1539,kntrie_uint64_mem:70272,map_int32_find:0.5040,map_int32_insert:0.7180,map_int32_erase:0.3825,map_int32_mem:276768,map_uint64_find:0.5003,map_uint64_insert:0.7512,map_uint64_erase:0.3973,map_uint64_mem:276768,umap_int32_find:0.0181,umap_int32_insert:0.0933,umap_int32_erase:0.0378,umap_int32_mem:186008,umap_uint64_find:0.0192,umap_uint64_insert:0.0957,umap_uint64_erase:0.0382,umap_uint64_mem:186008},
+  {pattern:"sequential",N:8649,kntrie_int32_find:0.1163,kntrie_int32_insert:0.5620,kntrie_int32_erase:0.1698,kntrie_int32_mem:104464,kntrie_uint64_find:0.2862,kntrie_uint64_insert:0.5913,kntrie_uint64_erase:0.1990,kntrie_uint64_mem:104736,map_int32_find:0.8442,map_int32_insert:1.1488,map_int32_erase:0.6367,map_int32_mem:415152,map_uint64_find:0.8657,map_uint64_insert:1.1567,map_uint64_erase:0.6471,map_uint64_mem:415152,umap_int32_find:0.0269,umap_int32_insert:0.1345,umap_int32_erase:0.0717,umap_int32_mem:277840,umap_uint64_find:0.0290,umap_uint64_insert:0.1395,umap_uint64_erase:0.0594,umap_uint64_mem:277840},
+  {pattern:"sequential",N:12974,kntrie_int32_find:0.1689,kntrie_int32_insert:0.7613,kntrie_int32_erase:0.2724,kntrie_int32_mem:156736,kntrie_uint64_find:0.4252,kntrie_uint64_insert:0.7878,kntrie_uint64_erase:0.2886,kntrie_uint64_mem:156736,map_int32_find:1.4354,map_int32_insert:1.8387,map_int32_erase:1.0231,map_int32_mem:622752,map_uint64_find:1.3831,map_uint64_insert:1.8661,map_uint64_erase:1.0303,map_uint64_mem:622752,umap_int32_find:0.0395,umap_int32_insert:0.1934,umap_int32_erase:0.0911,umap_int32_mem:415240,umap_uint64_find:0.0395,umap_uint64_insert:0.1930,umap_uint64_erase:0.0882,umap_uint64_mem:415240},
+  {pattern:"sequential",N:19461,kntrie_int32_find:0.2667,kntrie_int32_insert:1.0990,kntrie_int32_erase:0.4172,kntrie_int32_mem:235568,kntrie_uint64_find:0.6481,kntrie_uint64_insert:1.0877,kntrie_uint64_erase:0.4620,kntrie_uint64_mem:235808,map_int32_find:2.5529,map_int32_insert:2.9980,map_int32_erase:1.7580,map_int32_mem:934128,map_uint64_find:2.3412,map_uint64_insert:2.9642,map_uint64_erase:1.7086,map_uint64_mem:934128,umap_int32_find:0.0597,umap_int32_insert:0.2868,umap_int32_erase:0.1388,umap_int32_mem:633088,umap_uint64_find:0.0612,umap_uint64_insert:0.2978,umap_uint64_erase:0.1383,umap_uint64_mem:633088},
+  {pattern:"sequential",N:29192,kntrie_int32_find:0.4230,kntrie_int32_insert:1.5778,kntrie_int32_erase:0.6633,kntrie_int32_mem:353696,kntrie_uint64_find:1.0066,kntrie_uint64_insert:1.5956,kntrie_uint64_erase:0.7148,kntrie_uint64_mem:353696,map_int32_find:4.4313,map_int32_insert:4.8595,map_int32_erase:2.8756,map_int32_mem:1401216,map_uint64_find:4.7111,map_uint64_insert:5.0547,map_uint64_erase:3.2302,map_uint64_mem:1401216,umap_int32_find:0.0978,umap_int32_insert:0.4300,umap_int32_erase:0.2275,umap_int32_mem:946424,umap_uint64_find:0.1092,umap_uint64_insert:0.4626,umap_uint64_erase:0.2198,umap_uint64_mem:946424},
+  {pattern:"sequential",N:43789,kntrie_int32_find:0.6461,kntrie_int32_insert:2.2765,kntrie_int32_erase:0.9993,kntrie_int32_mem:529808,kntrie_uint64_find:1.5472,kntrie_uint64_insert:2.4007,kntrie_uint64_erase:1.1312,kntrie_uint64_mem:530304,map_int32_find:8.6842,map_int32_insert:8.0838,map_int32_erase:5.3210,map_int32_mem:2101872,map_uint64_find:9.1369,map_uint64_insert:8.2671,map_uint64_erase:5.8086,map_uint64_mem:2101872,umap_int32_find:0.2244,umap_int32_insert:0.6402,umap_int32_erase:0.4403,umap_int32_mem:1414784,umap_uint64_find:0.2644,umap_uint64_insert:0.6553,umap_uint64_erase:0.5038,umap_uint64_mem:1414784},
+  {pattern:"sequential",N:65684,kntrie_int32_find:1.0444,kntrie_int32_insert:3.9695,kntrie_int32_erase:1.8896,kntrie_int32_mem:796296,kntrie_uint64_find:2.3647,kntrie_uint64_insert:3.9658,kntrie_uint64_erase:2.0037,kntrie_uint64_mem:796584,map_int32_find:17.8342,map_int32_insert:15.5391,map_int32_erase:9.6634,map_int32_mem:3152832,map_uint64_find:18.1155,map_uint64_insert:15.4777,map_uint64_erase:10.7476,map_uint64_mem:3152832,umap_int32_find:0.5610,umap_int32_insert:1.1124,umap_int32_erase:1.1245,umap_int32_mem:2114872,umap_uint64_find:0.6100,umap_uint64_insert:1.0503,umap_uint64_erase:1.0704,umap_uint64_mem:2114872},
+  {pattern:"sequential",N:98526,kntrie_int32_find:1.5879,kntrie_int32_insert:6.0469,kntrie_int32_erase:2.9543,kntrie_int32_mem:1192592,kntrie_uint64_find:3.6843,kntrie_uint64_insert:6.5439,kntrie_uint64_erase:3.2451,kntrie_uint64_mem:1192880,map_int32_find:32.2018,map_int32_insert:26.4634,map_int32_erase:17.7809,map_int32_mem:4729248,map_uint64_find:37.0744,map_uint64_insert:27.4407,map_uint64_erase:21.1401,map_uint64_mem:4729248,umap_int32_find:1.0683,umap_int32_insert:1.7724,umap_int32_erase:2.1288,umap_int32_mem:3162488,umap_uint64_find:1.2658,umap_uint64_insert:2.0678,umap_uint64_erase:2.2553,umap_uint64_mem:3162488},
+];
+
+
+const LINES = [
+  { key: "kntrie_int32", color: "#3b82f6", dash: [], width: 2.5, label: "kntrie i32" },
+  { key: "kntrie_uint64", color: "#93c5fd", dash: [6,3], width: 1.5, label: "kntrie u64" },
+  { key: "map_int32", color: "#ef4444", dash: [], width: 2.5, label: "map i32" },
+  { key: "map_uint64", color: "#fca5a5", dash: [6,3], width: 1.5, label: "map u64" },
+  { key: "umap_int32", color: "#22c55e", dash: [], width: 2.5, label: "umap i32" },
+  { key: "umap_uint64", color: "#86efac", dash: [6,3], width: 1.5, label: "umap u64" },
+];
+
+const MEM_LINES = [
+  ...LINES,
+  { key: "raw_int32", color: "#888", dash: [], width: 1, label: "raw i32" },
+  { key: "raw_uint64", color: "#555", dash: [3,3], width: 1, label: "raw u64" },
+];
+
+const METRICS = [
+  { id: "find", suffix: "find", convert: (ms, n) => (ms * 1e6) / n },
+  { id: "insert", suffix: "insert", convert: (ms, n) => (ms * 1e6) / n },
+  { id: "erase", suffix: "erase", convert: (ms, n) => (ms * 1e6) / (n / 2) },
+  { id: "mem", suffix: "mem", convert: (b, n) => b / n },
+];
+
+function buildData(pattern, metric) {
+  const lines = metric.id === "mem" ? MEM_LINES : LINES;
+  return RAW_DATA
+    .filter(r => r.pattern === pattern)
+    .map(r => {
+      const pt = { N: r.N };
+      for (const l of lines) {
+        if (l.key === "raw_int32") { pt[l.key] = 12; continue; }
+        if (l.key === "raw_uint64") { pt[l.key] = 16; continue; }
+        const raw = r[l.key + "_" + metric.suffix];
+        if (raw != null) pt[l.key] = metric.convert(raw, r.N);
+      }
+      return pt;
+    });
+}
+
+const charts = {};
+
+function makeChart(canvasId, metric) {
+  const ctx = document.getElementById(canvasId).getContext("2d");
+  const lines = metric.id === "mem" ? MEM_LINES : LINES;
+  const data = buildData("random", metric);
+
+  charts[canvasId] = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: data.map(d => d.N),
+      datasets: lines.map(l => ({
+        label: l.label,
+        data: data.map(d => d[l.key] ?? null),
+        borderColor: l.color,
+        backgroundColor: l.color + "33",
+        borderWidth: l.width,
+        borderDash: l.dash,
+        pointRadius: 0,
+        pointHitRadius: 8,
+        tension: 0.2,
+        spanGaps: true,
+      })),
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: true, labels: { color: "#bbb", font: { size: 11 }, boxWidth: 20, padding: 10 } },
+        tooltip: {
+          backgroundColor: "#1a1a2e",
+          borderColor: "#444",
+          borderWidth: 1,
+          titleColor: "#aaa",
+          bodyColor: "#ddd",
+          callbacks: {
+            title: (items) => {
+              const v = items[0].parsed.x;
+              if (v >= 1e6) return "N = " + (v/1e6).toFixed(1) + "M";
+              if (v >= 1e3) return "N = " + (v/1e3).toFixed(1) + "K";
+              return "N = " + v;
+            },
+            label: (item) => {
+              const v = item.parsed.y;
+              if (v == null) return null;
+              const s = v < 0.1 ? v.toFixed(3) : v < 10 ? v.toFixed(2) : v < 1000 ? v.toFixed(1) : v.toFixed(0);
+              return " " + item.dataset.label + ": " + s;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: "logarithmic",
+          title: { display: false },
+          ticks: { color: "#888", font: { size: 11 },
+            callback: (v) => v >= 1e6 ? (v/1e6)+"M" : v >= 1e3 ? (v/1e3)+"K" : v },
+          grid: { color: "#2a2a3e" },
+        },
+        y: {
+          type: "logarithmic",
+          ticks: { color: "#888", font: { size: 10 },
+            callback: (v) => v < 0.1 ? v.toFixed(2) : v < 10 ? v.toFixed(1) : v >= 1000 ? v.toFixed(0) : v.toFixed(1) },
+          grid: { color: "#2a2a3e" },
+        },
+      },
+    },
+  });
+  charts[canvasId]._metric = metric;
+}
+
+METRICS.forEach(m => makeChart("c_" + m.id, m));
+
+function show(pattern) {
+  document.querySelectorAll(".btns button").forEach(b => b.classList.remove("active"));
+  event.target.classList.add("active");
+  for (const [id, chart] of Object.entries(charts)) {
+    const m = chart._metric;
+    const lines = m.id === "mem" ? MEM_LINES : LINES;
+    const data = buildData(pattern, m);
+    chart.data.labels = data.map(d => d.N);
+    lines.forEach((l, i) => {
+      chart.data.datasets[i].data = data.map(d => d[l.key] ?? null);
+    });
+    chart.update("none");
+  }
+}
+</script>
+</body>
+</html>

@@ -301,6 +301,7 @@ private:
             if constexpr (!INSERT) return {tag_bitmask(node), false, false};
             auto* leaf = make_single_leaf_(static_cast<IK>(ik << 8), value, bits - 8);
             auto* nn = BO::add_child(node, hdr, ti, tag_leaf(leaf), alloc_);
+            inc_descendants_(get_header(nn));
             return {tag_bitmask(nn), true, false};
         }
 
@@ -309,6 +310,7 @@ private:
             lk.child, static_cast<IK>(ik << 8), value, bits - 8);
         if (cr.tagged_ptr != lk.child)
             BO::set_child(node, lk.slot, cr.tagged_ptr);
+        if (cr.inserted) inc_descendants_(hdr);
         return {tag_bitmask(node), cr.inserted, false};
     }
 
@@ -379,6 +381,7 @@ private:
             if constexpr (!INSERT) return {tag_bitmask(node), false, false};
             auto* leaf = make_single_leaf_(static_cast<IK>(ik << 8), value, bits - 8);
             auto* nn = add_child_to_chain_(node, hdr, sc, ti, tag_leaf(leaf));
+            inc_descendants_(get_header(nn));
             return {tag_bitmask(nn), true, false};
         }
 
@@ -389,6 +392,7 @@ private:
             old_child, static_cast<IK>(ik << 8), value, bits - 8);
         if (cr.tagged_ptr != old_child)
             real_ch[slot] = cr.tagged_ptr;
+        if (cr.inserted) inc_descendants_(hdr);
         return {tag_bitmask(node), cr.inserted, false};
     }
 
@@ -486,6 +490,8 @@ private:
             bi[1] = expected;    cp[1] = new_leaf_tagged;
         }
         auto* split_node = BO::make_bitmask(bi, cp, 2, alloc_);
+        get_header(split_node)->set_descendants(
+            sum_tagged_array_(cp, 2));
 
         // Wrap in skip chain for prefix bytes [0..split_pos-1]
         uint64_t result;
@@ -534,6 +540,8 @@ private:
         if (rem_skip == 0) {
             // Just the final bitmask — create standalone
             auto* bm_node = BO::make_bitmask(indices, children, final_nc, alloc_);
+            get_header(bm_node)->set_descendants(
+                sum_tagged_array_(children, final_nc));
             return tag_bitmask(bm_node);
         }
 
@@ -546,6 +554,8 @@ private:
 
         auto* chain = BO::make_skip_chain(
             skip_bytes, rem_skip, indices, children, final_nc, alloc_);
+        get_header(chain)->set_descendants(
+            sum_tagged_array_(children, final_nc));
         return tag_bitmask(chain);
     }
 
@@ -601,19 +611,13 @@ private:
         if (!cr.erased) return {tag_bitmask(node), false, 0};
 
         if (cr.tagged_ptr) {
-            // Child survived
+            // Child survived — update pointer, decrement descendants
             if (cr.tagged_ptr != lk.child)
                 BO::set_child(node, lk.slot, cr.tagged_ptr);
-
-            // Check coalesce: child_entries + siblings
-            uint16_t child_ent = cr.subtree_entries;
-            if (child_ent > COMPACT_MAX)
-                return {tag_bitmask(node), true, COALESCE_CAP};
-            uint16_t siblings = count_children_capped_(node, 0, lk.slot);
-            uint32_t total = uint32_t(child_ent) + siblings;
-            if (total > COMPACT_MAX)
-                return {tag_bitmask(node), true, COALESCE_CAP};
-            return do_coalesce_(node, hdr, bits, static_cast<uint16_t>(total));
+            uint16_t desc = dec_or_recompute_desc_(node, 0);
+            if (desc <= COMPACT_MAX)
+                return do_coalesce_(node, hdr, bits, desc);
+            return {tag_bitmask(node), true, desc};
         }
 
         // Child fully erased — remove from bitmask
@@ -628,7 +632,7 @@ private:
                 sole_child = tagged;
                 sole_idx = idx;
             });
-            uint16_t sole_ent = count_subtree_capped_(sole_child);
+            uint16_t sole_ent = tagged_count_(sole_child);
             if (sole_child & LEAF_BIT) {
                 uint64_t* leaf = untag_leaf_mut(sole_child);
                 uint8_t byte_arr[1] = {sole_idx};
@@ -644,18 +648,17 @@ private:
             return {wrap_bitmask_chain_(child_node, byte_arr, 1), true, sole_ent};
         }
 
-        // Multi-child: check coalesce on remaining
-        uint16_t remaining = count_children_capped_(nn, 0);
-        if (remaining <= COMPACT_MAX)
-            return do_coalesce_(nn, get_header(nn), bits, remaining);
-        return {tag_bitmask(nn), true, remaining};
+        // Multi-child: decrement descendants, check coalesce
+        uint16_t desc = dec_or_recompute_desc_(nn, 0);
+        if (desc <= COMPACT_MAX)
+            return do_coalesce_(nn, get_header(nn), bits, desc);
+        return {tag_bitmask(nn), true, desc};
     }
 
     // ==================================================================
     // erase_skip_chain_: walk embedded bo<1> nodes, erase from final
     //
-    // TODO: finish walk-up coalesce (replace maybe_coalesce_ calls)
-    // Currently won't compile due to maybe_coalesce_ references.
+    // Uses stored descendants for O(1) coalesce check.
     // ==================================================================
 
     erase_result_t erase_skip_chain_(uint64_t* node, node_header* hdr,
@@ -685,17 +688,12 @@ private:
         if (!cr.erased) return {tag_bitmask(node), false, 0};
 
         if (cr.tagged_ptr) {
-            // Child survived — check coalesce using walk-up entries
+            // Child survived — update pointer, decrement descendants
             if (cr.tagged_ptr != old_child) real_ch[slot] = cr.tagged_ptr;
-
-            uint16_t child_ent = cr.subtree_entries;
-            if (child_ent > COMPACT_MAX)
-                return {tag_bitmask(node), true, COALESCE_CAP};
-            uint16_t siblings = count_children_capped_(node, sc, slot);
-            uint32_t total = uint32_t(child_ent) + siblings;
-            if (total > COMPACT_MAX)
-                return {tag_bitmask(node), true, COALESCE_CAP};
-            return do_coalesce_(node, hdr, orig_bits, static_cast<uint16_t>(total));
+            uint16_t desc = dec_or_recompute_desc_(node, sc);
+            if (desc <= COMPACT_MAX)
+                return do_coalesce_(node, hdr, orig_bits, desc);
+            return {tag_bitmask(node), true, desc};
         }
 
         // Child erased — remove from final bitmask
@@ -762,7 +760,7 @@ private:
             uint8_t total_skip = sc + 1;
 
             size_t node_au64 = hdr->alloc_u64();
-            uint16_t sole_ent = count_subtree_capped_(sole_child);
+            uint16_t sole_ent = tagged_count_(sole_child);
 
             if (sole_child & LEAF_BIT) {
                 uint64_t* leaf = untag_leaf_mut(sole_child);
@@ -776,11 +774,11 @@ private:
             return {wrap_bitmask_chain_(child_node, all_bytes, total_skip), true, sole_ent};
         }
 
-        // Multi-child: check coalesce on remaining
-        uint16_t remaining = count_children_capped_(node, sc);
-        if (remaining <= COMPACT_MAX)
-            return do_coalesce_(node, hdr, orig_bits, remaining);
-        return {tag_bitmask(node), true, remaining};
+        // Multi-child: decrement descendants, check coalesce
+        uint16_t desc = dec_or_recompute_desc_(node, sc);
+        if (desc <= COMPACT_MAX)
+            return do_coalesce_(node, hdr, orig_bits, desc);
+        return {tag_bitmask(node), true, desc};
     }
 
     // ==================================================================
@@ -814,8 +812,7 @@ private:
     // ==================================================================
     // Coalesce: collapse bitmask subtree back into compact leaf
     //
-    // count_subtree_capped_: count entries, early exit > COMPACT_MAX
-    // count_children_capped_: sum children entries, skip one slot
+    // Descendant tracking via stored counts makes coalesce O(1) check.
     // do_coalesce_: rebuild as leaf (caller already verified total <= COMPACT_MAX)
     // collect_entries_tagged_: gather (suffix_u64, value_slot) pairs
     // dealloc_bitmask_subtree_: free bitmask nodes (NOT leaf values)
@@ -823,40 +820,73 @@ private:
 
     static constexpr uint16_t COALESCE_CAP = static_cast<uint16_t>(COMPACT_MAX + 1);
 
-    uint16_t count_subtree_capped_(uint64_t tagged) const noexcept {
-        if (tagged & LEAF_BIT) {
-            const uint64_t* node = untag_leaf(tagged);
-            return get_header(node)->entries();
-        }
-        const uint64_t* node = bm_to_node_const(tagged);
-        auto* hdr = get_header(node);
-        uint8_t sc = hdr->skip();
+    // ------------------------------------------------------------------
+    // Descendant tracking helpers
+    //
+    // Bitmask nodes store total descendant count in total_slots_ field
+    // (unused by bitmask). Saturates at DESC_SATURATED (0xFFFF).
+    // Leaf nodes: use entries() instead.
+    // ------------------------------------------------------------------
+
+    // Get descendant count from any tagged pointer
+    static uint16_t tagged_count_(uint64_t tagged) noexcept {
+        if (tagged & LEAF_BIT)
+            return get_header(untag_leaf(tagged))->entries();
+        return get_header(bm_to_node_const(tagged))->descendants();
+    }
+
+    // Sum immediate children's counts (saturating). O(num_children).
+    static uint16_t sum_children_desc_(const uint64_t* node, uint8_t sc) noexcept {
         size_t fo = 1 + static_cast<size_t>(sc) * 6;
         const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + fo);
         const uint64_t* rch = node + fo + 5;
         uint32_t total = 0;
         int slot = 0;
         for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1)) {
-            total += count_subtree_capped_(rch[slot++]);
-            if (total > COMPACT_MAX) return COALESCE_CAP;
+            uint16_t c = tagged_count_(rch[slot++]);
+            if (c == DESC_SATURATED) return DESC_SATURATED;
+            total += c;
+            if (total >= DESC_SATURATED) return DESC_SATURATED;
         }
         return static_cast<uint16_t>(total);
     }
 
-    // Sum entries of all children except exclude_slot (-1 to count all).
-    // Early exit when sum > COMPACT_MAX.
-    uint16_t count_children_capped_(const uint64_t* node, uint8_t sc,
-                                      int exclude_slot = -1) const noexcept {
-        size_t fo = 1 + static_cast<size_t>(sc) * 6;
-        const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + fo);
-        const uint64_t* rch = node + fo + 5;
+    // Set descendants from known count (saturating)
+    static void set_desc_saturating_(uint64_t* node, size_t count) noexcept {
+        get_header(node)->set_descendants(
+            count >= DESC_SATURATED ? DESC_SATURATED : static_cast<uint16_t>(count));
+    }
+
+    // Saturating increment (for insert path)
+    static void inc_descendants_(node_header* h) noexcept {
+        uint16_t d = h->descendants();
+        if (d < DESC_SATURATED) h->set_descendants(d + 1);
+    }
+
+    // Decrement or recompute if saturated. Returns new count.
+    // Node's children must reflect post-operation state before calling.
+    static uint16_t dec_or_recompute_desc_(uint64_t* node, uint8_t sc) noexcept {
+        auto* h = get_header(node);
+        uint16_t d = h->descendants();
+        if (d != DESC_SATURATED) {
+            --d;
+            h->set_descendants(d);
+            return d;
+        }
+        // Saturated: recompute from immediate children
+        d = sum_children_desc_(node, sc);
+        h->set_descendants(d);
+        return d;
+    }
+
+    // Sum tagged children array (for build paths)
+    static uint16_t sum_tagged_array_(const uint64_t* children, unsigned nc) noexcept {
         uint32_t total = 0;
-        int slot = 0;
-        for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1)) {
-            if (slot != exclude_slot)
-                total += count_subtree_capped_(rch[slot]);
-            slot++;
-            if (total > COMPACT_MAX) return COALESCE_CAP;
+        for (unsigned i = 0; i < nc; ++i) {
+            uint16_t c = tagged_count_(children[i]);
+            if (c == DESC_SATURATED) return DESC_SATURATED;
+            total += c;
+            if (total >= DESC_SATURATED) return DESC_SATURATED;
         }
         return static_cast<uint16_t>(total);
     }
@@ -1100,6 +1130,7 @@ private:
         }
 
         auto* chain = BO::make_skip_chain(all_bytes, total_skip, indices, children, nc, alloc_);
+        get_header(chain)->set_descendants(ch->descendants());
         dealloc_node(alloc_, child, ch->alloc_u64());
         return tag_bitmask(chain);
     }
@@ -1317,6 +1348,7 @@ private:
         }
 
         auto* node = BO::make_bitmask(indices, child_tagged, n_children, alloc_);
+        set_desc_saturating_(node, count);
         return tag_bitmask(node);
     }
 
@@ -1377,6 +1409,8 @@ private:
         }
 
         auto* bm_node = BO::make_bitmask(bi, cp, 2, alloc_);
+        get_header(bm_node)->set_descendants(
+            sum_tagged_array_(cp, 2));
         if (common > 0)
             return wrap_bitmask_chain_(bm_node, saved_prefix, common);
         return tag_bitmask(bm_node);
