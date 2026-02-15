@@ -226,7 +226,7 @@ struct compact_ops {
 
         const K* base = adaptive_search<K>::find_base(
             kd, ts, suffix);
-        if (*base != suffix) return {tag_leaf(node), false};
+        if (*base != suffix) return {tag_leaf(node), false, 0};
         unsigned idx = static_cast<unsigned>(base - kd);
 
         unsigned nc = entries - 1;
@@ -236,7 +236,7 @@ struct compact_ops {
             if constexpr (!VT::IS_INLINE)
                 VT::destroy(vd[idx], alloc);
             dealloc_node(alloc, node, h->alloc_u64());
-            return {0, true};
+            return {0, true, 0};
         }
 
         // Shrink check: if entries-1 fits in half the slots, realloc
@@ -259,13 +259,13 @@ struct compact_ops {
             seed_from_real_(nn, tmp_k.get(), tmp_v.get(), nc, new_ts, hs);
 
             dealloc_node(alloc, node, h->alloc_u64());
-            return {tag_leaf(nn), true};
+            return {tag_leaf(nn), true, static_cast<uint16_t>(nc)};
         }
 
         // In-place: convert erased entry's run to neighbor dups
         erase_create_dup_(kd, vd, ts, idx, suffix, alloc);
         h->set_entries(nc);
-        return {tag_leaf(node), true};
+        return {tag_leaf(node), true, static_cast<uint16_t>(nc)};
     }
 
 private:

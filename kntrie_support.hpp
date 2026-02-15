@@ -291,6 +291,7 @@ struct insert_result_t {
 struct erase_result_t {
     uint64_t tagged_ptr;    // tagged pointer, or 0 if fully erased
     bool erased;
+    uint16_t subtree_entries;  // remaining entries in subtree (capped at COMPACT_MAX+1)
 };
 
 } // namespace gteitelbaum

@@ -464,7 +464,7 @@ struct bitmask_ops {
         auto* h = get_header(node);
         size_t hs = hdr_u64(node);
         bitmap256& bm = bm_mut_(node, hs);
-        if (!bm.has_bit(suffix)) return {tag_leaf(node), false};
+        if (!bm.has_bit(suffix)) return {tag_leaf(node), false, 0};
 
         unsigned count = h->entries();
         int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
@@ -473,7 +473,7 @@ struct bitmask_ops {
         unsigned nc = count - 1;
         if (nc == 0) {
             dealloc_node(alloc, node, h->alloc_u64());
-            return {0, true};
+            return {0, true, 0};
         }
 
         size_t new_sz = bitmap_leaf_size_u64(nc, hs);
@@ -484,7 +484,7 @@ struct bitmask_ops {
             bm.clear_bit(suffix);
             std::memmove(vd + slot, vd + slot + 1, (nc - slot) * sizeof(VST));
             h->set_entries(nc);
-            return {tag_leaf(node), true};
+            return {tag_leaf(node), true, static_cast<uint16_t>(nc)};
         }
 
         // Realloc
@@ -503,7 +503,7 @@ struct bitmask_ops {
         std::memcpy(nv + slot, ov + slot + 1, (nc - slot) * sizeof(VST));
 
         dealloc_node(alloc, node, h->alloc_u64());
-        return {tag_leaf(nn), true};
+        return {tag_leaf(nn), true, static_cast<uint16_t>(nc)};
     }
 
     // ==================================================================
