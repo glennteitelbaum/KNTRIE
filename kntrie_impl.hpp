@@ -66,28 +66,23 @@ public:
         node_header hdr = *get_header(node);
 
         while (true) {
-            // Skip / prefix check (u8 chunks)
-            {
-                if (hdr.is_skip()) [[unlikely]] {
-                    uint8_t skip = reinterpret_cast<const uint8_t*>(&node[1])[7];
-                    const uint8_t* actual = reinterpret_cast<const uint8_t*>(&node[1]);
-                    for (uint8_t i = 0; i < skip; ++i) {
-                        uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-                        if (expected != actual[i]) [[unlikely]] return nullptr;
-                        ik = static_cast<IK>(ik << 8);
-                    }
-                }
+            if (hdr.is_skip()) [[unlikely]] {
+                const uint8_t* actual = reinterpret_cast<const uint8_t*>(&node[1]);
+                uint8_t skip = actual[7];
+                uint8_t i = 0;
+                do {
+                    if (static_cast<uint8_t>(ik >> (IK_BITS - 8)) != actual[i]) [[unlikely]]
+                        return nullptr;
+                    ik <<= 8;
+                } while (++i < skip);
             }
 
             if (hdr.is_leaf()) [[unlikely]] break;
 
-            // Bitmask node: extract next byte, branchless descend
-            {
-                uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-                ik = static_cast<IK>(ik << 8);
-                node = BO::branchless_child(node, ti);
-                hdr = *get_header(node);
-            }
+            uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+            ik <<= 8;
+            node = BO::branchless_child(node, ti);
+            hdr = *get_header(node);
         }
 
         // Leaf dispatch by suffix_type
