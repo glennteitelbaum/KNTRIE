@@ -106,7 +106,16 @@ static Row bench_kntrie(Workload<KEY>& w, size_t n, int fi,
                         const char* key_type, const std::string& pattern,
                         std::mt19937_64& rng) {
     double best_fnd = 1e18, best_ins = 1e18, best_ers = 1e18;
-    size_t mem = 0;
+
+    // Memory: one tracked run with counting allocator
+    size_t mem;
+    {
+        using TrieT = gteitelbaum::kntrie<KEY, uint64_t, TrackingAlloc<uint64_t>>;
+        g_alloc_total = 0;
+        TrieT trie;
+        for (auto k : w.keys) trie.insert(k, static_cast<uint64_t>(k));
+        mem = g_alloc_total;
+    }
 
     // Pre-generate shuffled find orders
     std::vector<std::vector<KEY>> find_orders(fi);
@@ -115,13 +124,13 @@ static Row bench_kntrie(Workload<KEY>& w, size_t n, int fi,
         std::shuffle(find_orders[r].begin(), find_orders[r].end(), rng);
     }
 
+    // Speed trials with default allocator
     for (int t = 0; t < TRIALS; ++t) {
         std::shuffle(w.keys.begin(), w.keys.end(), rng);
         gteitelbaum::kntrie<KEY, uint64_t> trie;
         double t0 = now_ms();
         for (auto k : w.keys) trie.insert(k, static_cast<uint64_t>(k));
         best_ins = std::min(best_ins, now_ms() - t0);
-        if (t == 0) mem = trie.memory_usage();
 
         uint64_t cs = 0;
         double t1 = now_ms();
@@ -488,7 +497,7 @@ function show(pattern) {
 
 int main() {
     std::vector<size_t> sizes;
-    constexpr double MAX_N = 6000000;  // change to 10000 for quick test
+    constexpr double MAX_N = 3000000;  // change to 10000 for quick test
     for (double n = 100; n < MAX_N; n *= 1.5)
         sizes.push_back(static_cast<size_t>(n));
 
