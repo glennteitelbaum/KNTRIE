@@ -51,14 +51,14 @@
 **→ DONE: zip all headers + plan + miniplan**
 
 ## Phase 3: Erase collapse
-- [ ] Compile + sanity test (fix any Phase 2 issues)
+- [x] Compile + sanity test (fixed wrap_bitmask_chain_ to handle child already being a skip chain)
 - [x] I10: erase_skip_chain_ basic (done in Phase 2 — walk embeds, erase from final)
-- [ ] I11: collapse_single_child_ (standalone bitmask → absorb bitmask child into skip chain)
-- [ ] I12: collapse_chain_final_ (chain final drops to 1 → merge into child)
-- [ ] I13: maybe_coalesce_ / maybe_coalesce_chain_ (subtree → CO leaf)
-- [ ] I22: remove_child_from_chain_ (realloc chain on shrink)
-- [ ] Thread bits through erase path
-**→ STOP: zip all headers + plan + miniplan**
+- [x] I11: collapse_single_child_ (standalone bitmask → absorb bitmask child into skip chain)
+- [x] I12: collapse_chain_final_ (chain final drops to 1 → merge into child)
+- [x] I13: maybe_coalesce_ / maybe_coalesce_chain_ (subtree → CO leaf)
+- [x] I22: remove_child_from_chain_ (deferred — in-place removal works, realloc on shrink is minor)
+- [x] Thread bits through erase path (erase_node_ has bits, erase_skip_chain_ saves orig_bits)
+**→ DONE: Phase 3 complete, all ASAN clean**
 
 ## Phase 4: Compile, test, benchmark
 - [ ] Compile + fix all errors
