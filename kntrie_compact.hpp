@@ -21,10 +21,9 @@ struct adaptive_search {
     // Pure cmov loop — returns pointer to candidate.
     // Caller checks *result == key.
     // count must be power of 2 or 3/4 midpoint (P/2 + P/4).
-    static const K* find_base(const K* keys, int count, K key) noexcept {
-        const K* base = keys;
-        int step = count >> 1;
-        if (!std::has_single_bit(static_cast<unsigned>(count))) {
+    static const K* find_base(const K* base, unsigned count, K key) noexcept {
+        unsigned step = count >> 1;
+        if (!std::has_single_bit(count)) {
             step = count / 3;
             base = (base[step] <= key) ? base + step : base;
         }
@@ -88,7 +87,7 @@ struct compact_ops {
         uint16_t entries = h.entries();
         uint16_t ts = slots_for(entries);
         const K* keys = keys_(node);
-        const K* base = adaptive_search<K>::find_base(keys, static_cast<int>(ts), suffix);
+        const K* base = adaptive_search<K>::find_base(keys, ts, suffix);
         if (*base != suffix) [[unlikely]] return nullptr;
         return VT::as_ptr(vals_(node, ts)[base - keys]);
     }
@@ -172,7 +171,7 @@ struct compact_ops {
         VST* vd = vals_mut_(node, ts);
 
         const K* base = adaptive_search<K>::find_base(
-            kd, static_cast<int>(ts), suffix);
+            kd, ts, suffix);
 
         // Key exists
         if (*base == suffix) {
@@ -234,7 +233,7 @@ struct compact_ops {
         VST* vd = vals_mut_(node, ts);
 
         const K* base = adaptive_search<K>::find_base(
-            kd, static_cast<int>(ts), suffix);
+            kd, ts, suffix);
         if (*base != suffix) return {node, false};
         int idx = static_cast<int>(base - kd);
 
