@@ -300,7 +300,7 @@ private:
         if (!lk.found) {
             if constexpr (!INSERT) return {tag_bitmask(node), false, false};
             auto* leaf = make_single_leaf_(static_cast<IK>(ik << 8), value, bits - 8);
-            auto* nn = BO::add_child(node, hdr, ti, tag_leaf(leaf), alloc_);
+            auto* nn = BO::add_child(node, hdr, ti, tag_leaf(leaf), 1, alloc_);
             inc_descendants_(get_header(nn));
             return {tag_bitmask(nn), true, false};
         }
@@ -310,7 +310,11 @@ private:
             lk.child, static_cast<IK>(ik << 8), value, bits - 8);
         if (cr.tagged_ptr != lk.child)
             BO::set_child(node, lk.slot, cr.tagged_ptr);
-        if (cr.inserted) inc_descendants_(hdr);
+        if (cr.inserted) {
+            inc_descendants_(hdr);
+            uint16_t* da = BO::child_desc_array(node);
+            if (da[lk.slot] < COALESCE_CAP) da[lk.slot]++;
+        }
         return {tag_bitmask(node), cr.inserted, false};
     }
 
@@ -380,7 +384,7 @@ private:
         if (slot < 0) {
             if constexpr (!INSERT) return {tag_bitmask(node), false, false};
             auto* leaf = make_single_leaf_(static_cast<IK>(ik << 8), value, bits - 8);
-            auto* nn = add_child_to_chain_(node, hdr, sc, ti, tag_leaf(leaf));
+            auto* nn = add_child_to_chain_(node, hdr, sc, ti, tag_leaf(leaf), 1);
             inc_descendants_(get_header(nn));
             return {tag_bitmask(nn), true, false};
         }
@@ -392,7 +396,12 @@ private:
             old_child, static_cast<IK>(ik << 8), value, bits - 8);
         if (cr.tagged_ptr != old_child)
             real_ch[slot] = cr.tagged_ptr;
-        if (cr.inserted) inc_descendants_(hdr);
+        if (cr.inserted) {
+            inc_descendants_(hdr);
+            unsigned nc = hdr->entries();
+            uint16_t* da = reinterpret_cast<uint16_t*>(real_ch + nc);
+            if (da[slot] < COALESCE_CAP) da[slot]++;
+        }
         return {tag_bitmask(node), cr.inserted, false};
     }
 
@@ -405,18 +414,35 @@ private:
 
     uint64_t* add_child_to_chain_(uint64_t* node, node_header* hdr,
                                     uint8_t sc, uint8_t idx,
-                                    uint64_t child_tagged) {
+                                    uint64_t child_tagged,
+                                    uint16_t child_desc) {
         unsigned oc = hdr->entries();
         unsigned nc = oc + 1;
         size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
-        size_t needed = final_offset + 5 + nc;
+        size_t needed = final_offset + 5 + nc + desc_u64(nc);
 
         if (needed <= hdr->alloc_u64()) {
             // In-place: insert into final bitmask
             bitmap256& bm = *reinterpret_cast<bitmap256*>(node + final_offset);
             uint64_t* children = node + final_offset + 5;
-            bitmap256::arr_insert(bm, children, oc, idx, child_tagged);
+            int isl = bm.find_slot<slot_mode::UNFILTERED>(idx);
+
+            // Save desc (children shift will overwrite it)
+            uint16_t saved_desc[256];
+            uint16_t* od = reinterpret_cast<uint16_t*>(children + oc);
+            std::memcpy(saved_desc, od, oc * sizeof(uint16_t));
+
+            // Insert child
+            std::memmove(children + isl + 1, children + isl, (oc - isl) * sizeof(uint64_t));
+            children[isl] = child_tagged;
+            bm.set_bit(idx);
             hdr->set_entries(nc);
+
+            // Write desc with insertion
+            uint16_t* nd = reinterpret_cast<uint16_t*>(children + nc);
+            std::memcpy(nd, saved_desc, isl * sizeof(uint16_t));
+            nd[isl] = child_desc;
+            std::memcpy(nd + isl + 1, saved_desc + isl, (oc - isl) * sizeof(uint16_t));
             return node;
         }
 
@@ -450,6 +476,13 @@ private:
         bitmap256::arr_copy_insert(
             node + final_offset + 5, nn + final_offset + 5,
             oc, isl, child_tagged);
+
+        // Copy-insert desc
+        const uint16_t* od = reinterpret_cast<const uint16_t*>(node + final_offset + 5 + oc);
+        uint16_t* nd = reinterpret_cast<uint16_t*>(nn + final_offset + 5 + nc);
+        std::memcpy(nd, od, isl * sizeof(uint16_t));
+        nd[isl] = child_desc;
+        std::memcpy(nd + isl + 1, od + isl, (oc - isl) * sizeof(uint16_t));
 
         dealloc_node(alloc_, node, hdr->alloc_u64());
         return nn;
@@ -489,9 +522,9 @@ private:
             bi[0] = actual_byte; cp[0] = remainder;
             bi[1] = expected;    cp[1] = new_leaf_tagged;
         }
-        auto* split_node = BO::make_bitmask(bi, cp, 2, alloc_);
-        get_header(split_node)->set_descendants(
-            sum_tagged_array_(cp, 2));
+        uint16_t ds[2] = {tagged_count_(cp[0]), tagged_count_(cp[1])};
+        auto* split_node = BO::make_bitmask(bi, cp, 2, alloc_, ds);
+        get_header(split_node)->set_descendants(sum_tagged_array_(cp, 2));
 
         // Wrap in skip chain for prefix bytes [0..split_pos-1]
         uint64_t result;
@@ -530,16 +563,19 @@ private:
 
         uint8_t indices[256];
         uint64_t children[256];
+        uint16_t descs[256];
+        const uint16_t* old_desc = reinterpret_cast<const uint16_t*>(old_ch + final_nc);
         int si = 0;
         for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1)) {
             indices[si] = static_cast<uint8_t>(i);
             children[si] = old_ch[si];
+            descs[si] = old_desc[si];
             si++;
         }
 
         if (rem_skip == 0) {
             // Just the final bitmask — create standalone
-            auto* bm_node = BO::make_bitmask(indices, children, final_nc, alloc_);
+            auto* bm_node = BO::make_bitmask(indices, children, final_nc, alloc_, descs);
             get_header(bm_node)->set_descendants(
                 sum_tagged_array_(children, final_nc));
             return tag_bitmask(bm_node);
@@ -553,7 +589,7 @@ private:
         }
 
         auto* chain = BO::make_skip_chain(
-            skip_bytes, rem_skip, indices, children, final_nc, alloc_);
+            skip_bytes, rem_skip, indices, children, final_nc, alloc_, descs);
         get_header(chain)->set_descendants(
             sum_tagged_array_(children, final_nc));
         return tag_bitmask(chain);
@@ -614,6 +650,8 @@ private:
             // Child survived
             if (cr.tagged_ptr != lk.child)
                 BO::set_child(node, lk.slot, cr.tagged_ptr);
+            // Update desc for this slot
+            BO::child_desc_array(node)[lk.slot] = cr.subtree_entries;
             // If child is still above COMPACT_MAX, so is parent — bail
             if (cr.subtree_entries == COALESCE_CAP)
                 return {tag_bitmask(node), true, COALESCE_CAP};
@@ -701,6 +739,10 @@ private:
         if (cr.tagged_ptr) {
             // Child survived
             if (cr.tagged_ptr != old_child) real_ch[slot] = cr.tagged_ptr;
+            // Update desc for this slot
+            unsigned nc_cur = hdr->entries();
+            uint16_t* da = reinterpret_cast<uint16_t*>(real_ch + nc_cur);
+            da[slot] = cr.subtree_entries;
             if (cr.subtree_entries == COALESCE_CAP)
                 return {tag_bitmask(node), true, COALESCE_CAP};
             uint16_t d = hdr->descendants();
@@ -726,7 +768,7 @@ private:
 
         // Remove from final bitmask
         // Check if we should shrink the allocation
-        size_t needed = final_offset + 5 + nc;
+        size_t needed = final_offset + 5 + nc + desc_u64(nc);
         if (should_shrink_u64(hdr->alloc_u64(), needed)) {
             // Realloc: rebuild chain with fewer children
             size_t au64 = round_up_u64(needed);
@@ -753,15 +795,29 @@ private:
             uint64_t* nch = nn + final_offset + 5;
             bitmap256::arr_copy_remove(real_ch, nch, nc + 1, slot);
 
+            // Copy desc excluding erased slot
+            const uint16_t* od = reinterpret_cast<const uint16_t*>(real_ch + nc + 1);
+            uint16_t* nd = reinterpret_cast<uint16_t*>(nch + nc);
+            std::memcpy(nd, od, slot * sizeof(uint16_t));
+            std::memcpy(nd + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
+
             dealloc_node(alloc_, node, hdr->alloc_u64());
             node = nn;
             hdr = nh;
             real_ch = nch;
         } else {
-            // In-place removal
+            // In-place removal — save desc first (children shift overwrites it)
+            uint16_t saved_desc[256];
+            const uint16_t* od = reinterpret_cast<const uint16_t*>(real_ch + nc + 1);
+            std::memcpy(saved_desc, od, slot * sizeof(uint16_t));
+            std::memcpy(saved_desc + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
+
             bitmap256& bm = *reinterpret_cast<bitmap256*>(node + final_offset);
             bitmap256::arr_remove(bm, real_ch, nc + 1, slot, ti);
             hdr->set_entries(nc);
+
+            uint16_t* nd = reinterpret_cast<uint16_t*>(real_ch + nc);
+            std::memcpy(nd, saved_desc, nc * sizeof(uint16_t));
         }
 
         // Collapse when final drops to 1 child
@@ -855,19 +911,17 @@ private:
         return get_header(bm_to_node_const(tagged))->descendants();
     }
 
-    // Sum immediate children's counts. Early exit when > COMPACT_MAX.
-    // Unchecked children assumed to have at least 1 entry each.
+    // Sum immediate children's counts from local desc array. No pointer chasing.
+    // Early exit when > COMPACT_MAX. Unchecked children assumed to have ≥ 1.
     static uint16_t sum_children_desc_(const uint64_t* node, uint8_t sc) noexcept {
-        size_t fo = 1 + static_cast<size_t>(sc) * 6;
-        const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + fo);
-        const uint64_t* rch = node + fo + 5;
         unsigned nc = get_header(node)->entries();
         if (nc > COMPACT_MAX) return COALESCE_CAP;
+        size_t fo = 1 + static_cast<size_t>(sc) * 6;
+        const uint16_t* desc = reinterpret_cast<const uint16_t*>(node + fo + 5 + nc);
         uint32_t total = 0;
         unsigned remaining = nc;
-        int slot = 0;
-        for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1)) {
-            total += tagged_count_(rch[slot++]);
+        for (unsigned i = 0; i < nc; ++i) {
+            total += desc[i];
             --remaining;
             if (total + remaining > COMPACT_MAX) return COALESCE_CAP;
         }
@@ -1143,14 +1197,17 @@ private:
 
         uint8_t indices[256];
         uint64_t children[256];
+        uint16_t descs[256];
+        const uint16_t* old_desc = reinterpret_cast<const uint16_t*>(cch + nc);
         int si = 0;
         for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1)) {
             indices[si] = static_cast<uint8_t>(i);
             children[si] = cch[si];
+            descs[si] = old_desc[si];
             si++;
         }
 
-        auto* chain = BO::make_skip_chain(all_bytes, total_skip, indices, children, nc, alloc_);
+        auto* chain = BO::make_skip_chain(all_bytes, total_skip, indices, children, nc, alloc_, descs);
         get_header(chain)->set_descendants(ch->descendants());
         dealloc_node(alloc_, child, ch->alloc_u64());
         return tag_bitmask(chain);
@@ -1348,6 +1405,7 @@ private:
                                                 size_t count, int bits) {
         uint8_t  indices[256];
         uint64_t child_tagged[256];
+        uint16_t descs[256];
         int      n_children = 0;
 
         size_t i = 0;
@@ -1365,10 +1423,12 @@ private:
             indices[n_children]      = ti;
             child_tagged[n_children] = build_node_from_arrays_tagged_(
                 cs.get(), vals + start, cc, bits - 8);
+            descs[n_children] = cc > COMPACT_MAX ? COALESCE_CAP
+                                                  : static_cast<uint16_t>(cc);
             n_children++;
         }
 
-        auto* node = BO::make_bitmask(indices, child_tagged, n_children, alloc_);
+        auto* node = BO::make_bitmask(indices, child_tagged, n_children, alloc_, descs);
         set_desc_capped_(node, count);
         return tag_bitmask(node);
     }
@@ -1429,7 +1489,8 @@ private:
             bi[1] = new_idx; cp[1] = tag_leaf(new_leaf);
         }
 
-        auto* bm_node = BO::make_bitmask(bi, cp, 2, alloc_);
+        uint16_t ds[2] = {tagged_count_(cp[0]), tagged_count_(cp[1])};
+        auto* bm_node = BO::make_bitmask(bi, cp, 2, alloc_, ds);
         get_header(bm_node)->set_descendants(
             sum_tagged_array_(cp, 2));
         if (common > 0)

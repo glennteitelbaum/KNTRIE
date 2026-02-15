@@ -21,6 +21,9 @@ inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
 inline constexpr size_t HEADER_U64    = 1;   // base header is 1 u64 (8 bytes), +1 if skip
 
+// u64s needed for N child descriptor entries (uint16_t each)
+inline constexpr size_t desc_u64(size_t n) noexcept { return (n + 3) / 4; }
+
 // Tagged pointer: bit 63 = leaf (sign bit for fast test)
 static constexpr uint64_t LEAF_BIT = uint64_t(1) << 63;
 
