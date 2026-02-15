@@ -17,7 +17,7 @@ namespace gteitelbaum {
 // ==========================================================================
 
 inline constexpr size_t BITMAP256_U64 = 4;   // 32 bytes
-inline constexpr size_t COMPACT_MAX   = 4096;
+inline constexpr size_t COMPACT_MAX   = 8192;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
 inline constexpr size_t HEADER_U64    = 1;   // base header is 1 u64 (8 bytes), +1 if skip
 
@@ -63,13 +63,12 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 // ==========================================================================
 // Node Header  (8 bytes = 1 u64)
 //
-// bits_ layout:
-//   [13:0]   entries      (14 bits, max 16383)
-//   [27:14]  alloc_u64    (14 bits, max 16383)
-//   [28]     is_bitmask   (0=leaf, 1=bitmask node)
-//   [29]     is_skip      (1=skip u64 present at node[1])
-//   [61:30]  reserved
-//   [63:62]  suffix_type  (leaf only: 0=bitmap256, 1=u16, 2=u32, 3=u64)
+// Struct layout (little-endian):
+//   [0]      flags       (bit 0: is_bitmask, bit 1: is_skip)
+//   [1]      suffix_type (leaf only: 0=bitmap256, 1=u16, 2=u32, 3=u64)
+//   [2..3]   entries     (uint16_t)
+//   [4..5]   alloc_u64   (uint16_t)
+//   [6..7]   pad
 //
 // Zeroed header -> is_leaf=true, is_skip=false, suffix_type=0,
 //                  entries=0. Sentinel-safe.
@@ -85,43 +84,34 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 // ==========================================================================
 
 struct node_header {
-    uint64_t bits_;
+    uint8_t  flags_       = 0;
+    uint8_t  suffix_type_ = 0;
+    uint16_t entries_     = 0;
+    uint16_t alloc_u64_   = 0;
+    uint16_t pad_         = 0;
 
-    static constexpr uint64_t ENTRIES_MASK    = 0x3FFF;
-    static constexpr int      ALLOC_SHIFT     = 14;
-    static constexpr uint64_t ALLOC_MASK      = uint64_t{0x3FFF} << 14;
-    static constexpr uint64_t BITMASK_BIT     = uint64_t{1} << 28;
-    static constexpr uint64_t SKIP_BIT        = uint64_t{1} << 29;
-    static constexpr int      STYPE_SHIFT     = 62;
+    static constexpr uint8_t BITMASK_BIT = 1 << 0;
+    static constexpr uint8_t SKIP_BIT    = 1 << 1;
 
     // --- header1 accessors (safe on value copies) ---
 
-    bool is_leaf()    const noexcept { return !(bits_ & BITMASK_BIT); }
-    bool is_skip()    const noexcept { return bits_ & SKIP_BIT; }
-    void set_bitmask()      noexcept { bits_ |= BITMASK_BIT; }
+    bool is_leaf()    const noexcept { return !(flags_ & BITMASK_BIT); }
+    bool is_skip()    const noexcept { return flags_ & SKIP_BIT; }
+    void set_bitmask()      noexcept { flags_ |= BITMASK_BIT; }
 
-    uint8_t suffix_type() const noexcept { return static_cast<uint8_t>(bits_ >> STYPE_SHIFT); }
-    void set_suffix_type(uint8_t t) noexcept {
-        bits_ = (bits_ & ~(uint64_t{0x3} << STYPE_SHIFT))
-              | (static_cast<uint64_t>(t & 0x3) << STYPE_SHIFT);
-    }
+    uint8_t suffix_type() const noexcept { return suffix_type_; }
+    void set_suffix_type(uint8_t t) noexcept { suffix_type_ = t; }
 
-    uint16_t entries() const noexcept { return static_cast<uint16_t>(bits_ & ENTRIES_MASK); }
-    void set_entries(unsigned n) noexcept {
-        bits_ = (bits_ & ~ENTRIES_MASK) | (n & 0x3FFF);
-    }
+    unsigned entries()   const noexcept { return entries_; }
+    void set_entries(unsigned n) noexcept { entries_ = static_cast<uint16_t>(n); }
 
-    uint16_t alloc_u64() const noexcept {
-        return static_cast<uint16_t>((bits_ & ALLOC_MASK) >> ALLOC_SHIFT);
-    }
-    void set_alloc_u64(unsigned n) noexcept {
-        bits_ = (bits_ & ~ALLOC_MASK) | (static_cast<uint64_t>(n & 0x3FFF) << ALLOC_SHIFT);
-    }
+    unsigned alloc_u64() const noexcept { return alloc_u64_; }
+    void set_alloc_u64(unsigned n) noexcept { alloc_u64_ = static_cast<uint16_t>(n); }
 
     // --- header2 accessors (node[1]) -- only valid via get_header(node)-> ---
 
     uint8_t skip() const noexcept {
-        if (!(bits_ & SKIP_BIT)) return 0;
+        if (!(flags_ & SKIP_BIT)) return 0;
         auto* p = reinterpret_cast<const uint64_t*>(this);
         return reinterpret_cast<const uint8_t*>(p + 1)[7];
     }
@@ -133,11 +123,11 @@ struct node_header {
 
     void set_skip(uint8_t s) noexcept {
         if (s > 0) {
-            bits_ |= SKIP_BIT;
+            flags_ |= SKIP_BIT;
             auto* p = reinterpret_cast<uint64_t*>(this);
             reinterpret_cast<uint8_t*>(p + 1)[7] = s;
         } else {
-            bits_ &= ~SKIP_BIT;
+            flags_ &= ~SKIP_BIT;
         }
     }
 
@@ -154,7 +144,7 @@ inline const node_header* get_header(const uint64_t* n) noexcept { return reinte
 
 // Dynamic header size: 1 (base) + 1 (if skip present)
 inline size_t hdr_u64(const uint64_t* n) noexcept {
-    return 1 + ((n[0] & node_header::SKIP_BIT) ? 1 : 0);
+    return 1 + (get_header(n)->is_skip() ? 1 : 0);
 }
 
 // ==========================================================================

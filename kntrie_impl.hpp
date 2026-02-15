@@ -426,7 +426,7 @@ private:
         size_t new_au64 = old_au64 - 1;
         uint64_t* nn = alloc_node(alloc_, new_au64);
         nn[0] = node[0];  // copy header
-        nn[0] &= ~node_header::SKIP_BIT;  // clear skip bit
+        get_header(nn)->set_skip(0);  // clear skip bit
         std::memcpy(nn + 1, node + 2, (old_au64 - 2) * 8);  // shift data left
         get_header(nn)->set_alloc_u64(new_au64);
         dealloc_node(alloc_, node, old_au64);
