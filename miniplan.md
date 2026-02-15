@@ -56,7 +56,7 @@
 - [x] I11: collapse_single_child_ (standalone bitmask → absorb bitmask child into skip chain)
 - [x] I12: collapse_chain_final_ (chain final drops to 1 → merge into child)
 - [x] I13: maybe_coalesce_ / maybe_coalesce_chain_ (subtree → CO leaf)
-- [ ] I22: remove_child_from_chain_ (deferred — in-place removal works; coalesce reclaims memory when subtree shrinks below COMPACT_MAX anyway)
+- [x] I22: remove_child_from_chain_ (realloc shrink when allocation > 2x needed after removal)
 - [x] Thread bits through erase path (erase_node_ has bits, erase_skip_chain_ saves orig_bits)
 - [x] Verify collapse back to CO leaf: FIXED — skip bytes must be stripped from collected keys and leaf_bits reduced by sc*8 before building leaf
 **→ DONE: Phase 3 complete, all ASAN clean, coalesce verified**

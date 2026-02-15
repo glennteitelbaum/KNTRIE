@@ -683,15 +683,50 @@ private:
             return {0, true};
         }
 
-        // Remove in-place from final bitmask
-        bitmap256& bm_mut = *reinterpret_cast<bitmap256*>(node + final_offset);
-        bitmap256::arr_remove(bm_mut, real_ch, nc + 1, slot, ti);
-        hdr->set_entries(nc);
+        // Remove from final bitmask
+        // Check if we should shrink the allocation
+        size_t needed = final_offset + 5 + nc;
+        if (should_shrink_u64(hdr->alloc_u64(), needed)) {
+            // Realloc: rebuild chain with fewer children
+            size_t au64 = round_up_u64(needed);
+            uint64_t* nn = alloc_node(alloc_, au64);
+
+            // Copy header + embeds + final bitmap + sentinel
+            size_t prefix_u64 = final_offset + 5;
+            std::memcpy(nn, node, prefix_u64 * 8);
+
+            auto* nh = get_header(nn);
+            nh->set_entries(nc);
+            nh->set_alloc_u64(au64);
+
+            // Fix embed internal pointers
+            for (uint8_t e = 0; e < sc; ++e) {
+                uint64_t* embed_child = nn + 1 + e * 6 + 5;
+                uint64_t* next_bm = nn + 1 + (e + 1) * 6;
+                *embed_child = reinterpret_cast<uint64_t>(next_bm);
+            }
+            nn[final_offset + 4] = SENTINEL_TAGGED;
+
+            // Copy children excluding erased slot
+            reinterpret_cast<bitmap256*>(nn + final_offset)->clear_bit(ti);
+            uint64_t* nch = nn + final_offset + 5;
+            bitmap256::arr_copy_remove(real_ch, nch, nc + 1, slot);
+
+            dealloc_node(alloc_, node, hdr->alloc_u64());
+            node = nn;
+            hdr = nh;
+            real_ch = nch;
+        } else {
+            // In-place removal
+            bitmap256& bm = *reinterpret_cast<bitmap256*>(node + final_offset);
+            bitmap256::arr_remove(bm, real_ch, nc + 1, slot, ti);
+            hdr->set_entries(nc);
+        }
 
         // Collapse when final drops to 1 child
         if (nc == 1) {
-            // Find sole remaining child
-            uint8_t sole_idx = static_cast<uint8_t>(bm_mut.find_next_set(0));
+            const bitmap256& fbm_after = *reinterpret_cast<const bitmap256*>(node + final_offset);
+            uint8_t sole_idx = static_cast<uint8_t>(fbm_after.find_next_set(0));
             uint64_t sole_child = real_ch[0];
 
             // Collect all skip bytes + sole_idx
