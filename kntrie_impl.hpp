@@ -614,10 +614,10 @@ private:
             // Child survived — update pointer, decrement descendants
             if (cr.tagged_ptr != lk.child)
                 BO::set_child(node, lk.slot, cr.tagged_ptr);
-            uint16_t desc = dec_or_recompute_desc_(node, 0);
-            if (desc <= COMPACT_MAX)
-                return do_coalesce_(node, hdr, bits, desc);
-            return {tag_bitmask(node), true, desc};
+            uint16_t d = dec_or_recompute_desc_(node, 0);
+            if (d <= COMPACT_MAX)
+                return do_coalesce_(node, hdr, bits, d);
+            return {tag_bitmask(node), true, d};
         }
 
         // Child fully erased — remove from bitmask
@@ -690,10 +690,10 @@ private:
         if (cr.tagged_ptr) {
             // Child survived — update pointer, decrement descendants
             if (cr.tagged_ptr != old_child) real_ch[slot] = cr.tagged_ptr;
-            uint16_t desc = dec_or_recompute_desc_(node, sc);
-            if (desc <= COMPACT_MAX)
-                return do_coalesce_(node, hdr, orig_bits, desc);
-            return {tag_bitmask(node), true, desc};
+            uint16_t d = dec_or_recompute_desc_(node, sc);
+            if (d <= COMPACT_MAX)
+                return do_coalesce_(node, hdr, orig_bits, d);
+            return {tag_bitmask(node), true, d};
         }
 
         // Child erased — remove from final bitmask
@@ -824,18 +824,18 @@ private:
     // Descendant tracking helpers
     //
     // Bitmask nodes store total descendant count in total_slots_ field
-    // (unused by bitmask). Saturates at DESC_SATURATED (0xFFFF).
+    // (unused by bitmask). Capped at COALESCE_CAP (COMPACT_MAX + 1).
     // Leaf nodes: use entries() instead.
     // ------------------------------------------------------------------
 
-    // Get descendant count from any tagged pointer
+    // Get descendant count from any tagged pointer (capped)
     static uint16_t tagged_count_(uint64_t tagged) noexcept {
         if (tagged & LEAF_BIT)
             return get_header(untag_leaf(tagged))->entries();
         return get_header(bm_to_node_const(tagged))->descendants();
     }
 
-    // Sum immediate children's counts (saturating). O(num_children).
+    // Sum immediate children's counts. Early exit when > COMPACT_MAX.
     static uint16_t sum_children_desc_(const uint64_t* node, uint8_t sc) noexcept {
         size_t fo = 1 + static_cast<size_t>(sc) * 6;
         const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + fo);
@@ -843,37 +843,35 @@ private:
         uint32_t total = 0;
         int slot = 0;
         for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1)) {
-            uint16_t c = tagged_count_(rch[slot++]);
-            if (c == DESC_SATURATED) return DESC_SATURATED;
-            total += c;
-            if (total >= DESC_SATURATED) return DESC_SATURATED;
+            total += tagged_count_(rch[slot++]);
+            if (total > COMPACT_MAX) return COALESCE_CAP;
         }
         return static_cast<uint16_t>(total);
     }
 
-    // Set descendants from known count (saturating)
-    static void set_desc_saturating_(uint64_t* node, size_t count) noexcept {
+    // Set descendants from known count (capped)
+    static void set_desc_capped_(uint64_t* node, size_t count) noexcept {
         get_header(node)->set_descendants(
-            count >= DESC_SATURATED ? DESC_SATURATED : static_cast<uint16_t>(count));
+            count > COMPACT_MAX ? COALESCE_CAP : static_cast<uint16_t>(count));
     }
 
-    // Saturating increment (for insert path)
+    // Capping increment (for insert path)
     static void inc_descendants_(node_header* h) noexcept {
         uint16_t d = h->descendants();
-        if (d < DESC_SATURATED) h->set_descendants(d + 1);
+        if (d < COALESCE_CAP) h->set_descendants(d + 1);
     }
 
-    // Decrement or recompute if saturated. Returns new count.
+    // Decrement or recompute if capped. Returns new count (capped).
     // Node's children must reflect post-operation state before calling.
     static uint16_t dec_or_recompute_desc_(uint64_t* node, uint8_t sc) noexcept {
         auto* h = get_header(node);
         uint16_t d = h->descendants();
-        if (d != DESC_SATURATED) {
+        if (d <= COMPACT_MAX) {
             --d;
             h->set_descendants(d);
             return d;
         }
-        // Saturated: recompute from immediate children
+        // Capped: recompute from immediate children (early exit > COMPACT_MAX)
         d = sum_children_desc_(node, sc);
         h->set_descendants(d);
         return d;
@@ -883,10 +881,8 @@ private:
     static uint16_t sum_tagged_array_(const uint64_t* children, unsigned nc) noexcept {
         uint32_t total = 0;
         for (unsigned i = 0; i < nc; ++i) {
-            uint16_t c = tagged_count_(children[i]);
-            if (c == DESC_SATURATED) return DESC_SATURATED;
-            total += c;
-            if (total >= DESC_SATURATED) return DESC_SATURATED;
+            total += tagged_count_(children[i]);
+            if (total > COMPACT_MAX) return COALESCE_CAP;
         }
         return static_cast<uint16_t>(total);
     }
@@ -1348,7 +1344,7 @@ private:
         }
 
         auto* node = BO::make_bitmask(indices, child_tagged, n_children, alloc_);
-        set_desc_saturating_(node, count);
+        set_desc_capped_(node, count);
         return tag_bitmask(node);
     }
 
