@@ -10,19 +10,25 @@
 namespace gteitelbaum {
 
 // ==========================================================================
-// AdaptiveSearch  (branchless binary search for power-of-2 counts)
+// AdaptiveSearch  (branchless binary search for pow2 and 3/4 midpoint counts)
 //
-// Every compact leaf has power-of-2 total slots, so the search is a
+// Every compact leaf has power-of-2 or 3/4 midpoint total slots, so the search is a
 // pure halving loop — no alignment preamble, no branches.
 // ==========================================================================
 
 template<typename K>
 struct adaptive_search {
     // Pure cmov loop — returns pointer to candidate.
-    // Caller checks *result == key. count must be power of 2.
+    // Caller checks *result == key.
+    // count must be power of 2 or 3/4 midpoint (P/2 + P/4).
     static const K* find_base(const K* keys, int count, K key) noexcept {
         const K* base = keys;
-        for (int step = count >> 1; step > 0; step >>= 1)
+        int step = count >> 1;
+        if (!std::has_single_bit(static_cast<unsigned>(count))) {
+            step = count / 3;
+            base = (base[step] <= key) ? base + step : base;
+        }
+        for (; step > 0; step >>= 1)
             base = (base[step] <= key) ? base + step : base;
         return base;
     }
@@ -33,7 +39,7 @@ struct adaptive_search {
 //
 // Layout: [header (2 u64)][sorted_keys (aligned)][values (aligned)]
 //
-// Slot count is always power-of-2 (via bit_ceil). Extra slots are
+// Slot count is always power-of-2 or 3/4 midpoint (P/2+P/4). Extra slots are
 // filled with evenly-spaced duplicates of neighboring keys.
 // Insert consumes the nearest dup; erase creates a new dup.
 //
@@ -50,11 +56,17 @@ struct compact_ops {
         (sizeof(K) == 2) ? 1 :
         (sizeof(K) == 4) ? 2 : 3;
 
-    // --- power-of-2 slot count for a given entry count ---
+    // --- slot count: power-of-2 or 3/4 midpoint (P/2 + P/4) ---
+    // Sequence: 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, ...
+    // Max waste: ~25% (down from ~50% with pure power-of-2).
 
     static constexpr uint16_t slots_for(uint16_t entries) noexcept {
-        return static_cast<uint16_t>(std::min<uint32_t>(
-            std::bit_ceil(static_cast<unsigned>(entries)), COMPACT_MAX));
+        if (entries <= 4) return static_cast<uint16_t>(
+            std::bit_ceil(static_cast<unsigned>(entries)));
+        unsigned p = std::bit_ceil(entries);
+        unsigned mid = p / 2 + p / 4;  // 3/4 point
+        unsigned s = (entries <= mid) ? mid : p;
+        return static_cast<uint16_t>(std::min<unsigned>(s, COMPACT_MAX));
     }
 
     // --- exact u64 size for a given slot count ---
@@ -190,7 +202,7 @@ struct compact_ops {
             return {node, true, false};
         }
 
-        // No dups: realloc to next power-of-2 slot count
+        // No dups: realloc to next slot count
         uint16_t new_entries = entries + 1;
         uint16_t new_ts = slots_for(new_entries);
         size_t hu = hdr_u64(node);
@@ -239,7 +251,7 @@ struct compact_ops {
         // Shrink check: if entries-1 fits in half the slots, realloc
         uint16_t new_ts = slots_for(nc);
         if (new_ts < ts) {
-            // Realloc + re-seed at smaller power-of-2
+            // Realloc + re-seed at smaller slot count
             size_t hu = hdr_u64(node);
             size_t au64 = size_u64(new_ts, hu);
             uint64_t* nn = alloc_node(alloc, au64);
