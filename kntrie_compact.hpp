@@ -22,11 +22,10 @@ struct adaptive_search {
     // Caller checks *result == key.
     // count must be power of 2.
     static const K* find_base(const K* base, unsigned count, K key) noexcept {
-        count >>= 1;
         do {
-            base += (base[count] <= key) ? count : 0;
             count >>= 1;
-        } while (count > 0);
+            base += (base[count] <= key) ? count : 0;
+        } while (count > 1);
         return base;
     }
 };
