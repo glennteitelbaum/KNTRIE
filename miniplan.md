@@ -38,23 +38,25 @@
 **→ DONE: zip all headers + plan + miniplan**
 
 ## Phase 2: Bitmask skip chains (insert path)
-- [ ] Compile + sanity test (fix any Phase 1 issues)
-- [ ] B10: make_skip_chain (one allocation: embeds + final bitmask)
-- [ ] I21: make_skip_chain_for_bitmask_ helper
-- [ ] Replace wrap_bitmask_chain_ → skip chain creation
-- [ ] I5: insert_skip_chain_ (walk embeds, match bytes, operate on final)
-- [ ] I6: add_child_to_chain_ (in-place or realloc)
-- [ ] I7: split_skip_at_ (divergent key splits chain)
-- [ ] I8: build_remainder_tagged_ (extract remainder into new chain)
-**→ STOP: zip all headers + plan + miniplan**
+- [x] Compile + sanity test (fix any Phase 1 issues)
+- [x] B10: make_skip_chain (one allocation: embeds + final bitmask)
+- [x] I21: wrap_bitmask_chain_ rewritten to use make_skip_chain
+- [x] Replace wrap_bitmask_chain_ → skip chain creation
+- [x] I5: insert_skip_chain_ (walk embeds, match bytes, operate on final)
+- [x] I6: add_child_to_chain_ (in-place or realloc)
+- [x] I7: split_skip_at_ (divergent key splits chain)
+- [x] I8: build_remainder_tagged_ (extract remainder into new chain)
+- [x] erase_skip_chain_ (basic: walk embeds, erase from final, no collapse)
+- [x] remove_node_ / collect_stats_ updated for skip chain awareness
+**→ DONE: zip all headers + plan + miniplan**
 
 ## Phase 3: Erase collapse
 - [ ] Compile + sanity test (fix any Phase 2 issues)
-- [ ] I10: erase_skip_chain_ (walk embeds, erase from final)
-- [ ] I11: collapse_single_child_ (standalone bitmask → absorb into child)
-- [ ] I12: collapse_chain_final_ (chain final drops to 1 → merge)
+- [x] I10: erase_skip_chain_ basic (done in Phase 2 — walk embeds, erase from final)
+- [ ] I11: collapse_single_child_ (standalone bitmask → absorb bitmask child into skip chain)
+- [ ] I12: collapse_chain_final_ (chain final drops to 1 → merge into child)
 - [ ] I13: maybe_coalesce_ / maybe_coalesce_chain_ (subtree → CO leaf)
-- [ ] I22: remove_child_from_chain_
+- [ ] I22: remove_child_from_chain_ (realloc chain on shrink)
 - [ ] Thread bits through erase path
 **→ STOP: zip all headers + plan + miniplan**
 

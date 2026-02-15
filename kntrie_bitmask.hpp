@@ -299,6 +299,58 @@ struct bitmask_ops {
     }
 
     // ==================================================================
+    // Bitmask node: make skip chain (one allocation)
+    //
+    // Layout: [header(1)][embed_0(6)]...[embed_{S-1}(6)][final_bm(4)][sent(1)][children(N)]
+    // Each embed = bitmap256(4) + sentinel(1) + child_ptr(1)
+    // child_ptr points to next embed's bitmap (or final bitmap).
+    // Total: 1 + S*6 + 4 + 1 + 1 + N = 7 + S*6 + N  (but we use 6 + S*6 + N since
+    //        final_bm(4)+sent(1)+first_child_slot = 6, and remaining N-1 children follow,
+    //        but actually: header(1) + S*6 + 4 + 1 + N = 6 + S*6 + N)
+    // ==================================================================
+
+    static uint64_t* make_skip_chain(const uint8_t* skip_bytes, uint8_t skip_count,
+                                      const uint8_t* final_indices,
+                                      const uint64_t* final_children_tagged,
+                                      unsigned final_n_children, ALLOC& alloc) {
+        // Allocation: header(1) + skip_count*6 + bitmap(4) + sentinel(1) + children(N)
+        size_t needed = 1 + static_cast<size_t>(skip_count) * 6 + 5 + final_n_children;
+        size_t au64 = round_up_u64(needed);
+        uint64_t* nn = alloc_node(alloc, au64);
+
+        auto* nh = get_header(nn);
+        nh->set_entries(final_n_children);
+        nh->set_alloc_u64(au64);
+        nh->set_skip(skip_count);
+        nh->set_bitmask();
+
+        // Build each embed: bitmap(4) + sentinel(1) + child_ptr(1)
+        for (uint8_t e = 0; e < skip_count; ++e) {
+            uint64_t* embed = nn + 1 + e * 6;
+            // bitmap with single bit
+            bitmap256& bm = *reinterpret_cast<bitmap256*>(embed);
+            bm = bitmap256{};
+            bm.set_bit(skip_bytes[e]);
+            // sentinel
+            embed[4] = SENTINEL_TAGGED;
+            // child ptr → next embed's bitmap (or final bitmap)
+            uint64_t* next_bm = nn + 1 + (e + 1) * 6;
+            embed[5] = reinterpret_cast<uint64_t>(next_bm);  // no LEAF_BIT
+        }
+
+        // Final bitmask
+        size_t final_offset = 1 + static_cast<size_t>(skip_count) * 6;
+        bitmap256 fbm = bitmap256::from_indices(final_indices, final_n_children);
+        *reinterpret_cast<bitmap256*>(nn + final_offset) = fbm;
+        nn[final_offset + 4] = SENTINEL_TAGGED;
+        bitmap256::arr_fill_sorted(fbm, nn + final_offset + 5,
+                                    final_indices, final_children_tagged,
+                                    final_n_children);
+
+        return nn;
+    }
+
+    // ==================================================================
     // Bitmask node: iterate  cb(uint8_t idx, int slot, uint64_t tagged_child)
     // ==================================================================
 
