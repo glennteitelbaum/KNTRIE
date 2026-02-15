@@ -154,7 +154,7 @@ inline size_t hdr_u64(const uint64_t* n) noexcept {
 // Must be large enough for safe bitmap read: header(2) + bitmap(4) = 6 u64s.
 // ==========================================================================
 
-alignas(64) inline constinit uint64_t SENTINEL_NODE[6] = {};
+alignas(64) inline constinit uint64_t SENTINEL_NODE[8] = {};
 
 // ==========================================================================
 // key_ops<KEY> -- internal key representation
