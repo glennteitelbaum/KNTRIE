@@ -66,6 +66,8 @@ public:
         node_header hdr = *get_header(node);
 
         while (true) {
+            size_t hs = 1 + hdr.is_skip();
+
             if (hdr.is_skip()) [[unlikely]] {
                 const uint8_t* actual = reinterpret_cast<const uint8_t*>(&node[1]);
                 uint8_t skip = actual[7];
@@ -81,29 +83,30 @@ public:
 
             uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
             ik <<= 8;
-            node = BO::branchless_child(node, ti);
+            node = BO::branchless_child(node, ti, hs);
             hdr = *get_header(node);
         }
 
         // Leaf dispatch by suffix_type
+        size_t hs = 1 + hdr.is_skip();
         uint8_t st = hdr.suffix_type();
 
         if (st <= 1) [[likely]] {
             if (st == 0)
                 return BO::bitmap_find(node, hdr,
-                    static_cast<uint8_t>(ik >> (IK_BITS - 8)));
+                    static_cast<uint8_t>(ik >> (IK_BITS - 8)), hs);
             return CO16::find(node, hdr,
-                static_cast<uint16_t>(ik >> (IK_BITS - 16)));
+                static_cast<uint16_t>(ik >> (IK_BITS - 16)), hs);
         }
 
         if constexpr (KEY_BITS > 16) {
             if constexpr (KEY_BITS > 32) {
                 if (st & 0b01)
                     return CO64::find(node, hdr,
-                        static_cast<uint64_t>(ik));
+                        static_cast<uint64_t>(ik), hs);
             }
             return CO32::find(node, hdr,
-                static_cast<uint32_t>(ik >> (IK_BITS - 32)));
+                static_cast<uint32_t>(ik >> (IK_BITS - 32)), hs);
         }
     }
 
