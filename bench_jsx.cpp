@@ -52,7 +52,7 @@ struct Workload {
     std::vector<KEY> keys;          // insert keys
     std::vector<KEY> erase_keys;    // N/2 keys to erase
     std::vector<KEY> find_fnd;      // N keys, 100% found, shuffled
-    std::vector<KEY> find_mix;      // N+N/4 keys shuffled, first N used (75% hit)
+    std::vector<KEY> find_nf;       // N keys, 100% NOT found, shuffled
     int find_iters;
 };
 
@@ -63,7 +63,7 @@ static Workload make_workload(size_t n, const std::string& pattern,
 
     std::vector<KEY> raw(n);
     if (pattern == "sequential") {
-        for (size_t i = 0; i < n; ++i) raw[i] = static_cast<KEY>(i);
+        for (size_t i = 0; i < n; ++i) raw[i] = static_cast<KEY>(i * 2);
     } else {
         for (size_t i = 0; i < n; ++i) raw[i] = static_cast<KEY>(rng());
     }
@@ -80,24 +80,23 @@ static Workload make_workload(size_t n, const std::string& pattern,
     w.find_fnd = raw;
     std::shuffle(w.find_fnd.begin(), w.find_fnd.end(), rng);
 
-    // MIX: N + N/4 keys, shuffled, use first N for lookup
-    size_t extra = n / 4;
-    w.find_mix = raw;
+    // NF: 100% not found (within range of inserted keys)
     if (pattern == "sequential") {
-        for (size_t i = 0; i < extra; ++i)
-            w.find_mix.push_back(static_cast<KEY>(n + i));
+        w.find_nf.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+            w.find_nf.push_back(static_cast<KEY>(i * 2 + 1));
     } else {
         std::set<KEY> existing(raw.begin(), raw.end());
-        while (w.find_mix.size() < n + extra) {
+        w.find_nf.reserve(n);
+        while (w.find_nf.size() < n) {
             KEY k = static_cast<KEY>(rng());
             if (!existing.count(k)) {
-                w.find_mix.push_back(k);
+                w.find_nf.push_back(k);
                 existing.insert(k);
             }
         }
     }
-    std::shuffle(w.find_mix.begin(), w.find_mix.end(), rng);
-    w.find_mix.resize(n);  // use first N
+    std::shuffle(w.find_nf.begin(), w.find_nf.end(), rng);
 
     return w;
 }
@@ -115,7 +114,7 @@ struct Row {
     size_t n;
     const char* container;
     double find_fnd_ms;
-    double find_mix_ms;
+    double find_nf_ms;
     double insert_ms;
     double erase_ms;
     size_t mem_bytes;
@@ -159,17 +158,17 @@ static void bench_all(size_t target_n, const std::string& pattern,
     }
 
     // Pre-generate find orders (shared across containers)
-    std::vector<std::vector<KEY>> fnd_orders(fi), mix_orders(fi);
+    std::vector<std::vector<KEY>> fnd_orders(fi), nf_orders(fi);
     for (int r = 0; r < fi; ++r) {
         fnd_orders[r] = w.find_fnd;
         std::shuffle(fnd_orders[r].begin(), fnd_orders[r].end(), rng);
-        mix_orders[r] = w.find_mix;
-        std::shuffle(mix_orders[r].begin(), mix_orders[r].end(), rng);
+        nf_orders[r] = w.find_nf;
+        std::shuffle(nf_orders[r].begin(), nf_orders[r].end(), rng);
     }
 
-    double k_fnd = 1e18, k_mix = 1e18, k_ins = 1e18, k_ers = 1e18;
-    double m_fnd = 1e18, m_mix = 1e18, m_ins = 1e18, m_ers = 1e18;
-    double u_fnd = 1e18, u_mix = 1e18, u_ins = 1e18, u_ers = 1e18;
+    double k_fnd = 1e18, k_nf = 1e18, k_ins = 1e18, k_ers = 1e18;
+    double m_fnd = 1e18, m_nf = 1e18, m_ins = 1e18, m_ers = 1e18;
+    double u_fnd = 1e18, u_nf = 1e18, u_ins = 1e18, u_ers = 1e18;
 
     for (int t = 0; t < TRIALS; ++t) {
         // --- kntrie ---
@@ -188,10 +187,10 @@ static void bench_all(size_t target_n, const std::string& pattern,
             do_not_optimize(cs);
 
             cs = 0;
-            double t1m = now_ms();
+            double t1n = now_ms();
             for (int r = 0; r < fi; ++r)
-                for (auto k : mix_orders[r]) { auto* v = trie.find_value(k); cs += v ? *v : 0; }
-            k_mix = std::min(k_mix, (now_ms() - t1m) / fi);
+                for (auto k : nf_orders[r]) { auto* v = trie.find_value(k); cs += v ? *v : 0; }
+            k_nf = std::min(k_nf, (now_ms() - t1n) / fi);
             do_not_optimize(cs);
 
             std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
@@ -216,10 +215,10 @@ static void bench_all(size_t target_n, const std::string& pattern,
             do_not_optimize(cs);
 
             cs = 0;
-            double t1m = now_ms();
+            double t1n = now_ms();
             for (int r = 0; r < fi; ++r)
-                for (auto k : mix_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
-            m_mix = std::min(m_mix, (now_ms() - t1m) / fi);
+                for (auto k : nf_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
+            m_nf = std::min(m_nf, (now_ms() - t1n) / fi);
             do_not_optimize(cs);
 
             std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
@@ -245,10 +244,10 @@ static void bench_all(size_t target_n, const std::string& pattern,
             do_not_optimize(cs);
 
             cs = 0;
-            double t1m = now_ms();
+            double t1n = now_ms();
             for (int r = 0; r < fi; ++r)
-                for (auto k : mix_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
-            u_mix = std::min(u_mix, (now_ms() - t1m) / fi);
+                for (auto k : nf_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
+            u_nf = std::min(u_nf, (now_ms() - t1n) / fi);
             do_not_optimize(cs);
 
             std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
@@ -258,10 +257,10 @@ static void bench_all(size_t target_n, const std::string& pattern,
         }
     }
 
-    rows.push_back({pattern, n, "kntrie", k_fnd, k_mix, k_ins, k_ers, kntrie_mem});
+    rows.push_back({pattern, n, "kntrie", k_fnd, k_nf, k_ins, k_ers, kntrie_mem});
     if (do_map)
-        rows.push_back({pattern, n, "map", m_fnd, m_mix, m_ins, m_ers, map_mem});
-    rows.push_back({pattern, n, "umap", u_fnd, u_mix, u_ins, u_ers, umap_mem});
+        rows.push_back({pattern, n, "map", m_fnd, m_nf, m_ins, m_ers, map_mem});
+    rows.push_back({pattern, n, "umap", u_fnd, u_nf, u_ins, u_ers, umap_mem});
 }
 
 // ==========================================================================
@@ -272,7 +271,7 @@ static void emit_html(const std::vector<Row>& rows) {
     struct DataPoint {
         std::string pattern;
         size_t N;
-        double vals[3][5]; // [kntrie=0, map=1, umap=2] x [fnd, mix, insert, erase, mem]
+        double vals[3][5]; // [kntrie=0, map=1, umap=2] x [fnd, nf, insert, erase, mem]
         bool has[3];
     };
 
@@ -299,7 +298,7 @@ static void emit_html(const std::vector<Row>& rows) {
         }
         int ci = cidx(r.container);
         points[pi].vals[ci][0] = r.find_fnd_ms;
-        points[pi].vals[ci][1] = r.find_mix_ms;
+        points[pi].vals[ci][1] = r.find_nf_ms;
         points[pi].vals[ci][2] = r.insert_ms;
         points[pi].vals[ci][3] = r.erase_ms;
         points[pi].vals[ci][4] = static_cast<double>(r.mem_bytes);
@@ -312,7 +311,7 @@ static void emit_html(const std::vector<Row>& rows) {
     });
 
     const char* names[] = {"kntrie", "map", "umap"};
-    const char* suffixes[] = {"fnd", "mix", "insert", "erase", "mem"};
+    const char* suffixes[] = {"fnd", "nf", "insert", "erase", "mem"};
 
     // HTML preamble
     std::printf("%s", R"HTML(<!DOCTYPE html>
@@ -339,7 +338,7 @@ static void emit_html(const std::vector<Row>& rows) {
 <body>
 <div class="wrap">
   <h2>kntrie Benchmark (u64)</h2>
-  <p class="sub">Log-log · Per-entry · Lower is better · FND=100% hit, MIX=75% hit</p>
+  <p class="sub">Log-log · Per-entry · Lower is better · FND=100% hit, NF=100% miss</p>
   <div class="btns">
     <button class="active" onclick="show('random')">random</button>
     <button onclick="show('sequential')">sequential</button>
@@ -374,11 +373,11 @@ static void emit_html(const std::vector<Row>& rows) {
 R"JS(
 const LINES_FIND = [
   { key: "kntrie", suffix: "fnd", color: "#3b82f6", dash: [],    width: 2.5, label: "kntrie FND" },
-  { key: "kntrie", suffix: "mix", color: "#93c5fd", dash: [6,3], width: 1.5, label: "kntrie MIX" },
+  { key: "kntrie", suffix: "nf", color: "#93c5fd", dash: [6,3], width: 1.5, label: "kntrie NF" },
   { key: "map",    suffix: "fnd", color: "#ef4444", dash: [],    width: 2.5, label: "map FND" },
-  { key: "map",    suffix: "mix", color: "#fca5a5", dash: [6,3], width: 1.5, label: "map MIX" },
+  { key: "map",    suffix: "nf", color: "#fca5a5", dash: [6,3], width: 1.5, label: "map NF" },
   { key: "umap",   suffix: "fnd", color: "#22c55e", dash: [],    width: 2.5, label: "umap FND" },
-  { key: "umap",   suffix: "mix", color: "#86efac", dash: [6,3], width: 1.5, label: "umap MIX" },
+  { key: "umap",   suffix: "nf", color: "#86efac", dash: [6,3], width: 1.5, label: "umap NF" },
 ];
 
 const LINES_OP = [
