@@ -62,9 +62,9 @@
 **→ DONE: Phase 3 complete, all ASAN clean, coalesce verified**
 
 ## Phase 4: Compile, test, benchmark
-- [ ] Compile + fix all errors
-- [ ] test_sanity pass
-- [ ] test_big pass
-- [ ] test_huge pass
-- [ ] Benchmark at 100K
-**→ STOP: zip all headers + plan + miniplan + benchmark HTML**
+- [x] Compile + fix all errors
+- [x] test_sanity pass
+- [x] test_big pass
+- [x] test_huge pass
+- [x] Benchmark at 100K
+**→ DONE**
