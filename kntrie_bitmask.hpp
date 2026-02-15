@@ -80,14 +80,6 @@ struct bitmap256 {
             dest[bm.find_slot<slot_mode::UNFILTERED>(indices[i])] = tagged_ptrs[i];
     }
 
-    // Fill u16 dest in bitmap order
-    static void arr_fill_sorted_u16(const bitmap256& bm, uint16_t* dest,
-                                const uint8_t* indices, const uint16_t* vals,
-                                unsigned count) noexcept {
-        for (unsigned i = 0; i < count; ++i)
-            dest[bm.find_slot<slot_mode::UNFILTERED>(indices[i])] = vals[i];
-    }
-
     // In-place insert: memmove right, write new entry, set bit
     static void arr_insert(bitmap256& bm, uint64_t* arr, unsigned count,
                            uint8_t idx, uint64_t val) noexcept {
@@ -348,7 +340,7 @@ struct bitmask_ops {
         // Fill desc array
         uint16_t* nd = desc_array_mut_(nn, hs, n_children);
         if (descs) {
-            bitmap256::arr_fill_sorted_u16(bm, nd, indices, descs, n_children);
+            std::memcpy(nd, descs, n_children * sizeof(uint16_t));
         } else {
             std::memset(nd, 0, n_children * sizeof(uint16_t));
         }
@@ -409,7 +401,7 @@ struct bitmask_ops {
         // Fill desc array (after children)
         uint16_t* nd = reinterpret_cast<uint16_t*>(nn + final_offset + 5 + final_n_children);
         if (descs) {
-            bitmap256::arr_fill_sorted_u16(fbm, nd, final_indices, descs, final_n_children);
+            std::memcpy(nd, descs, final_n_children * sizeof(uint16_t));
         } else {
             std::memset(nd, 0, final_n_children * sizeof(uint16_t));
         }
