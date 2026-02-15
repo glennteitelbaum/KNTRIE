@@ -890,17 +890,23 @@ private:
         if (total > COMPACT_MAX)
             return {tagged, true};
 
-        // Collect all entries
+        // Collect all entries (includes skip bytes in the top of each key)
         auto wk = std::make_unique<uint64_t[]>(total);
         auto wv = std::make_unique<VST[]>(total);
         size_t wi = 0;
-
-        // For coalesce: prefix starts at 0, bits consumed by skip are in the tree
         collect_entries_tagged_(tagged, 0, 0, wk.get(), wv.get(), wi);
 
-        // Account for skip bytes in bits calculation
-        int leaf_bits = bits;
-        // Build leaf
+        // Strip skip bytes from collected keys — the skip prefix will be
+        // stored separately via prepend_skip_, so suffixes must only cover
+        // the bits BELOW the skip level.
+        int leaf_bits = bits - sc * 8;
+        if (sc > 0) {
+            unsigned shift = sc * 8;
+            for (size_t i = 0; i < total; ++i)
+                wk[i] <<= shift;
+        }
+
+        // Build leaf with narrower suffix type
         uint64_t* leaf = build_leaf_from_arrays_(wk.get(), wv.get(), total, leaf_bits);
 
         // Transfer skip from bitmask to leaf
