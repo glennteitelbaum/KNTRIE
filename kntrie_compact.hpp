@@ -20,14 +20,9 @@ template<typename K>
 struct adaptive_search {
     // Pure cmov loop — returns pointer to candidate.
     // Caller checks *result == key.
-    // count must be power of 2 or 3/4 midpoint (P/2 + P/4).
+    // count must be power of 2.
     static const K* find_base(const K* base, unsigned count, K key) noexcept {
-        unsigned step = count >> 1;
-        if (!std::has_single_bit(count)) {
-            step = count / 3;
-            base = (base[step] <= key) ? base + step : base;
-        }
-        for (; step > 0; step >>= 1)
+        for (unsigned step = count >> 1; step > 0; step >>= 1)
             base = (base[step] <= key) ? base + step : base;
         return base;
     }
@@ -38,7 +33,7 @@ struct adaptive_search {
 //
 // Layout: [header (2 u64)][sorted_keys (aligned)][values (aligned)]
 //
-// Slot count is always power-of-2 or 3/4 midpoint (P/2+P/4). Extra slots are
+// Slot count is always power-of-2. Extra slots are
 // filled with evenly-spaced duplicates of neighboring keys.
 // Insert consumes the nearest dup; erase creates a new dup.
 //
@@ -55,16 +50,11 @@ struct compact_ops {
         (sizeof(K) == 2) ? 1 :
         (sizeof(K) == 4) ? 2 : 3;
 
-    // --- slot count: power-of-2 or 3/4 midpoint (P/2 + P/4) ---
-    // Sequence: 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, ...
-    // Max waste: ~25% (down from ~50% with pure power-of-2).
+    // --- slot count: next power of 2 ---
 
     static constexpr uint16_t slots_for(unsigned entries) noexcept {
-        if (entries <= 4) return static_cast<uint16_t>(std::bit_ceil(entries));
         unsigned p = std::bit_ceil(entries);
-        unsigned mid = p / 2 + p / 4;  // 3/4 point
-        unsigned s = (entries <= mid) ? mid : p;
-        return static_cast<uint16_t>(std::min(s, unsigned(COMPACT_MAX)));
+        return static_cast<uint16_t>(std::min(p, unsigned(COMPACT_MAX)));
     }
 
     // --- exact u64 size for a given slot count ---
