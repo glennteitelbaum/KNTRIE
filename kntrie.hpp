@@ -128,6 +128,7 @@ public:
     size_t memory_usage() const noexcept { return impl_.memory_usage(); }
     auto   debug_stats() const noexcept  { return impl_.debug_stats(); }
     auto   debug_root_info() const       { return impl_.debug_root_info(); }
+    const uint64_t* debug_root() const noexcept { return impl_.debug_root(); }
 
 private:
     kntrie_impl<KEY, VALUE, ALLOC> impl_;

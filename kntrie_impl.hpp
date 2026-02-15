@@ -65,30 +65,28 @@ public:
         const uint64_t* node = root_;
         node_header hdr = *get_header(node);
 
-        while (true) {
-            size_t hs = 1 + hdr.is_skip();
-
-            if (hdr.is_skip()) [[unlikely]] {
-                const uint8_t* actual = reinterpret_cast<const uint8_t*>(&node[1]);
-                uint8_t skip = actual[7];
-                uint8_t i = 0;
-                do {
-                    if (static_cast<uint8_t>(ik >> (IK_BITS - 8)) != actual[i]) [[unlikely]]
-                        return nullptr;
-                    ik <<= 8;
-                } while (++i < skip);
-            }
-
-            if (hdr.is_leaf()) [[unlikely]] break;
-
+        while (!hdr.is_leaf()) [[likely]] {
             uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
             ik <<= 8;
-            node = BO::branchless_child(node, ti, hs);
+            node = BO::branchless_child(node, ti);
             hdr = *get_header(node);
         }
 
+        // Leaf skip check (leaves still have skip)
+        size_t hs = 1;
+        if (hdr.is_skip()) [[unlikely]] {
+            hs = 2;
+            const uint8_t* actual = reinterpret_cast<const uint8_t*>(&node[1]);
+            uint8_t skip = actual[7];
+            uint8_t i = 0;
+            do {
+                if (static_cast<uint8_t>(ik >> (IK_BITS - 8)) != actual[i]) [[unlikely]]
+                    return nullptr;
+                ik <<= 8;
+            } while (++i < skip);
+        }
+
         // Leaf dispatch by suffix_type
-        size_t hs = 1 + hdr.is_skip();
         uint8_t st = hdr.suffix_type();
 
         if (st <= 1) [[likely]] {
@@ -226,23 +224,22 @@ private:
     insert_result_t insert_node_(uint64_t* node, IK ik, VST value, int bits) {
         auto* hdr = get_header(node);
 
-        // Skip check
-        uint8_t skip = hdr->skip();
-        if (skip) [[unlikely]] {
-            const uint8_t* actual = hdr->prefix_bytes();
-            for (uint8_t i = 0; i < skip; ++i) {
-                uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-                if (expected != actual[i]) {
-                    if constexpr (!INSERT) return {node, false, false};
-                    return {split_on_prefix_(node, hdr, ik, value,
-                                              actual, skip, i, bits), true, false};
-                }
-                ik = static_cast<IK>(ik << 8);
-                bits -= 8;
-            }
-        }
-
         if (hdr->is_leaf()) {
+            // Leaf skip check
+            uint8_t skip = hdr->skip();
+            if (skip) [[unlikely]] {
+                const uint8_t* actual = hdr->prefix_bytes();
+                for (uint8_t i = 0; i < skip; ++i) {
+                    uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+                    if (expected != actual[i]) {
+                        if constexpr (!INSERT) return {node, false, false};
+                        return {split_on_prefix_(node, hdr, ik, value,
+                                                  actual, skip, i, bits), true, false};
+                    }
+                    ik = static_cast<IK>(ik << 8);
+                    bits -= 8;
+                }
+            }
             auto result = leaf_insert_<INSERT, ASSIGN>(node, hdr, ik, value, bits);
             if (result.needs_split) {
                 if constexpr (!INSERT) return {node, false, false};
@@ -251,7 +248,7 @@ private:
             return result;
         }
 
-        // Bitmask node: extract next byte, descend
+        // Bitmask node: no skip, just descend
         uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
         auto lk = BO::lookup(node, ti);
 
@@ -309,22 +306,22 @@ private:
     erase_result_t erase_node_(uint64_t* node, IK ik, int bits) {
         auto* hdr = get_header(node);
 
-        // Skip check
-        uint8_t skip = hdr->skip();
-        if (skip) [[unlikely]] {
-            const uint8_t* actual = hdr->prefix_bytes();
-            for (uint8_t i = 0; i < skip; ++i) {
-                uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-                if (expected != actual[i]) return {node, false};
-                ik = static_cast<IK>(ik << 8);
-                bits -= 8;
+        if (hdr->is_leaf()) {
+            // Leaf skip check
+            uint8_t skip = hdr->skip();
+            if (skip) [[unlikely]] {
+                const uint8_t* actual = hdr->prefix_bytes();
+                for (uint8_t i = 0; i < skip; ++i) {
+                    uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+                    if (expected != actual[i]) return {node, false};
+                    ik = static_cast<IK>(ik << 8);
+                    bits -= 8;
+                }
             }
+            return leaf_erase_(node, hdr, ik);
         }
 
-        if (hdr->is_leaf())
-            return leaf_erase_(node, hdr, ik);
-
-        // Bitmask node: extract next byte, descend
+        // Bitmask node: no skip, just descend
         uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
         auto lk = BO::lookup(node, ti);
         if (!lk.found) return {node, false};
@@ -342,6 +339,23 @@ private:
 
         // Child fully erased — remove from bitmask
         auto* nn = BO::remove_child(node, hdr, lk.slot, ti, alloc_);
+
+        // Collapse: single-child bitmask whose child is a leaf → absorb byte
+        if (nn && get_header(nn)->entries() == 1) {
+            uint64_t* sole_child = nullptr;
+            uint8_t sole_idx = 0;
+            BO::for_each_child(nn, [&](uint8_t idx, int, uint64_t* child) {
+                sole_child = child;
+                sole_idx = idx;
+            });
+            if (get_header(sole_child)->is_leaf()) {
+                uint8_t byte_arr[1] = {sole_idx};
+                sole_child = prepend_skip_(sole_child, 1, byte_arr);
+                size_t nn_au64 = get_header(nn)->alloc_u64();
+                dealloc_node(alloc_, nn, nn_au64);
+                nn = sole_child;
+            }
+        }
         return {nn, true};
     }
 
@@ -432,6 +446,21 @@ private:
     }
 
     // ==================================================================
+    // wrap_bitmask_chain_: wrap child in single-child bitmask nodes
+    //
+    // Each prefix byte becomes a bitmask node with one child.
+    // Built inside-out so bytes[0] is outermost.
+    // ==================================================================
+
+    uint64_t* wrap_bitmask_chain_(uint64_t* child, const uint8_t* bytes, uint8_t count) {
+        for (int i = count - 1; i >= 0; --i) {
+            uint8_t idx = bytes[i];
+            child = BO::make_bitmask(&idx, &child, 1, alloc_);
+        }
+        return child;
+    }
+
+    // ==================================================================
     // make_single_leaf: create 1-entry leaf at given bits
     // ==================================================================
 
@@ -488,8 +517,12 @@ private:
 
         // Propagate old skip/prefix to new child
         uint8_t ps = hdr->skip();
-        if (ps > 0)
-            child = prepend_skip_(child, ps, hdr->prefix_bytes());
+        if (ps > 0) {
+            if (get_header(child)->is_leaf())
+                child = prepend_skip_(child, ps, hdr->prefix_bytes());
+            else
+                child = wrap_bitmask_chain_(child, hdr->prefix_bytes(), ps);
+        }
 
         dealloc_node(alloc_, node, hdr->alloc_u64());
         return child;
@@ -581,9 +614,12 @@ private:
 
                 uint64_t* child = build_node_from_arrays_(suf, vals, count, bits - 8);
 
-                // Prepend skip byte to child's prefix
+                // Leaf gets skip prefix, bitmask gets chain wrapper
                 uint8_t byte_arr[1] = {first_top};
-                return prepend_skip_(child, 1, byte_arr);
+                if (get_header(child)->is_leaf())
+                    return prepend_skip_(child, 1, byte_arr);
+                else
+                    return wrap_bitmask_chain_(child, byte_arr, 1);
             }
         }
 
@@ -620,8 +656,7 @@ private:
             n_children++;
         }
 
-        return BO::make_bitmask(indices, child_ptrs, n_children,
-                                 0, nullptr, alloc_);
+        return BO::make_bitmask(indices, child_ptrs, n_children, alloc_);
     }
 
     // ==================================================================
@@ -683,8 +718,10 @@ private:
             bi[1] = new_idx; cp[1] = new_leaf;
         }
 
-        return BO::make_bitmask(bi, cp, 2, common,
-                                 common > 0 ? saved_prefix : nullptr, alloc_);
+        auto* bm_node = BO::make_bitmask(bi, cp, 2, alloc_);
+        if (common > 0)
+            bm_node = wrap_bitmask_chain_(bm_node, saved_prefix, common);
+        return bm_node;
     }
 
     // ==================================================================

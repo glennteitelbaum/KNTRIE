@@ -144,11 +144,10 @@ struct bitmask_ops {
     // Bitmask node: branchless descent (for find)
     // ==================================================================
 
-    static const uint64_t* branchless_child(const uint64_t* node, uint8_t idx,
-                                            size_t header_size) noexcept {
-        const bitmap256& bm = bm_(node, header_size);
+    static const uint64_t* branchless_child(const uint64_t* node, uint8_t idx) noexcept {
+        const bitmap256& bm = bm_(node, 1);
         int slot = bm.find_slot<slot_mode::BRANCHLESS>(idx);  // 0 on miss -> sentinel
-        return reinterpret_cast<const uint64_t*>(children_(node, header_size)[slot]);
+        return reinterpret_cast<const uint64_t*>(children_(node, 1)[slot]);
     }
 
     // ==================================================================
@@ -162,7 +161,7 @@ struct bitmask_ops {
     };
 
     static child_lookup lookup(const uint64_t* node, uint8_t idx) noexcept {
-        size_t hs = hdr_u64(node);
+        constexpr size_t hs = 1;
         const bitmap256& bm = bm_(node, hs);
         int slot = bm.find_slot<slot_mode::FAST_EXIT>(idx);
         if (slot < 0) return {nullptr, -1, false};
@@ -175,7 +174,7 @@ struct bitmask_ops {
     // ==================================================================
 
     static void set_child(uint64_t* node, int slot, uint64_t* ptr) noexcept {
-        real_children_mut_(node, hdr_u64(node))[slot] = reinterpret_cast<uint64_t>(ptr);
+        real_children_mut_(node, 1)[slot] = reinterpret_cast<uint64_t>(ptr);
     }
 
     // ==================================================================
@@ -184,7 +183,7 @@ struct bitmask_ops {
 
     static uint64_t* add_child(uint64_t* node, node_header* h,
                                 uint8_t idx, uint64_t* child_ptr, ALLOC& alloc) {
-        size_t hs = hdr_u64(node);
+        constexpr size_t hs = 1;
         bitmap256& bm = bm_mut_(node, hs);
         unsigned oc = h->entries();
         unsigned nc = oc + 1;
@@ -204,7 +203,6 @@ struct bitmask_ops {
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         *nh = *h;
-        if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(nc);
         nh->set_alloc_u64(au64);
 
@@ -234,7 +232,7 @@ struct bitmask_ops {
             return nullptr;
         }
 
-        size_t hs = hdr_u64(node);
+        constexpr size_t hs = 1;
         size_t needed = bitmask_size_u64(nc, hs);
 
         // In-place
@@ -250,7 +248,6 @@ struct bitmask_ops {
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         *nh = *h;
-        if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(nc);
         nh->set_alloc_u64(au64);
 
@@ -271,20 +268,18 @@ struct bitmask_ops {
 
     static uint64_t* make_bitmask(const uint8_t* indices,
                                    uint64_t* const* child_ptrs,
-                                   unsigned n_children, uint8_t skip,
-                                   const uint8_t* prefix, ALLOC& alloc) {
+                                   unsigned n_children, ALLOC& alloc) {
         bitmap256 bm = bitmap256::from_indices(indices, n_children);
 
-        size_t hs = 1 + (skip > 0);
+        constexpr size_t hs = 1;
         size_t needed = bitmask_size_u64(n_children, hs);
         size_t au64 = round_up_u64(needed);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
         nh->set_entries(n_children);
         nh->set_alloc_u64(au64);
-        nh->set_skip(skip);
+        nh->set_skip(0);
         nh->set_bitmask();
-        if (skip > 0) nh->set_prefix(prefix, skip);
 
         bm_mut_(nn, hs) = bm;
         children_mut_(nn, hs)[0] = reinterpret_cast<uint64_t>(SENTINEL_NODE);
@@ -300,7 +295,7 @@ struct bitmask_ops {
 
     template<typename Fn>
     static void for_each_child(const uint64_t* node, Fn&& cb) {
-        size_t hs = hdr_u64(node);
+        constexpr size_t hs = 1;
         const bitmap256& bm = bm_(node, hs);
         const uint64_t* rch = real_children_(node, hs);
         int slot = 0;
