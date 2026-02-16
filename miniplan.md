@@ -23,8 +23,8 @@ transcript before doing anything.
 | kntrie_support.hpp | 337 | node_header, tagged ptrs, bitmap256 layout constants, next_narrow_t |
 | kntrie_compact.hpp | 612 | CO<NK>: compact leaf ops |
 | kntrie_bitmask.hpp | 1092 | BM: bitmask/chain ops (add/remove/build/wrap/collapse) |
-| kntrie_ops.hpp | 387 | Ops<NK>: find + desc/skip/dealloc helpers + NK-dependent build/convert |
-| kntrie_impl.hpp | 1456 | Insert, erase, iter, build (old dups pending 3B deletion) |
+| kntrie_ops.hpp | 759 | Ops<NK>: find + insert + desc/skip/dealloc helpers + build/convert |
+| kntrie_impl.hpp | 983 | Erase, iter, build_leaf_from_arrays, leaf_for_each_u64 |
 | kntrie.hpp | 240 | Public API, KEY→UK, iterators |
 
 ---
@@ -188,30 +188,33 @@ Compile + test + ASAN.
 - [x] 3A.5 `build_bitmask_from_arrays_tagged_` → `Ops::` — DONE
       - Same narrowing pattern as 3A.4
 
-- [~] 3A.6 `split_on_prefix_tagged_` — DEFERRED
-      - Runtime variable prefix consumption → can't determine leaf NK at compile time
-      - Write-path: suffix_type dispatch cost negligible vs alloc
-- [~] 3A.7 `split_skip_at_` — DEFERRED (same reason)
+- [x] 3A.6 `split_on_prefix_` → `Ops::split_on_prefix_<BITS>` — DONE
+      - Recursive `make_leaf_descended_<BITS>` for NK narrowing
+      - `insert_leaf_skip_<BITS>` consumes prefix bytes one-at-a-time with narrowing
+- [x] 3A.7 `split_skip_at_` → `Ops::split_skip_at_<BITS>` — DONE
+      - Same narrowing pattern via `insert_chain_skip_<BITS>`
 
 **⏸ STOP**: Present zip. Wait for confirmation. Compile + test + ASAN.
 
 ### 3B: Move insert dispatch
 
-- [ ] 3B.1 Move `leaf_insert_` (impl:687) → `Ops::leaf_insert_`
-      - Replace suffix_type dispatch with `CO::insert`
-
-- [ ] 3B.2 Merge `insert_skip_chain_` logic into `insert_node_`
-      - Single function, skip loop uses BO:: accessors
-      - Use `BO::chain_add_child` for child addition
-
-- [ ] 3B.3 Move `insert_node_` (impl:610) → `Ops::insert_node_<INSERT, ASSIGN>`
-      - IK param → NK param
-      - Add narrowing: `Narrow::template insert_node_<INSERT, ASSIGN>` at boundary
-      - All leaf dispatch via CO (compile-time)
-      - All skip chain ops via BO methods
-
-- [ ] 3B.4 Thin down `insert_dispatch_` in impl to ~10 lines:
-      - Convert IK → NK0, call `Ops::template insert_node_<INSERT, ASSIGN>`
+- [x] 3B.1 `leaf_insert_` → `Ops::leaf_insert_<BITS,INSERT,ASSIGN>` — DONE
+      - sizeof(NK)==1 → BO::bitmap_insert, else → CO::insert
+      - needs_split → convert_to_bitmask_tagged_ (now in Ops)
+- [x] 3B.2 Merged `insert_skip_chain_` into recursive `insert_chain_skip_<BITS>` — DONE
+      - Byte-at-a-time recursion with narrowing at NK/2 boundaries
+- [x] 3B.3 `insert_node_` → `Ops::insert_node_<BITS,INSERT,ASSIGN>` — DONE
+      - NK from struct, BITS template param
+      - Leaf prefix walk: `insert_leaf_skip_<BITS>` recursive
+      - Chain walk: `insert_chain_skip_<BITS>` recursive
+      - Final bitmask: `insert_final_bitmask_<BITS>` with narrowing
+- [x] 3B.4 `insert_dispatch_` thinned to 10 lines — DONE
+      - IK→NK0 conversion, delegates to `Ops::insert_node_<KEY_BITS,...>`
+- [x] 3B.5 Deleted all old insert code from impl — DONE
+      - insert_node_, leaf_insert_, insert_skip_chain_, split_skip_at_
+      - make_single_leaf_ (old IK), convert_to_bitmask_tagged_ (old)
+      - split_on_prefix_tagged_, build_node/bitmask_from_arrays_tagged_ (old)
+      - impl: 1456→983 (−473 lines)
 
 **⏸ STOP**: Present zip. Wait for confirmation. Compile + test + ASAN.
 
@@ -362,3 +365,4 @@ ALL is_leaf() / set_bitmask() calls replaced by tagged ptr checks.
 | 2026-02-16 | 2B | 2B.1-2B.4 | build_remainder, wrap_in_chain, collapse_info moved to BM. Impl -129 lines |
 | 2026-02-16 | 2C | 2C.1-2C.5 | Desc helpers, skip helpers, dealloc_bitmask_subtree_ moved to Ops. Impl -116 lines. Deferred: remove_node_/destroy_leaf_ (NK-dependent) |
 | 2026-02-16 | 3A | 3A.1-3A.5 | NK-dependent helpers added to Ops: make_single_leaf_, leaf_for_each_aligned_, build_leaf_, build_node_from_arrays_tagged_, build_bitmask_from_arrays_tagged_, convert_to_bitmask_tagged_. Narrowing at NK/2 boundaries. Deferred 3A.6-7 (runtime prefix consumption) |
+| 2026-02-16 | 3A+3B | 3A.6-7, 3B.1-5 | Full insert path moved to Ops with recursive byte-at-a-time narrowing. split_on_prefix_, split_skip_at_, insert_node_, leaf_insert_, insert_chain_skip_, insert_final_bitmask_ all in Ops. Old IK-based code deleted. impl 1456→983 (−473). ops 387→759 (+372) |

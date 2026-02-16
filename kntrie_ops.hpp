@@ -100,6 +100,173 @@ struct kntrie_ops {
         }
     }
 
+    // Recursively descend `depth` bytes, narrowing NK at boundaries,
+    // then create a single-entry leaf at the correct NK.
+    // Returns raw (untagged) pointer. Caller tags.
+    template<int BITS> requires (BITS >= 8)
+    static uint64_t* make_leaf_descended_(NK ik, VST value, uint8_t depth,
+                                           ALLOC& alloc) {
+        if (depth == 0)
+            return make_single_leaf_(ik, value, alloc);
+
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
+                return Narrow::template make_leaf_descended_<BITS - 8>(
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    value, depth - 1, alloc);
+            } else {
+                return make_leaf_descended_<BITS - 8>(
+                    shifted, value, depth - 1, alloc);
+            }
+        }
+        __builtin_unreachable();
+    }
+
+    // ==================================================================
+    // split_on_prefix_: leaf skip prefix diverges at position `common`.
+    //
+    // BITS: compile-time remaining key bits at this node's depth
+    //       (BEFORE any prefix bytes were consumed).
+    //       ik has already been shifted by `common` bytes by the caller's
+    //       prefix-matching loop, so ik's top byte is the divergence byte.
+    //
+    // Returns: tagged uint64_t.
+    // ==================================================================
+
+    template<int BITS> requires (BITS >= 8)
+    static uint64_t split_on_prefix_(uint64_t* node, node_header* hdr,
+                                      NK ik, VST value,
+                                      const uint8_t* actual, uint8_t skip,
+                                      uint8_t common, ALLOC& alloc) {
+        uint8_t new_idx = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        uint8_t old_idx = actual[common];
+        uint8_t old_rem = skip - 1 - common;
+
+        // Save common prefix before any reallocation invalidates `actual`
+        uint8_t saved_prefix[6] = {};
+        if (common > 0)
+            std::memcpy(saved_prefix, actual, common);
+
+        // Update old node: strip consumed prefix, keep remainder
+        if (old_rem > 0) {
+            uint8_t rem[6] = {};
+            std::memcpy(rem, actual + common + 1, old_rem);
+            hdr->set_skip(old_rem);
+            hdr->set_prefix(rem, old_rem);
+        } else {
+            node = remove_skip_(node, alloc);
+            hdr = get_header(node);
+        }
+
+        // Extract prefix bytes from remaining ik (past divergence byte)
+        uint8_t new_prefix[6] = {};
+        {
+            NK tmp = static_cast<NK>(ik << 8);
+            for (uint8_t j = 0; j < old_rem; ++j) {
+                new_prefix[j] = static_cast<uint8_t>(tmp >> (NK_BITS - 8));
+                tmp = static_cast<NK>(tmp << 8);
+            }
+        }
+
+        // Build new leaf at correct NK depth via recursive narrowing.
+        // Consume old_rem bytes past the divergence byte.
+        uint64_t* new_leaf;
+        if constexpr (BITS > 8) {
+            new_leaf = make_leaf_descended_<BITS - 8>(
+                static_cast<NK>(ik << 8), value, old_rem, alloc);
+        } else {
+            // BITS==8: no skip possible on 8-bit leaf, unreachable
+            new_leaf = make_single_leaf_(ik, value, alloc);
+        }
+        if (old_rem > 0)
+            new_leaf = prepend_skip_(new_leaf, old_rem, new_prefix, alloc);
+
+        // Create parent bitmask with 2 children
+        uint8_t   bi[2];
+        uint64_t  cp[2];
+        if (new_idx < old_idx) {
+            bi[0] = new_idx; cp[0] = tag_leaf(new_leaf);
+            bi[1] = old_idx; cp[1] = tag_leaf(node);
+        } else {
+            bi[0] = old_idx; cp[0] = tag_leaf(node);
+            bi[1] = new_idx; cp[1] = tag_leaf(new_leaf);
+        }
+
+        uint16_t ds[2] = {tagged_count(cp[0]), tagged_count(cp[1])};
+        auto* bm_node = BO::make_bitmask(bi, cp, 2, alloc, ds);
+        get_header(bm_node)->set_descendants(sum_tagged_array(cp, 2));
+        if (common > 0)
+            return BO::wrap_in_chain(bm_node, saved_prefix, common, alloc);
+        return tag_bitmask(bm_node);
+    }
+
+    // ==================================================================
+    // split_skip_at_: key diverges at embed position `split_pos`
+    //                 in a skip chain.
+    //
+    // BITS: compile-time remaining key bits (ik's top byte is the
+    //       expected byte at embed split_pos).
+    //
+    // 1. Build new leaf for divergent key
+    // 2. Build remainder from [split_pos+1..sc-1] + final bitmask
+    // 3. Create 2-child bitmask at split point
+    // 4. If split_pos > 0: wrap in skip chain for bytes [0..split_pos-1]
+    // Returns: tagged bitmask pointer.
+    // ==================================================================
+
+    template<int BITS> requires (BITS >= 8)
+    static uint64_t split_skip_at_(uint64_t* node, node_header* hdr,
+                                    uint8_t sc, uint8_t split_pos,
+                                    NK ik, VST value, ALLOC& alloc) {
+        uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        uint8_t actual_byte = BO::skip_byte(node, split_pos);
+
+        // Build new leaf — one byte past the split point, with recursive narrowing
+        uint64_t new_leaf_tagged;
+        {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
+                auto* leaf = Narrow::make_single_leaf_(
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)), value, alloc);
+                new_leaf_tagged = tag_leaf(leaf);
+            } else {
+                auto* leaf = make_single_leaf_(shifted, value, alloc);
+                new_leaf_tagged = tag_leaf(leaf);
+            }
+        }
+
+        // Build remainder from [split_pos+1..sc-1] + final bitmask
+        uint64_t remainder = BO::build_remainder(node, sc, split_pos + 1, alloc);
+
+        // Create 2-child bitmask at split point
+        uint8_t bi[2];
+        uint64_t cp[2];
+        if (expected < actual_byte) {
+            bi[0] = expected;    cp[0] = new_leaf_tagged;
+            bi[1] = actual_byte; cp[1] = remainder;
+        } else {
+            bi[0] = actual_byte; cp[0] = remainder;
+            bi[1] = expected;    cp[1] = new_leaf_tagged;
+        }
+        uint16_t ds[2] = {tagged_count(cp[0]), tagged_count(cp[1])};
+        auto* split_node = BO::make_bitmask(bi, cp, 2, alloc, ds);
+        get_header(split_node)->set_descendants(sum_tagged_array(cp, 2));
+
+        // Wrap in skip chain for prefix bytes [0..split_pos-1]
+        uint64_t result;
+        if (split_pos > 0) {
+            uint8_t prefix_bytes[6];
+            BO::skip_bytes(node, split_pos, prefix_bytes);
+            result = BO::wrap_in_chain(split_node, prefix_bytes, split_pos, alloc);
+        } else {
+            result = tag_bitmask(split_node);
+        }
+
+        dealloc_node(alloc, node, hdr->alloc_u64());
+        return result;
+    }
+
     // Iterate leaf entries, callback receives (uint64_t bit63_aligned, VST value)
     template<typename Fn>
     static void leaf_for_each_aligned_(const uint64_t* node, const node_header* hdr,
@@ -266,6 +433,211 @@ struct kntrie_ops {
 
         dealloc_node(alloc, const_cast<uint64_t*>(node), hdr->alloc_u64());
         return child_tagged;
+    }
+
+    // ==================================================================
+    // Insert — template<BITS, INSERT, ASSIGN>, NK from struct
+    //
+    // BITS: compile-time remaining key bits at this node's depth.
+    // ik: NK-typed key shifted so next byte is at (NK_BITS - 8).
+    // ==================================================================
+
+    template<int BITS, bool INSERT, bool ASSIGN> requires (BITS >= 8)
+    static insert_result_t insert_node_(uint64_t ptr, NK ik, VST value,
+                                         ALLOC& alloc) {
+        // SENTINEL
+        if (ptr == SENTINEL_TAGGED) {
+            if constexpr (!INSERT) return {ptr, false, false};
+            return {tag_leaf(make_single_leaf_(ik, value, alloc)), true, false};
+        }
+
+        // LEAF
+        if (ptr & LEAF_BIT) {
+            uint64_t* node = untag_leaf_mut(ptr);
+            auto* hdr = get_header(node);
+
+            uint8_t skip = hdr->skip();
+            if (skip) [[unlikely]] {
+                const uint8_t* actual = hdr->prefix_bytes();
+                return insert_leaf_skip_<BITS, INSERT, ASSIGN>(
+                    node, hdr, ik, value, actual, skip, 0, alloc);
+            }
+
+            return leaf_insert_<BITS, INSERT, ASSIGN>(node, hdr, ik, value, alloc);
+        }
+
+        // BITMASK
+        uint64_t* node = bm_to_node(ptr);
+        auto* hdr = get_header(node);
+        uint8_t sc = hdr->skip();
+
+        if (sc > 0)
+            return insert_chain_skip_<BITS, INSERT, ASSIGN>(
+                node, hdr, sc, ik, value, 0, alloc);
+
+        return insert_final_bitmask_<BITS, INSERT, ASSIGN>(
+            node, hdr, 0, ik, value, alloc);
+    }
+
+    // --- Leaf skip prefix: recursive byte-at-a-time with narrowing ---
+    template<int BITS, bool INSERT, bool ASSIGN> requires (BITS >= 8)
+    static insert_result_t insert_leaf_skip_(
+            uint64_t* node, node_header* hdr,
+            NK ik, VST value,
+            const uint8_t* actual, uint8_t skip, uint8_t pos,
+            ALLOC& alloc) {
+        if (pos >= skip)
+            return leaf_insert_<BITS, INSERT, ASSIGN>(node, hdr, ik, value, alloc);
+
+        uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        if (expected != actual[pos]) {
+            if constexpr (!INSERT) return {tag_leaf(node), false, false};
+            return {split_on_prefix_<BITS>(node, hdr, ik, value,
+                                            actual, skip, pos, alloc), true, false};
+        }
+
+        // Match — consume byte, narrow at boundary
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
+                return Narrow::template insert_leaf_skip_<BITS - 8, INSERT, ASSIGN>(
+                    node, hdr,
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    value, actual, skip, pos + 1, alloc);
+            } else {
+                return insert_leaf_skip_<BITS - 8, INSERT, ASSIGN>(
+                    node, hdr, shifted, value, actual, skip, pos + 1, alloc);
+            }
+        }
+        __builtin_unreachable();
+    }
+
+    // --- Leaf insert: compile-time NK dispatch ---
+    template<int BITS, bool INSERT, bool ASSIGN>
+    static insert_result_t leaf_insert_(uint64_t* node, node_header* hdr,
+                                         NK ik, VST value, ALLOC& alloc) {
+        insert_result_t result;
+        if constexpr (sizeof(NK) == 1) {
+            result = BO::template bitmap_insert<INSERT, ASSIGN>(
+                node, static_cast<uint8_t>(ik), value, alloc);
+        } else {
+            result = CO::template insert<INSERT, ASSIGN>(
+                node, hdr, ik, value, alloc);
+        }
+        if (result.needs_split) {
+            if constexpr (!INSERT) return {tag_leaf(node), false, false};
+            return {convert_to_bitmask_tagged_(node, hdr, ik, value, BITS, alloc),
+                    true, false};
+        }
+        return result;
+    }
+
+    // --- Skip chain: recursive embed walk with narrowing ---
+    template<int BITS, bool INSERT, bool ASSIGN> requires (BITS >= 8)
+    static insert_result_t insert_chain_skip_(
+            uint64_t* node, node_header* hdr,
+            uint8_t sc, NK ik, VST value, uint8_t pos,
+            ALLOC& alloc) {
+        if (pos >= sc)
+            return insert_final_bitmask_<BITS, INSERT, ASSIGN>(
+                node, hdr, sc, ik, value, alloc);
+
+        uint8_t actual_byte = BO::skip_byte(node, pos);
+        uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+
+        if (expected != actual_byte) {
+            if constexpr (!INSERT) return {tag_bitmask(node), false, false};
+            return {split_skip_at_<BITS>(node, hdr, sc, pos, ik, value, alloc),
+                    true, false};
+        }
+
+        // Match — consume byte, narrow at boundary
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
+                return Narrow::template insert_chain_skip_<BITS - 8, INSERT, ASSIGN>(
+                    node, hdr, sc,
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    value, pos + 1, alloc);
+            } else {
+                return insert_chain_skip_<BITS - 8, INSERT, ASSIGN>(
+                    node, hdr, sc, shifted, value, pos + 1, alloc);
+            }
+        }
+        __builtin_unreachable();
+    }
+
+    // --- Final bitmask: lookup + recurse with narrowing ---
+    template<int BITS, bool INSERT, bool ASSIGN> requires (BITS >= 8)
+    static insert_result_t insert_final_bitmask_(
+            uint64_t* node, node_header* hdr,
+            uint8_t sc, NK ik, VST value, ALLOC& alloc) {
+        uint8_t ti = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+
+        typename BO::child_lookup cl;
+        if (sc > 0)
+            cl = BO::chain_lookup(node, sc, ti);
+        else
+            cl = BO::lookup(node, ti);
+
+        if (!cl.found) {
+            if constexpr (!INSERT) return {tag_bitmask(node), false, false};
+
+            uint64_t* leaf;
+            if constexpr (BITS > 8) {
+                NK shifted = static_cast<NK>(ik << 8);
+                if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                    leaf = Narrow::make_single_leaf_(
+                        static_cast<NNK>(shifted >> (NK_BITS / 2)), value, alloc);
+                else
+                    leaf = make_single_leaf_(shifted, value, alloc);
+            } else {
+                // BITS==8: no child to create — shouldn't reach here
+                // (bitmap leaf handles 8-bit case)
+                __builtin_unreachable();
+            }
+
+            uint64_t* nn;
+            if (sc > 0)
+                nn = BO::chain_add_child(node, hdr, sc, ti, tag_leaf(leaf), 1, alloc);
+            else
+                nn = BO::add_child(node, hdr, ti, tag_leaf(leaf), 1, alloc);
+            inc_descendants_(get_header(nn));
+            return {tag_bitmask(nn), true, false};
+        }
+
+        // Found — recurse into child
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            insert_result_t cr;
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
+                cr = Narrow::template insert_node_<BITS - 8, INSERT, ASSIGN>(
+                    cl.child,
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    value, alloc);
+            } else {
+                cr = insert_node_<BITS - 8, INSERT, ASSIGN>(
+                    cl.child, shifted, value, alloc);
+            }
+
+            if (cr.tagged_ptr != cl.child) {
+                if (sc > 0)
+                    BO::chain_set_child(node, sc, cl.slot, cr.tagged_ptr);
+                else
+                    BO::set_child(node, cl.slot, cr.tagged_ptr);
+            }
+            if (cr.inserted) {
+                inc_descendants_(hdr);
+                uint16_t* da;
+                if (sc > 0)
+                    da = BO::chain_desc_array_mut(node, sc, hdr->entries());
+                else
+                    da = BO::child_desc_array(node);
+                if (da[cl.slot] < COALESCE_CAP) da[cl.slot]++;
+            }
+            return {tag_bitmask(node), cr.inserted, false};
+        }
+        __builtin_unreachable();
     }
 
     // ==================================================================
