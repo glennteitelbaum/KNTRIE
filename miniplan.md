@@ -23,7 +23,7 @@ transcript before doing anything.
 | kntrie_support.hpp | 324 | node_header, tagged ptrs, bitmap256 layout constants, next_narrow_t |
 | kntrie_compact.hpp | 612 | CO<NK>: compact leaf ops |
 | kntrie_bitmask.hpp | 1092 | BM: bitmask/chain ops (add/remove/build/wrap/collapse) |
-| kntrie_ops.hpp | 1138 | Ops<NK>: find + insert + erase + coalesce + collect + build helpers |
+| kntrie_ops.hpp | 1173 | Ops<NK>: find + insert + erase + coalesce + collect + build helpers |
 | kntrie_impl.hpp | 604 | Iteration (suffix_type dispatch), destroy, stats |
 | kntrie.hpp | 240 | Public API, KEY→UK, iterators |
 
@@ -238,7 +238,10 @@ Compile + test + ASAN.
       - coalesce_build_skip_<BITS>: narrow through skip to find correct NK for build_leaf_
       - Deleted from impl: do_coalesce_, collect_entries_tagged_, build_leaf_from_arrays_,
         leaf_for_each_u64_, suffix_type_for()
-      - impl: 772→604 (−168). ops: 973→1138 (+165). support: 337→324 (−13)
+      - NK-native arrays: eliminated uint64_t intermediary. collect/build/convert all
+        use NK-typed arrays. At narrowing boundaries: child returns NNK[], parent widens.
+        leaf_for_each_ returns (NK,VST). build_leaf_ takes NK*. collected_t = {NK[],VST[],count}.
+      - impl: 983→604 (−379). ops: 759→1173 (+414). support: 337→324 (−13)
 
 **⏸ STOP**: Present zip. Wait for confirmation. Compile + test + ASAN.
 
@@ -356,4 +359,4 @@ ALL is_leaf() / set_bitmask() calls replaced by tagged ptr checks.
 | 2026-02-16 | 2C | 2C.1-2C.5 | Desc helpers, skip helpers, dealloc_bitmask_subtree_ moved to Ops. Impl -116 lines. Deferred: remove_node_/destroy_leaf_ (NK-dependent) |
 | 2026-02-16 | 3A | 3A.1-3A.5 | NK-dependent helpers added to Ops: make_single_leaf_, leaf_for_each_aligned_, build_leaf_, build_node_from_arrays_tagged_, build_bitmask_from_arrays_tagged_, convert_to_bitmask_tagged_. Narrowing at NK/2 boundaries. Deferred 3A.6-7 (runtime prefix consumption) |
 | 2026-02-16 | 3A+3B | 3A.6-7, 3B.1-5 | Full insert path moved to Ops with recursive byte-at-a-time narrowing. split_on_prefix_, split_skip_at_, insert_node_, leaf_insert_, insert_chain_skip_, insert_final_bitmask_ all in Ops. Old IK-based code deleted. impl 1456→983 (−473). ops 387→759 (+372) |
-| 2026-02-16 | 4A+4B | All | Full erase+coalesce in Ops. No CoalesceFn callback — do_coalesce_<BITS>, collect_entries_<BITS> with recursive narrowing. Deleted suffix_type_for(). impl 983→604 (−379). ops 759→1138 (+379). support 337→324 (−13) |
+| 2026-02-16 | 4A+4B | All | Full erase+coalesce in Ops. No CoalesceFn — do_coalesce_<BITS>, collect_entries_<BITS> return NK-typed collected_t. NK-native arrays throughout: no uint64_t intermediary. build_leaf_ takes NK*. leaf_for_each_ returns (NK,VST). Parent widens at narrowing boundaries. impl 983→604 (−379). ops 759→1173 (+414). support 337→324 (−13) |
