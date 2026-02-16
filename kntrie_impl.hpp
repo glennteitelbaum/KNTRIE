@@ -230,48 +230,26 @@ public:
 
     iter_result_t iter_next_(KEY key) const noexcept {
         if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
+        return iter_next_node_(root_, KO::to_internal(key), IK{0}, 0);
+    }
 
-        IK ik = KO::to_internal(key);
-        uint64_t ptr = root_;
-        IK prefix = IK{0};
-        int bits = 0;
+    iter_result_t iter_prev_(KEY key) const noexcept {
+        if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
+        return iter_prev_node_(root_, KO::to_internal(key), IK{0}, 0);
+    }
 
-        struct resume_t { uint64_t child_ptr; IK prefix; int bits; };
-        resume_t stk[IK_BITS / 8];
-        int top = -1;
+private:
+    // ==================================================================
+    // Iterator helpers (private)
+    // ==================================================================
 
-        // Bitmask descent
-        while (!(ptr & LEAF_BIT)) {
-            const auto* bm = reinterpret_cast<const uint64_t*>(ptr);
-            const auto& bitmap = *reinterpret_cast<const bitmap256*>(bm);
-            uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-            ik <<= 8;
-
-            if (bitmap.has_bit(byte)) {
-                auto adj = bitmap.next_set_after(byte);
-                if (adj.found) {
-                    IK rp = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
-                    stk[++top] = {bm[BITMAP256_U64 + 1 + adj.slot], rp, bits + 8};
-                }
-                int slot = bitmap.find_slot<slot_mode::UNFILTERED>(byte);
-                prefix |= IK(byte) << (IK_BITS - bits - 8);
-                bits += 8;
-                ptr = bm[BITMAP256_U64 + 1 + slot];
-            } else {
-                auto adj = bitmap.next_set_after(byte);
-                if (adj.found) {
-                    IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
-                    return descend_min_(bm[BITMAP256_U64 + 1 + adj.slot], np, bits + 8);
-                }
-                goto use_resume_next;
-            }
-        }
-
-        // Leaf
-        {
+    // Recursive: find smallest key > ik in subtree at ptr
+    iter_result_t iter_next_node_(uint64_t ptr, IK ik, IK prefix, int bits) const noexcept {
+        // --- LEAF ---
+        if (ptr & LEAF_BIT) {
             const uint64_t* node = untag_leaf(ptr);
             node_header hdr = *get_header(node);
-            if (hdr.entries() == 0) goto use_resume_next;
+            if (hdr.entries() == 0) return {KEY{}, VALUE{}, false};
 
             size_t hs = 1;
             if (hdr.is_skip()) {
@@ -281,73 +259,50 @@ public:
                 for (uint8_t i = 0; i < skip; ++i) {
                     uint8_t kb = static_cast<uint8_t>(ik >> (IK_BITS - 8));
                     if (kb < sb[i]) {
-                        // All leaf entries > key, return first
                         for (uint8_t j = i; j < skip; ++j) {
                             prefix |= IK(sb[j]) << (IK_BITS - bits - 8);
                             bits += 8;
                         }
                         return leaf_first_(node, hdr, prefix, bits, hs);
                     }
-                    if (kb > sb[i]) goto use_resume_next;
+                    if (kb > sb[i]) return {KEY{}, VALUE{}, false};
                     prefix |= IK(sb[i]) << (IK_BITS - bits - 8);
                     bits += 8;
                     ik <<= 8;
                 }
             }
-
-            auto lr = leaf_next_dispatch_(node, hdr, ik, prefix, bits, hs);
-            if (lr.found) return lr;
+            return leaf_next_dispatch_(node, hdr, ik, prefix, bits, hs);
         }
 
-    use_resume_next:
-        if (top >= 0) return descend_min_(stk[top].child_ptr, stk[top].prefix, stk[top].bits);
+        // --- BITMASK ---
+        const auto* bm = reinterpret_cast<const uint64_t*>(ptr);
+        const auto& bitmap = *reinterpret_cast<const bitmap256*>(bm);
+        uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+
+        if (bitmap.has_bit(byte)) {
+            int slot = bitmap.find_slot<slot_mode::UNFILTERED>(byte);
+            IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
+            auto r = iter_next_node_(bm[BITMAP256_U64 + 1 + slot],
+                                     static_cast<IK>(ik << 8), cp, bits + 8);
+            if (r.found) return r;
+            // Child exhausted — fall through to next sibling
+        }
+
+        auto adj = bitmap.next_set_after(byte);
+        if (adj.found) {
+            IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
+            return descend_min_(bm[BITMAP256_U64 + 1 + adj.slot], np, bits + 8);
+        }
         return {KEY{}, VALUE{}, false};
     }
 
-    iter_result_t iter_prev_(KEY key) const noexcept {
-        if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
-
-        IK ik = KO::to_internal(key);
-        uint64_t ptr = root_;
-        IK prefix = IK{0};
-        int bits = 0;
-
-        struct resume_t { uint64_t child_ptr; IK prefix; int bits; };
-        resume_t stk[IK_BITS / 8];
-        int top = -1;
-
-        // Bitmask descent
-        while (!(ptr & LEAF_BIT)) {
-            const auto* bm = reinterpret_cast<const uint64_t*>(ptr);
-            const auto& bitmap = *reinterpret_cast<const bitmap256*>(bm);
-            uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-            ik <<= 8;
-
-            if (bitmap.has_bit(byte)) {
-                auto adj = bitmap.prev_set_before(byte);
-                if (adj.found) {
-                    IK rp = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
-                    stk[++top] = {bm[BITMAP256_U64 + 1 + adj.slot], rp, bits + 8};
-                }
-                int slot = bitmap.find_slot<slot_mode::UNFILTERED>(byte);
-                prefix |= IK(byte) << (IK_BITS - bits - 8);
-                bits += 8;
-                ptr = bm[BITMAP256_U64 + 1 + slot];
-            } else {
-                auto adj = bitmap.prev_set_before(byte);
-                if (adj.found) {
-                    IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
-                    return descend_max_(bm[BITMAP256_U64 + 1 + adj.slot], np, bits + 8);
-                }
-                goto use_resume_prev;
-            }
-        }
-
-        // Leaf
-        {
+    // Recursive: find largest key < ik in subtree at ptr
+    iter_result_t iter_prev_node_(uint64_t ptr, IK ik, IK prefix, int bits) const noexcept {
+        // --- LEAF ---
+        if (ptr & LEAF_BIT) {
             const uint64_t* node = untag_leaf(ptr);
             node_header hdr = *get_header(node);
-            if (hdr.entries() == 0) goto use_resume_prev;
+            if (hdr.entries() == 0) return {KEY{}, VALUE{}, false};
 
             size_t hs = 1;
             if (hdr.is_skip()) {
@@ -357,32 +312,42 @@ public:
                 for (uint8_t i = 0; i < skip; ++i) {
                     uint8_t kb = static_cast<uint8_t>(ik >> (IK_BITS - 8));
                     if (kb > sb[i]) {
-                        // All leaf entries < key, return last
                         for (uint8_t j = i; j < skip; ++j) {
                             prefix |= IK(sb[j]) << (IK_BITS - bits - 8);
                             bits += 8;
                         }
                         return leaf_last_(node, hdr, prefix, bits, hs);
                     }
-                    if (kb < sb[i]) goto use_resume_prev;
+                    if (kb < sb[i]) return {KEY{}, VALUE{}, false};
                     prefix |= IK(sb[i]) << (IK_BITS - bits - 8);
                     bits += 8;
                     ik <<= 8;
                 }
             }
-
-            auto lr = leaf_prev_dispatch_(node, hdr, ik, prefix, bits, hs);
-            if (lr.found) return lr;
+            return leaf_prev_dispatch_(node, hdr, ik, prefix, bits, hs);
         }
 
-    use_resume_prev:
-        if (top >= 0) return descend_max_(stk[top].child_ptr, stk[top].prefix, stk[top].bits);
+        // --- BITMASK ---
+        const auto* bm = reinterpret_cast<const uint64_t*>(ptr);
+        const auto& bitmap = *reinterpret_cast<const bitmap256*>(bm);
+        uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+
+        if (bitmap.has_bit(byte)) {
+            int slot = bitmap.find_slot<slot_mode::UNFILTERED>(byte);
+            IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
+            auto r = iter_prev_node_(bm[BITMAP256_U64 + 1 + slot],
+                                     static_cast<IK>(ik << 8), cp, bits + 8);
+            if (r.found) return r;
+            // Child exhausted — fall through to prev sibling
+        }
+
+        auto adj = bitmap.prev_set_before(byte);
+        if (adj.found) {
+            IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
+            return descend_max_(bm[BITMAP256_U64 + 1 + adj.slot], np, bits + 8);
+        }
         return {KEY{}, VALUE{}, false};
     }
-
-private:
-    // ==================================================================
-    // Iterator helpers (private)
     // ==================================================================
 
     // Reconstruct full IK from prefix + suffix

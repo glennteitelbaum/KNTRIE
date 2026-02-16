@@ -159,14 +159,8 @@ struct compact_ops {
         const K*   kd = keys_(node, hs);
         const VST* vd = vals_(node, ts, hs);
         const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
-        unsigned p = static_cast<unsigned>(base - kd);
-        // find_base lands on last position where kd[p] <= suffix,
-        // or stays at 0 if all entries > suffix
-        if (kd[p] > suffix) return {kd[p], &vd[p], true};
-        // kd[p] <= suffix — advance past it and any dups
-        unsigned i = p + 1;
-        while (i < ts && kd[i] <= suffix) ++i;
-        if (i < ts) return {kd[i], &vd[i], true};
+        unsigned pos = static_cast<unsigned>(base - kd) + (*base <= suffix);
+        if (pos < ts) return {kd[pos], &vd[pos], true};
         return {0, nullptr, false};
     }
 
@@ -175,18 +169,13 @@ struct compact_ops {
                                        const node_header* h,
                                        K suffix) noexcept {
         unsigned ts = h->total_slots();
-        if (ts == 0) return {0, nullptr, false};
+        if (ts == 0 || suffix == 0) return {0, nullptr, false};
         size_t hs = hdr_u64(node);
         const K*   kd = keys_(node, hs);
         const VST* vd = vals_(node, ts, hs);
-        const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
-        int p = static_cast<int>(base - kd);
-        // If kd[p] < suffix, it's our answer
-        if (kd[p] < suffix) return {kd[p], &vd[p], true};
-        // kd[p] == suffix, go backward past dups
-        int i = p - 1;
-        while (i >= 0 && kd[i] >= suffix) --i;
-        if (i >= 0) return {kd[i], &vd[i], true};
+        const K* base = adaptive_search<K>::find_base(kd, ts, K(suffix - 1));
+        // find_base: last position where kd[p] <= suffix-1, i.e. < suffix
+        if (*base < suffix) return {*base, &vd[base - kd], true};
         return {0, nullptr, false};
     }
 
