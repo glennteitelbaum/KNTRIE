@@ -61,7 +61,7 @@ Every pointer in the kntrie encodes its target type in **bit 63** (the sign bit)
 
 Testing `ptr & (1 << 63)` compiles to a sign-bit test. The find hot loop uses this to distinguish internal descent from leaf arrival. Internal pointers target the bitmap directly so the find loop can feed them straight into the bitmap lookup with no offset arithmetic.
 
-The root of the trie is a single tagged pointer. An empty trie points to a global **sentinel** — a zeroed, cache-line-aligned block tagged as a leaf. It reads as a valid empty leaf with zero entries, so find returns nullptr without a null check. Internal nodes also use the sentinel as their branchless miss target (explained in the bitmask section).
+The root of the trie is a single tagged pointer. An empty trie points to a global sentinel — a zeroed block tagged as a leaf that reads as a valid empty node, so find returns nullptr without a null check.
 
 ---
 
@@ -137,6 +137,14 @@ Because dups replicate their neighbor's key AND value, the sorted order is prese
 #### Bitmask Nodes (KTRIE BRANCH)
 
 Bitmask nodes implement the KTRIE's BRANCH — they dispatch on one byte of the key, fanning out to up to 256 children. This section covers the 256-bit bitmap used for compressed dispatch, then the internal node layout, skip chains for PREFIX compression, and bitmap leaves at the terminal level.
+
+##### Sentinel
+
+Internal nodes need a target for branchless misses — when a lookup asks for a child that doesn't exist, something must be returned without taking a branch. The kntrie uses a global **sentinel**: a zeroed, cache-line-aligned block of 8 u64, tagged as a leaf. Its header reads as a valid compact leaf with zero entries and suffix_type 0, so any find that lands here naturally returns nullptr.
+
+Every internal node stores a tagged pointer to the sentinel at a fixed offset after its bitmap (described in the layout below). When the branchless popcount returns slot 0, it reads this pointer, and find descends into the sentinel as if it were a real leaf. The sentinel is also used as the root pointer of an empty trie.
+
+Because there is exactly one sentinel shared across all nodes, repeated misses across different internal nodes all hit the same cache line.
 
 ##### The 256-Bit Bitmap
 
