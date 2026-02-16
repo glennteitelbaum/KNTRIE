@@ -78,6 +78,66 @@ struct bitmap256 {
         __builtin_unreachable();
     }
 
+    // Return the highest set bit index. Undefined if bitmap is empty.
+    uint8_t last_set_bit() const noexcept {
+        for (int w = 3; w >= 0; --w)
+            if (words[w]) return static_cast<uint8_t>((w << 6) + 63 - std::countl_zero(words[w]));
+        __builtin_unreachable();
+    }
+
+    struct adj_result { uint8_t idx; uint16_t slot; bool found; };
+
+    // Find smallest set bit > idx, with its slot. Single pass.
+    adj_result next_set_after(uint8_t idx) const noexcept {
+        if (idx == 255) return {0, 0, false};
+        int start = idx + 1;
+        int w = start >> 6, b = start & 63;
+
+        int slot = 0;
+        for (int i = 0; i < w; ++i)
+            slot += std::popcount(words[i]);
+
+        uint64_t m = words[w] & (~0ULL << b);
+        if (m) {
+            int bit = (w << 6) + std::countr_zero(m);
+            slot += std::popcount(words[w] & ((1ULL << (bit & 63)) - 1));
+            return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
+        }
+        slot += std::popcount(words[w]);
+
+        for (int ww = w + 1; ww < 4; ++ww) {
+            if (words[ww]) {
+                int bit = (ww << 6) + std::countr_zero(words[ww]);
+                slot += std::popcount(words[ww] & ((1ULL << (bit & 63)) - 1));
+                return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
+            }
+            slot += std::popcount(words[ww]);
+        }
+        return {0, 0, false};
+    }
+
+    // Find largest set bit < idx, with its slot. Single pass backward.
+    adj_result prev_set_before(uint8_t idx) const noexcept {
+        if (idx == 0) return {0, 0, false};
+        int last = idx - 1;
+        int w = last >> 6, b = last & 63;
+
+        uint64_t m = words[w] & ((2ULL << b) - 1);
+
+        for (int ww = w; ww >= 0; --ww) {
+            uint64_t bits = (ww == w) ? m : words[ww];
+            if (bits) {
+                int bit = (ww << 6) + 63 - std::countl_zero(bits);
+                int slot = 0;
+                for (int i = 0; i < ww; ++i)
+                    slot += std::popcount(words[i]);
+                slot += std::popcount(words[ww] & ((1ULL << (bit & 63)) - 1));
+                return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
+            }
+        }
+        return {0, 0, false};
+    }
+
     static bitmap256 from_indices(const uint8_t* indices, unsigned count) noexcept {
         bitmap256 bm{};
         for (unsigned i = 0; i < count; ++i) bm.set_bit(indices[i]);
