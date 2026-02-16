@@ -117,6 +117,7 @@ struct Row {
     double find_nf_ms;
     double insert_ms;
     double erase_ms;
+    double iter_ms;
     size_t mem_bytes;
 };
 
@@ -166,9 +167,9 @@ static void bench_all(size_t target_n, const std::string& pattern,
         std::shuffle(nf_orders[r].begin(), nf_orders[r].end(), rng);
     }
 
-    double k_fnd = 1e18, k_nf = 1e18, k_ins = 1e18, k_ers = 1e18;
-    double m_fnd = 1e18, m_nf = 1e18, m_ins = 1e18, m_ers = 1e18;
-    double u_fnd = 1e18, u_nf = 1e18, u_ins = 1e18, u_ers = 1e18;
+    double k_fnd = 1e18, k_nf = 1e18, k_ins = 1e18, k_ers = 1e18, k_iter = 1e18;
+    double m_fnd = 1e18, m_nf = 1e18, m_ins = 1e18, m_ers = 1e18, m_iter = 1e18;
+    double u_fnd = 1e18, u_nf = 1e18, u_ins = 1e18, u_ers = 1e18, u_iter = 1e18;
 
     for (int t = 0; t < TRIALS; ++t) {
         // --- kntrie ---
@@ -178,6 +179,10 @@ static void bench_all(size_t target_n, const std::string& pattern,
             double t0 = now_ms();
             for (auto k : w.keys) trie.insert(k, static_cast<uint64_t>(k));
             k_ins = std::min(k_ins, now_ms() - t0);
+
+            { uint64_t is = 0; double ti = now_ms();
+              for (auto it = trie.begin(); it != trie.end(); ++it) { auto [k,v] = *it; is += v; }
+              k_iter = std::min(k_iter, now_ms() - ti); do_not_optimize(is); }
 
             uint64_t cs = 0;
             double t1 = now_ms();
@@ -206,6 +211,10 @@ static void bench_all(size_t target_n, const std::string& pattern,
             double t0 = now_ms();
             for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
             m_ins = std::min(m_ins, now_ms() - t0);
+
+            { uint64_t is = 0; double ti = now_ms();
+              for (auto& [k,v] : m) is += v;
+              m_iter = std::min(m_iter, now_ms() - ti); do_not_optimize(is); }
 
             uint64_t cs = 0;
             double t1 = now_ms();
@@ -236,6 +245,10 @@ static void bench_all(size_t target_n, const std::string& pattern,
             for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
             u_ins = std::min(u_ins, now_ms() - t0);
 
+            { uint64_t is = 0; double ti = now_ms();
+              for (auto& [k,v] : m) is += v;
+              u_iter = std::min(u_iter, now_ms() - ti); do_not_optimize(is); }
+
             uint64_t cs = 0;
             double t1 = now_ms();
             for (int r = 0; r < fi; ++r)
@@ -257,10 +270,10 @@ static void bench_all(size_t target_n, const std::string& pattern,
         }
     }
 
-    rows.push_back({pattern, n, "kntrie", k_fnd, k_nf, k_ins, k_ers, kntrie_mem});
+    rows.push_back({pattern, n, "kntrie", k_fnd, k_nf, k_ins, k_ers, k_iter, kntrie_mem});
     if (do_map)
-        rows.push_back({pattern, n, "map", m_fnd, m_nf, m_ins, m_ers, map_mem});
-    rows.push_back({pattern, n, "umap", u_fnd, u_nf, u_ins, u_ers, umap_mem});
+        rows.push_back({pattern, n, "map", m_fnd, m_nf, m_ins, m_ers, m_iter, map_mem});
+    rows.push_back({pattern, n, "umap", u_fnd, u_nf, u_ins, u_ers, u_iter, umap_mem});
 }
 
 // ==========================================================================
@@ -271,7 +284,7 @@ static void emit_html(const std::vector<Row>& rows) {
     struct DataPoint {
         std::string pattern;
         size_t N;
-        double vals[3][5]; // [kntrie=0, map=1, umap=2] x [fnd, nf, insert, erase, mem]
+        double vals[3][6]; // [kntrie=0, map=1, umap=2] x [fnd, nf, insert, erase, iter, mem]
         bool has[3];
     };
 
@@ -301,7 +314,8 @@ static void emit_html(const std::vector<Row>& rows) {
         points[pi].vals[ci][1] = r.find_nf_ms;
         points[pi].vals[ci][2] = r.insert_ms;
         points[pi].vals[ci][3] = r.erase_ms;
-        points[pi].vals[ci][4] = static_cast<double>(r.mem_bytes);
+        points[pi].vals[ci][4] = r.iter_ms;
+        points[pi].vals[ci][5] = static_cast<double>(r.mem_bytes);
         points[pi].has[ci] = true;
     }
 
@@ -311,7 +325,7 @@ static void emit_html(const std::vector<Row>& rows) {
     });
 
     const char* names[] = {"kntrie", "map", "umap"};
-    const char* suffixes[] = {"fnd", "nf", "insert", "erase", "mem"};
+    const char* suffixes[] = {"fnd", "nf", "insert", "erase", "iter", "mem"};
 
     // HTML preamble
     std::printf("%s", R"HTML(<!DOCTYPE html>
@@ -344,6 +358,7 @@ static void emit_html(const std::vector<Row>& rows) {
     <button onclick="show('sequential')">sequential</button>
   </div>
   <div class="chart-box"><h3>Find (ns/entry)</h3><canvas id="c_find"></canvas></div>
+  <div class="chart-box"><h3>Iteration (ns/entry)</h3><canvas id="c_iter"></canvas></div>
   <div class="chart-box"><h3>Insert (ns/entry)</h3><canvas id="c_insert"></canvas></div>
   <div class="chart-box"><h3>Erase N/2 (ns/entry)</h3><canvas id="c_erase"></canvas></div>
   <div class="chart-box"><h3>Memory (B/entry)</h3><canvas id="c_mem"></canvas></div>
@@ -357,8 +372,8 @@ static void emit_html(const std::vector<Row>& rows) {
         std::printf("  {pattern:\"%s\",N:%zu", p.pattern.c_str(), p.N);
         for (int ci = 0; ci < 3; ++ci) {
             if (!p.has[ci]) continue;
-            for (int mi = 0; mi < 5; ++mi) {
-                if (mi == 4)
+            for (int mi = 0; mi < 6; ++mi) {
+                if (mi == 5)
                     std::printf(",%s_%s:%.0f", names[ci], suffixes[mi], p.vals[ci][mi]);
                 else
                     std::printf(",%s_%s:%.4f", names[ci], suffixes[mi], p.vals[ci][mi]);
@@ -399,8 +414,15 @@ const LINES_MEM = [
   { key: "raw",    suffix: "mem", color: "#888",    dash: [3,3], width: 1, label: "raw (16B)" },
 ];
 
+const LINES_ITER = [
+  { key: "kntrie", suffix: "iter", color: "#3b82f6", dash: [], width: 2.5, label: "kntrie" },
+  { key: "map",    suffix: "iter", color: "#ef4444", dash: [], width: 2.5, label: "map" },
+  { key: "umap",   suffix: "iter", color: "#22c55e", dash: [], width: 2.5, label: "umap" },
+];
+
 const METRICS = [
   { id: "find",   lines: LINES_FIND,  convert: (ms, n) => (ms * 1e6) / n },
+  { id: "iter",   lines: LINES_ITER,  convert: (ms, n) => (ms * 1e6) / n },
   { id: "insert", lines: LINES_OP,    convert: (ms, n) => (ms * 1e6) / n },
   { id: "erase",  lines: LINES_ERASE, convert: (ms, n) => (ms * 1e6) / (n / 2) },
   { id: "mem",    lines: LINES_MEM,   convert: (b, n) => b / n },
