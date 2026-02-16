@@ -124,6 +124,70 @@ struct compact_ops {
     }
 
     // ==================================================================
+    // Iterator helpers: first, last, next, prev
+    // ==================================================================
+
+    struct iter_leaf_result { K suffix; const VST* value; bool found; };
+
+    static iter_leaf_result iter_first(const uint64_t* node,
+                                        const node_header* h) noexcept {
+        unsigned ts = h->total_slots();
+        if (ts == 0) return {0, nullptr, false};
+        size_t hs = hdr_u64(node);
+        const K*   kd = keys_(node, hs);
+        const VST* vd = vals_(node, ts, hs);
+        return {kd[0], &vd[0], true};
+    }
+
+    static iter_leaf_result iter_last(const uint64_t* node,
+                                       const node_header* h) noexcept {
+        unsigned ts = h->total_slots();
+        if (ts == 0) return {0, nullptr, false};
+        size_t hs = hdr_u64(node);
+        const K*   kd = keys_(node, hs);
+        const VST* vd = vals_(node, ts, hs);
+        return {kd[ts - 1], &vd[ts - 1], true};
+    }
+
+    // Smallest suffix > key
+    static iter_leaf_result iter_next(const uint64_t* node,
+                                       const node_header* h,
+                                       K suffix) noexcept {
+        unsigned ts = h->total_slots();
+        if (ts == 0) return {0, nullptr, false};
+        size_t hs = hdr_u64(node);
+        const K*   kd = keys_(node, hs);
+        const VST* vd = vals_(node, ts, hs);
+        const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
+        unsigned p = static_cast<unsigned>(base - kd);
+        // Advance past suffix and its dups
+        unsigned i = p + 1;
+        while (i < ts && kd[i] <= suffix) ++i;
+        if (i < ts) return {kd[i], &vd[i], true};
+        return {0, nullptr, false};
+    }
+
+    // Largest suffix < key
+    static iter_leaf_result iter_prev(const uint64_t* node,
+                                       const node_header* h,
+                                       K suffix) noexcept {
+        unsigned ts = h->total_slots();
+        if (ts == 0) return {0, nullptr, false};
+        size_t hs = hdr_u64(node);
+        const K*   kd = keys_(node, hs);
+        const VST* vd = vals_(node, ts, hs);
+        const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
+        int p = static_cast<int>(base - kd);
+        // If kd[p] < suffix, it's our answer
+        if (kd[p] < suffix) return {kd[p], &vd[p], true};
+        // kd[p] == suffix, go backward past dups
+        int i = p - 1;
+        while (i >= 0 && kd[i] >= suffix) --i;
+        if (i >= 0) return {kd[i], &vd[i], true};
+        return {0, nullptr, false};
+    }
+
+    // ==================================================================
     // Destroy all values + deallocate node
     // ==================================================================
 

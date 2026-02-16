@@ -13,13 +13,13 @@
 
 ## Phase 2: leaf next/prev (kntrie_compact.hpp, kntrie_bitmask.hpp)
 
-- [ ] Compact leaf: `iter_next_suffix(node, suffix)` — binary search, return next entry
-- [ ] Compact leaf: `iter_prev_suffix(node, suffix)` — binary search, return prev entry
-- [ ] Bitmap256 leaf: `iter_next_suffix(node, byte)` — uses `next_set_after`
-- [ ] Bitmap256 leaf: `iter_prev_suffix(node, byte)` — uses `prev_set_before`
-- [ ] Compact leaf: `iter_first(node)` / `iter_last(node)` — min/max entry
-- [ ] Bitmap256 leaf: `iter_first(node)` / `iter_last(node)` — min/max entry
-- [ ] **STOP**: zip all headers + plan.md + miniplan.md, wait for user
+- [x] Compact leaf: `iter_next(node, h, suffix)` — binary search, return next entry
+- [x] Compact leaf: `iter_prev(node, h, suffix)` — binary search, return prev entry
+- [x] Bitmap256 leaf: `bitmap_iter_next(node, byte, hs)` — uses `next_set_after`
+- [x] Bitmap256 leaf: `bitmap_iter_prev(node, byte, hs)` — uses `prev_set_before`
+- [x] Compact leaf: `iter_first(node, h)` / `iter_last(node, h)` — min/max entry
+- [x] Bitmap256 leaf: `bitmap_iter_first(node, hs)` / `bitmap_iter_last(node, h, hs)` — min/max entry
+- [x] **STOP**: zip all headers + plan.md + miniplan.md, wait for user
 
 ## Phase 3: kntrie_impl traversal (kntrie_impl.hpp)
 

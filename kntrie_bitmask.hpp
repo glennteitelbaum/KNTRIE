@@ -540,6 +540,48 @@ struct bitmask_ops {
     }
 
     // ==================================================================
+    // Bitmap256 leaf: iterator helpers
+    // ==================================================================
+
+    struct iter_bm_result { uint8_t suffix; const VST* value; bool found; };
+
+    static iter_bm_result bitmap_iter_first(const uint64_t* node,
+                                             size_t header_size) noexcept {
+        const bitmap256& bm = bm_(node, header_size);
+        const VST* vd = bl_vals_(node, header_size);
+        return {bm.first_set_bit(), &vd[0], true};
+    }
+
+    static iter_bm_result bitmap_iter_last(const uint64_t* node,
+                                            node_header h,
+                                            size_t header_size) noexcept {
+        const bitmap256& bm = bm_(node, header_size);
+        const VST* vd = bl_vals_(node, header_size);
+        unsigned count = h.entries();
+        return {bm.last_set_bit(), &vd[count - 1], true};
+    }
+
+    static iter_bm_result bitmap_iter_next(const uint64_t* node,
+                                            uint8_t suffix,
+                                            size_t header_size) noexcept {
+        const bitmap256& bm = bm_(node, header_size);
+        auto r = bm.next_set_after(suffix);
+        if (!r.found) return {0, nullptr, false};
+        const VST* vd = bl_vals_(node, header_size);
+        return {r.idx, &vd[r.slot], true};
+    }
+
+    static iter_bm_result bitmap_iter_prev(const uint64_t* node,
+                                            uint8_t suffix,
+                                            size_t header_size) noexcept {
+        const bitmap256& bm = bm_(node, header_size);
+        auto r = bm.prev_set_before(suffix);
+        if (!r.found) return {0, nullptr, false};
+        const VST* vd = bl_vals_(node, header_size);
+        return {r.idx, &vd[r.slot], true};
+    }
+
+    // ==================================================================
     // Bitmap256 leaf: insert
     // ==================================================================
 
