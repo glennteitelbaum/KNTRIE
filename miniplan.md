@@ -20,11 +20,12 @@ transcript before doing anything.
 
 | File | Lines | Role |
 |------|-------|------|
-| kntrie_support.hpp | 307 | node_header, tagged ptrs, bitmap256 layout constants |
-| kntrie_compact.hpp | ~600 | CO<NK>: compact leaf ops |
-| kntrie_bitmask.hpp | 816 | BM: bitmask node ops, bitmap leaf ops |
-| kntrie_impl.hpp | 1942 | Everything else (find, insert, erase, iter, build) |
-| kntrie.hpp | 227 | Public API, KEY→UK, iterators |
+| kntrie_support.hpp | 314 | node_header, tagged ptrs, bitmap256 layout constants, next_narrow_t |
+| kntrie_compact.hpp | 612 | CO<NK>: compact leaf ops |
+| kntrie_bitmask.hpp | 922 | BM: bitmask node ops, bitmap leaf ops, chain accessors |
+| kntrie_ops.hpp | 93 | Ops<NK>: find (will grow with insert/erase/iter) |
+| kntrie_impl.hpp | 1844 | Insert, erase, iter, build (shrinking) |
+| kntrie.hpp | 240 | Public API, KEY→UK, iterators |
 
 ---
 
@@ -60,51 +61,48 @@ Run: all tests.
 **Goal**: BM gets public methods for skip chain + bitmask access.
 Replace raw layout math in impl. Zero behavior change.
 
-- [ ] 1.5.1 Add private helpers to bitmask_ops:
-      ```cpp
-      static constexpr size_t chain_hs_(uint8_t sc) noexcept {
-          return 1 + static_cast<size_t>(sc) * 6;
-      }
-      static void fix_embeds_(uint64_t* node, uint8_t sc) noexcept { ... }
-      ```
+- [x] 1.5.1 Add private helpers to bitmask_ops — DONE
+      - `chain_hs_` (made public, needed by impl too), `lookup_at_`
 
-- [ ] 1.5.2 Add skip chain read accessors:
-      - `skip_byte(node, e)` — read single skip byte at embed position
-      - `skip_bytes(node, sc, out)` — copy all skip bytes to buffer
-      - `chain_lookup(node, sc, idx)` → calls `lookup_at_` with chain_hs_
-      - `chain_child(node, sc, slot)` — read tagged child at slot
-      - `chain_set_child(node, sc, slot, tagged)` — write child at slot
-      - `chain_desc_array(node, sc)` — const + mutable versions
-      - `chain_for_each_child(node, sc, cb)` — iterate final bitmap children
+- [x] 1.5.2 Add skip chain read accessors — DONE
+      - `skip_byte`, `skip_bytes`, `chain_lookup`, `chain_child`, `chain_set_child`
+      - `chain_desc_array`, `chain_desc_array_mut`, `chain_bitmap`, `chain_child_count`
+      - `chain_children`, `chain_children_mut`, `chain_for_each_child`
+      - `embed_child`, `set_embed_child`
 
-- [ ] 1.5.3 Add tagged pointer accessors for iteration:
-      - `bitmap_ref(bm_tagged)` → bitmap256 const ref from tagged ptr
-      - `child_at(bm_tagged, slot)` → tagged child at slot
-      - `first_child(bm_tagged)` → tagged child at slot 0
+- [x] 1.5.3 Add tagged pointer accessors for iteration — DONE
+      - `bitmap_ref(bm_tagged)`, `child_at(bm_tagged, slot)`, `first_child(bm_tagged)`
 
-- [ ] 1.5.4 Refactor existing `lookup` to use private `lookup_at_(node, hs, idx)`:
-      - Extract core into `lookup_at_(node, hs, idx)` private method
-      - `lookup(node, idx)` calls `lookup_at_(node, 1, idx)`
-      - `chain_lookup` calls `lookup_at_(node, chain_hs_(sc), idx)`
+- [x] 1.5.4 Refactor existing `lookup` to use private `lookup_at_(node, hs, idx)` — DONE
+      - `lookup` → `lookup_at_(node, 1, idx)`
+      - `chain_lookup` → `lookup_at_(node, chain_hs_(sc), idx)`
 
-- [ ] 1.5.5 Replace raw BM access in `kntrie_impl.hpp` iteration functions:
-      - `iter_next_node_`: replace `bm[BITMAP256_U64 + 1 + slot]` → `BO::child_at(ptr, slot)`
-      - `iter_prev_node_`: same
-      - `descend_min_`: replace `bm[BITMAP256_U64 + 1]` → `BO::first_child(ptr)` etc.
-      - `descend_max_`: same
-      - Replace `reinterpret_cast<const bitmap256*>(bm)` → `BO::bitmap_ref(ptr)`
+- [x] 1.5.5 Replace raw BM access in iteration functions — DONE
+      - iter_next_node_: bitmap_ref, child_at (+ template keyword for find_slot)
+      - iter_prev_node_: same
+      - descend_min_: bitmap_ref, first_child
+      - descend_max_: bitmap_ref, child_at
 
-- [ ] 1.5.6 Replace raw BM access in `insert_skip_chain_`:
-      - Skip byte reads: `BO::skip_byte(node, e)` instead of `node+1+e*6` + `single_bit_index()`
-      - Final bitmap lookup: `BO::chain_lookup(node, sc, byte)`
-      - Child read/write: `BO::chain_child(node, sc, slot)`, `BO::chain_set_child(...)`
-      - Desc access: `BO::chain_desc_array(node, sc)`
+- [x] 1.5.6 Replace raw BM access in `insert_skip_chain_` — DONE
+      - Skip byte loop → BO::skip_byte
+      - Final lookup → BO::chain_lookup
+      - Child write → BO::chain_set_child
+      - Desc access → BO::chain_desc_array_mut
 
-- [ ] 1.5.7 Replace raw BM access in `erase_skip_chain_`:
-      - Same pattern as insert: skip_byte, chain_lookup, chain_child, chain_desc_array
+- [x] 1.5.7 Replace raw BM access in `erase_skip_chain_` — DONE
+      - Skip byte loop → BO::skip_byte
+      - Final lookup → BO::chain_lookup
+      - Child access → BO::chain_set_child, chain_children_mut
+      - Desc → BO::chain_desc_array_mut
+      - Collapse → BO::chain_bitmap, BO::skip_bytes
+      - Removal path: kept raw final_offset/real_ch as locals (moves to BM in Phase 2B)
 
-- [ ] 1.5.8 Replace raw BM access in `collect_entries_tagged_`, `remove_node_`, `collect_stats_`:
-      - Skip byte reads + final bitmap iteration via `BO::chain_for_each_child(node, sc, cb)`
+- [x] 1.5.8 Replace raw BM access in collect/remove/stats — DONE
+      - collect_entries_tagged_: BO::skip_byte, BO::chain_bitmap, BO::chain_children
+      - dealloc_bitmask_subtree_: BO::chain_for_each_child
+      - remove_node_: BO::chain_for_each_child
+      - collect_stats_: BO::chain_for_each_child
+      - sum_children_desc_: BO::chain_desc_array
 
 **⏸ STOP**: Present zip of all headers. Wait for confirmation.
 Compile + test + ASAN.
@@ -377,3 +375,4 @@ ALL is_leaf() / set_bitmask() calls replaced by tagged ptr checks.
 | Date | Phase | Step | Notes |
 |------|-------|------|-------|
 | 2026-02-16 | 1 | 1.1-1.6 | Created kntrie_ops.hpp, moved find_ops, added next_narrow_t to support |
+| 2026-02-16 | 1.5 | 1.5.1-1.5.8 | BM read accessors + chain methods. Replaced ~30 raw layout accesses in impl. Tests pass + ASAN |

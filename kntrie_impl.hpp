@@ -226,14 +226,13 @@ private:
         }
 
         // --- BITMASK ---
-        const auto* bm = reinterpret_cast<const uint64_t*>(ptr);
-        const auto& bitmap = *reinterpret_cast<const bitmap256*>(bm);
+        const auto& bitmap = BO::bitmap_ref(ptr);
         uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
 
         if (bitmap.has_bit(byte)) {
-            int slot = bitmap.find_slot<slot_mode::UNFILTERED>(byte);
+            int slot = bitmap.template find_slot<slot_mode::UNFILTERED>(byte);
             IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
-            auto r = iter_next_node_(bm[BITMAP256_U64 + 1 + slot],
+            auto r = iter_next_node_(BO::child_at(ptr, slot),
                                      static_cast<IK>(ik << 8), cp, bits + 8);
             if (r.found) return r;
             // Child exhausted — fall through to next sibling
@@ -242,7 +241,7 @@ private:
         auto adj = bitmap.next_set_after(byte);
         if (adj.found) {
             IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
-            return descend_min_(bm[BITMAP256_U64 + 1 + adj.slot], np, bits + 8);
+            return descend_min_(BO::child_at(ptr, adj.slot), np, bits + 8);
         }
         return {KEY{}, VALUE{}, false};
     }
@@ -279,14 +278,13 @@ private:
         }
 
         // --- BITMASK ---
-        const auto* bm = reinterpret_cast<const uint64_t*>(ptr);
-        const auto& bitmap = *reinterpret_cast<const bitmap256*>(bm);
+        const auto& bitmap = BO::bitmap_ref(ptr);
         uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
 
         if (bitmap.has_bit(byte)) {
-            int slot = bitmap.find_slot<slot_mode::UNFILTERED>(byte);
+            int slot = bitmap.template find_slot<slot_mode::UNFILTERED>(byte);
             IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
-            auto r = iter_prev_node_(bm[BITMAP256_U64 + 1 + slot],
+            auto r = iter_prev_node_(BO::child_at(ptr, slot),
                                      static_cast<IK>(ik << 8), cp, bits + 8);
             if (r.found) return r;
             // Child exhausted — fall through to prev sibling
@@ -295,7 +293,7 @@ private:
         auto adj = bitmap.prev_set_before(byte);
         if (adj.found) {
             IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
-            return descend_max_(bm[BITMAP256_U64 + 1 + adj.slot], np, bits + 8);
+            return descend_max_(BO::child_at(ptr, adj.slot), np, bits + 8);
         }
         return {KEY{}, VALUE{}, false};
     }
@@ -316,12 +314,11 @@ private:
     // Descend always-min from tagged ptr
     iter_result_t descend_min_(uint64_t ptr, IK prefix, int bits) const noexcept {
         while (!(ptr & LEAF_BIT)) {
-            const auto* bm = reinterpret_cast<const uint64_t*>(ptr);
-            const auto& bitmap = *reinterpret_cast<const bitmap256*>(bm);
+            const auto& bitmap = BO::bitmap_ref(ptr);
             uint8_t byte = bitmap.first_set_bit();
             prefix |= IK(byte) << (IK_BITS - bits - 8);
             bits += 8;
-            ptr = bm[BITMAP256_U64 + 1]; // slot 0
+            ptr = BO::first_child(ptr);
         }
         const uint64_t* node = untag_leaf(ptr);
         node_header hdr = *get_header(node);
@@ -341,13 +338,12 @@ private:
     // Descend always-max from tagged ptr
     iter_result_t descend_max_(uint64_t ptr, IK prefix, int bits) const noexcept {
         while (!(ptr & LEAF_BIT)) {
-            const auto* bm = reinterpret_cast<const uint64_t*>(ptr);
-            const auto& bitmap = *reinterpret_cast<const bitmap256*>(bm);
+            const auto& bitmap = BO::bitmap_ref(ptr);
             uint8_t byte = bitmap.last_set_bit();
-            int slot = bitmap.find_slot<slot_mode::UNFILTERED>(byte);
+            int slot = bitmap.template find_slot<slot_mode::UNFILTERED>(byte);
             prefix |= IK(byte) << (IK_BITS - bits - 8);
             bits += 8;
-            ptr = bm[BITMAP256_U64 + 1 + slot];
+            ptr = BO::child_at(ptr, slot);
         }
         const uint64_t* node = untag_leaf(ptr);
         node_header hdr = *get_header(node);
@@ -647,9 +643,7 @@ private:
     insert_result_t insert_skip_chain_(uint64_t* node, node_header* hdr,
                                         uint8_t sc, IK ik, VST value, int bits) {
         for (uint8_t e = 0; e < sc; ++e) {
-            uint64_t* embed = node + 1 + e * 6;
-            const bitmap256& bm = *reinterpret_cast<const bitmap256*>(embed);
-            uint8_t actual_byte = bm.single_bit_index();
+            uint8_t actual_byte = BO::skip_byte(node, e);
             uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
 
             if (expected != actual_byte) {
@@ -661,13 +655,11 @@ private:
         }
 
         // All skip matched — operate on final bitmask
-        size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
-        const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + final_offset);
-        uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        int slot = fbm.find_slot<slot_mode::FAST_EXIT>(ti);
+        auto cl = BO::chain_lookup(node, sc, static_cast<uint8_t>(ik >> (IK_BITS - 8)));
 
-        if (slot < 0) {
+        if (!cl.found) {
             if constexpr (!INSERT) return {tag_bitmask(node), false, false};
+            uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
             auto* leaf = make_single_leaf_(static_cast<IK>(ik << 8), value, bits - 8);
             auto* nn = add_child_to_chain_(node, hdr, sc, ti, tag_leaf(leaf), 1);
             inc_descendants_(get_header(nn));
@@ -675,17 +667,16 @@ private:
         }
 
         // Found — recurse into child
-        uint64_t* real_ch = node + final_offset + 5;
-        uint64_t old_child = real_ch[slot];
+        uint64_t old_child = cl.child;
         auto cr = insert_node_<INSERT, ASSIGN>(
             old_child, static_cast<IK>(ik << 8), value, bits - 8);
         if (cr.tagged_ptr != old_child)
-            real_ch[slot] = cr.tagged_ptr;
+            BO::chain_set_child(node, sc, cl.slot, cr.tagged_ptr);
         if (cr.inserted) {
             inc_descendants_(hdr);
             unsigned nc = hdr->entries();
-            uint16_t* da = reinterpret_cast<uint16_t*>(real_ch + nc);
-            if (da[slot] < COALESCE_CAP) da[slot]++;
+            uint16_t* da = BO::chain_desc_array_mut(node, sc, nc);
+            if (da[cl.slot] < COALESCE_CAP) da[cl.slot]++;
         }
         return {tag_bitmask(node), cr.inserted, false};
     }
@@ -998,8 +989,7 @@ private:
         int orig_bits = bits;  // save for coalesce (includes skip)
 
         for (uint8_t e = 0; e < sc; ++e) {
-            uint64_t* embed = node + 1 + e * 6;
-            uint8_t actual = reinterpret_cast<const bitmap256*>(embed)->single_bit_index();
+            uint8_t actual = BO::skip_byte(node, e);
             uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
             if (expected != actual) return {tag_bitmask(node), false, 0};
             ik = static_cast<IK>(ik << 8);
@@ -1007,25 +997,23 @@ private:
         }
 
         // Final bitmask
-        size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
-        const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + final_offset);
         uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        int slot = fbm.find_slot<slot_mode::FAST_EXIT>(ti);
-        if (slot < 0) return {tag_bitmask(node), false, 0};
+        auto cl = BO::chain_lookup(node, sc, ti);
+        if (!cl.found) return {tag_bitmask(node), false, 0};
 
-        uint64_t* real_ch = node + final_offset + 5;
-        uint64_t old_child = real_ch[slot];
+        uint64_t old_child = cl.child;
 
         auto cr = erase_node_(old_child, static_cast<IK>(ik << 8), bits - 8);
         if (!cr.erased) return {tag_bitmask(node), false, 0};
 
         if (cr.tagged_ptr) {
             // Child survived
-            if (cr.tagged_ptr != old_child) real_ch[slot] = cr.tagged_ptr;
+            if (cr.tagged_ptr != old_child)
+                BO::chain_set_child(node, sc, cl.slot, cr.tagged_ptr);
             // Update desc for this slot
             unsigned nc_cur = hdr->entries();
-            uint16_t* da = reinterpret_cast<uint16_t*>(real_ch + nc_cur);
-            da[slot] = cr.subtree_entries;
+            uint16_t* da = BO::chain_desc_array_mut(node, sc, nc_cur);
+            da[cl.slot] = cr.subtree_entries;
             if (cr.subtree_entries == COALESCE_CAP)
                 return {tag_bitmask(node), true, COALESCE_CAP};
             uint16_t d = hdr->descendants();
@@ -1048,6 +1036,11 @@ private:
             dealloc_node(alloc_, node, hdr->alloc_u64());
             return {0, true, 0};
         }
+
+        // Local aliases for the removal path (deep layout code, moves to BM in Phase 2B)
+        size_t final_offset = BO::chain_hs_(sc);
+        int slot = cl.slot;
+        uint64_t* real_ch = BO::chain_children_mut(node, sc);
 
         // Remove from final bitmask
         // Check if we should shrink the allocation
@@ -1105,16 +1098,13 @@ private:
 
         // Collapse when final drops to 1 child
         if (nc == 1) {
-            const bitmap256& fbm_after = *reinterpret_cast<const bitmap256*>(node + final_offset);
+            const bitmap256& fbm_after = BO::chain_bitmap(node, sc);
             uint8_t sole_idx = fbm_after.first_set_bit();
             uint64_t sole_child = real_ch[0];
 
             // Collect all skip bytes + sole_idx
             uint8_t all_bytes[7];
-            for (uint8_t i = 0; i < sc; ++i) {
-                uint64_t* eb = node + 1 + i * 6;
-                all_bytes[i] = reinterpret_cast<const bitmap256*>(eb)->single_bit_index();
-            }
+            BO::skip_bytes(node, sc, all_bytes);
             all_bytes[sc] = sole_idx;
             uint8_t total_skip = sc + 1;
 
@@ -1199,8 +1189,7 @@ private:
     static uint16_t sum_children_desc_(const uint64_t* node, uint8_t sc) noexcept {
         unsigned nc = get_header(node)->entries();
         if (nc > COMPACT_MAX) return COALESCE_CAP;
-        size_t fo = 1 + static_cast<size_t>(sc) * 6;
-        const uint16_t* desc = reinterpret_cast<const uint16_t*>(node + fo + 5 + nc);
+        const uint16_t* desc = BO::chain_desc_array(node, sc, nc);
         uint32_t total = 0;
         unsigned remaining = nc;
         for (unsigned i = 0; i < nc; ++i) {
@@ -1320,15 +1309,13 @@ private:
         uint64_t cur_prefix = prefix;
         int cur_bits = prefix_bits;
         for (uint8_t i = 0; i < sc; ++i) {
-            const uint64_t* eb = node + 1 + i * 6;
-            uint8_t byte = reinterpret_cast<const bitmap256*>(eb)->single_bit_index();
+            uint8_t byte = BO::skip_byte(node, i);
             cur_prefix |= uint64_t(byte) << (56 - cur_bits);
             cur_bits += 8;
         }
 
-        size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
-        const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + final_offset);
-        const uint64_t* rch = node + final_offset + 5;
+        const bitmap256& fbm = BO::chain_bitmap(node, sc);
+        const uint64_t* rch = BO::chain_children(node, sc);
         fbm.for_each_set([&](uint8_t idx, int slot) {
             uint64_t child_prefix = cur_prefix | (uint64_t(idx) << (56 - cur_bits));
             collect_entries_tagged_(rch[slot], child_prefix, cur_bits + 8,
@@ -1348,11 +1335,8 @@ private:
         uint64_t* node = bm_to_node(tagged);
         auto* hdr = get_header(node);
         uint8_t sc = hdr->skip();
-        size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
-        const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + final_offset);
-        const uint64_t* rch = node + final_offset + 5;
-        fbm.for_each_set([&](uint8_t, int slot) {
-            dealloc_bitmask_subtree_(rch[slot]);
+        BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
+            dealloc_bitmask_subtree_(child);
         });
         dealloc_node(alloc_, node, hdr->alloc_u64());
     }
@@ -1804,11 +1788,8 @@ private:
 
             // For skip chains: only recurse into final bitmask's children
             // (embeds are internal pointers within the same allocation)
-            size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
-            const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + final_offset);
-            const uint64_t* real_ch = node + final_offset + 5;
-            fbm.for_each_set([&](uint8_t, int slot) {
-                remove_node_(real_ch[slot]);
+            BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
+                remove_node_(child);
             });
 
             BO::dealloc_bitmask(node, alloc_);
@@ -1851,11 +1832,8 @@ private:
             s.bitmask_nodes++;
 
             uint8_t sc = hdr->skip();
-            size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
-            const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + final_offset);
-            const uint64_t* real_ch = node + final_offset + 5;
-            fbm.for_each_set([&](uint8_t, int slot) {
-                collect_stats_(real_ch[slot], s);
+            BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
+                collect_stats_(child, s);
             });
         }
     }

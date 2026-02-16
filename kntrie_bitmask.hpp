@@ -244,12 +244,7 @@ struct bitmask_ops {
     };
 
     static child_lookup lookup(const uint64_t* node, uint8_t idx) noexcept {
-        constexpr size_t hs = 1;
-        const bitmap256& bm = bm_(node, hs);
-        int slot = bm.find_slot<slot_mode::FAST_EXIT>(idx);
-        if (slot < 0) return {0, -1, false};
-        uint64_t child = real_children_(node, hs)[slot];  // tagged value
-        return {child, slot, true};
+        return lookup_at_(node, 1, idx);
     }
 
     // ==================================================================
@@ -258,6 +253,104 @@ struct bitmask_ops {
 
     static void set_child(uint64_t* node, int slot, uint64_t tagged_ptr) noexcept {
         real_children_mut_(node, 1)[slot] = tagged_ptr;
+    }
+
+    // ==================================================================
+    // Skip chain read accessors
+    // ==================================================================
+
+    // Read single skip byte at embed position e (0-based)
+    static uint8_t skip_byte(const uint64_t* node, uint8_t e) noexcept {
+        const auto* embed_bm = reinterpret_cast<const bitmap256*>(node + 1 + static_cast<size_t>(e) * 6);
+        return embed_bm->single_bit_index();
+    }
+
+    // Copy all skip bytes to buffer
+    static void skip_bytes(const uint64_t* node, uint8_t sc, uint8_t* out) noexcept {
+        for (uint8_t e = 0; e < sc; ++e)
+            out[e] = skip_byte(node, e);
+    }
+
+    // Lookup in the final bitmap of a skip chain
+    static child_lookup chain_lookup(const uint64_t* node, uint8_t sc, uint8_t idx) noexcept {
+        return lookup_at_(node, chain_hs_(sc), idx);
+    }
+
+    // Read tagged child at slot in final bitmap of skip chain
+    static uint64_t chain_child(const uint64_t* node, uint8_t sc, int slot) noexcept {
+        return real_children_(node, chain_hs_(sc))[slot];
+    }
+
+    // Write tagged child at slot in final bitmap of skip chain
+    static void chain_set_child(uint64_t* node, uint8_t sc, int slot, uint64_t tagged) noexcept {
+        real_children_mut_(node, chain_hs_(sc))[slot] = tagged;
+    }
+
+    // Desc array of final bitmap (const)
+    static const uint16_t* chain_desc_array(const uint64_t* node, uint8_t sc, unsigned nc) noexcept {
+        return desc_array_(node, chain_hs_(sc), nc);
+    }
+
+    // Desc array of final bitmap (mutable)
+    static uint16_t* chain_desc_array_mut(uint64_t* node, uint8_t sc, unsigned nc) noexcept {
+        return desc_array_mut_(node, chain_hs_(sc), nc);
+    }
+
+    // Final bitmap reference (const)
+    static const bitmap256& chain_bitmap(const uint64_t* node, uint8_t sc) noexcept {
+        return bm_(node, chain_hs_(sc));
+    }
+
+    // Number of children in final bitmap
+    static unsigned chain_child_count(const uint64_t* node, uint8_t sc) noexcept {
+        return static_cast<unsigned>(chain_bitmap(node, sc).popcount());
+    }
+
+    // Pointer to real children array in final bitmap
+    static const uint64_t* chain_children(const uint64_t* node, uint8_t sc) noexcept {
+        return real_children_(node, chain_hs_(sc));
+    }
+    static uint64_t* chain_children_mut(uint64_t* node, uint8_t sc) noexcept {
+        return real_children_mut_(node, chain_hs_(sc));
+    }
+
+    // Iterate final bitmap children: cb(slot, tagged_child)
+    template<typename Fn>
+    static void chain_for_each_child(const uint64_t* node, uint8_t sc, Fn&& cb) noexcept {
+        size_t hs = chain_hs_(sc);
+        unsigned nc = static_cast<unsigned>(bm_(node, hs).popcount());
+        const uint64_t* ch = real_children_(node, hs);
+        for (unsigned i = 0; i < nc; ++i)
+            cb(i, ch[i]);
+    }
+
+    // Embed child pointer (the pointer in embed e that links to next embed or final bitmap)
+    static uint64_t embed_child(const uint64_t* node, uint8_t e) noexcept {
+        return node[1 + static_cast<size_t>(e) * 6 + 5];
+    }
+    static void set_embed_child(uint64_t* node, uint8_t e, uint64_t tagged) noexcept {
+        node[1 + static_cast<size_t>(e) * 6 + 5] = tagged;
+    }
+
+    // ==================================================================
+    // Tagged pointer accessors (for iteration on standalone bitmask)
+    // ==================================================================
+
+    // Bitmap256 ref from a bitmask tagged pointer (ptr points at bitmap)
+    static const bitmap256& bitmap_ref(uint64_t bm_tagged) noexcept {
+        return *reinterpret_cast<const bitmap256*>(bm_tagged);
+    }
+
+    // Read tagged child at slot from a bitmask tagged pointer
+    static uint64_t child_at(uint64_t bm_tagged, int slot) noexcept {
+        const uint64_t* bm = reinterpret_cast<const uint64_t*>(bm_tagged);
+        return bm[BITMAP256_U64 + 1 + slot];
+    }
+
+    // First child (slot 0) from a bitmask tagged pointer
+    static uint64_t first_child(uint64_t bm_tagged) noexcept {
+        const uint64_t* bm = reinterpret_cast<const uint64_t*>(bm_tagged);
+        return bm[BITMAP256_U64 + 1];
     }
 
     // ==================================================================
@@ -768,7 +861,21 @@ struct bitmask_ops {
         dealloc_node(alloc, node, h->alloc_u64());
     }
 
+    // --- Chain header size: 1 (base header) + sc * 6 (embed slots) ---
+    static constexpr size_t chain_hs_(uint8_t sc) noexcept {
+        return 1 + static_cast<size_t>(sc) * 6;
+    }
+
 private:
+    // --- Shared lookup core: works for any header size ---
+    static child_lookup lookup_at_(const uint64_t* node, size_t hs, uint8_t idx) noexcept {
+        const bitmap256& bm = bm_(node, hs);
+        int slot = bm.find_slot<slot_mode::FAST_EXIT>(idx);
+        if (slot < 0) return {0, -1, false};
+        uint64_t child = real_children_(node, hs)[slot];
+        return {child, slot, true};
+    }
+
     // --- Shared: bitmap starts after header (1 or 2 u64s) ---
     static const bitmap256& bm_(const uint64_t* n, size_t header_size) noexcept {
         return *reinterpret_cast<const bitmap256*>(n + header_size);
