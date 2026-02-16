@@ -7,6 +7,82 @@
 
 namespace gteitelbaum {
 
+// ======================================================================
+// find_ops<VALUE, ALLOC> — KEY-independent find.
+// Static methods templated on <BITS, NK> only, so find_node_<32, u32>
+// is one symbol shared by kntrie_impl<u32>, kntrie_impl<u64>, etc.
+// ======================================================================
+
+template<typename VALUE, typename ALLOC>
+struct find_ops {
+    using BO = bitmask_ops<VALUE, ALLOC>;
+
+    template<int BITS, typename NK> requires (BITS > 8)
+    static const VALUE* find_node_(uint64_t ptr, NK ik) noexcept {
+        constexpr int NK_BITS = sizeof(NK) * 8;
+
+        if (ptr & LEAF_BIT) [[unlikely]] {
+            const uint64_t* node = reinterpret_cast<const uint64_t*>(ptr ^ LEAF_BIT);
+            node_header hdr = *get_header(node);
+            return find_leaf_<BITS, NK>(node, hdr, ik,
+                hdr.skip(), reinterpret_cast<const uint8_t*>(&node[1]));
+        }
+
+        const uint64_t* bm = reinterpret_cast<const uint64_t*>(ptr);
+        uint8_t ti = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        int slot = reinterpret_cast<const bitmap256*>(bm)->
+                       find_slot<slot_mode::BRANCHLESS>(ti);
+        uint64_t child = bm[BITMAP256_U64 + slot];
+
+        if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
+            using NNK = std::conditional_t<sizeof(NK) == 8, uint32_t,
+                        std::conditional_t<sizeof(NK) == 4, uint16_t, uint8_t>>;
+            return find_node_<BITS - 8, NNK>(child,
+                static_cast<NNK>(static_cast<NK>(ik << 8) >> (NK_BITS / 2)));
+        } else {
+            return find_node_<BITS - 8, NK>(child, static_cast<NK>(ik << 8));
+        }
+    }
+
+    template<int BITS, typename NK> requires (BITS == 8)
+    static const VALUE* find_node_(uint64_t ptr, NK ik) noexcept {
+        const uint64_t* node = reinterpret_cast<const uint64_t*>(ptr ^ LEAF_BIT);
+        node_header hdr = *get_header(node);
+        return find_leaf_<8, NK>(node, hdr, ik, 0, nullptr);
+    }
+
+    template<int BITS, typename NK> requires (BITS > 8)
+    static const VALUE* find_leaf_(const uint64_t* node, node_header hdr, NK ik,
+                                   uint8_t skip, const uint8_t* prefix) noexcept {
+        constexpr int NK_BITS = sizeof(NK) * 8;
+
+        if (skip) [[unlikely]] {
+            if (static_cast<uint8_t>(ik >> (NK_BITS - 8)) != *prefix) [[unlikely]]
+                return nullptr;
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
+                using NNK = std::conditional_t<sizeof(NK) == 8, uint32_t,
+                            std::conditional_t<sizeof(NK) == 4, uint16_t, uint8_t>>;
+                return find_leaf_<BITS - 8, NNK>(node, hdr,
+                    static_cast<NNK>(static_cast<NK>(ik << 8) >> (NK_BITS / 2)),
+                    skip - 1, prefix + 1);
+            } else {
+                return find_leaf_<BITS - 8, NK>(node, hdr,
+                    static_cast<NK>(ik << 8), skip - 1, prefix + 1);
+            }
+        }
+
+        size_t hs = 1 + (hdr.skip() > 0);
+        return compact_ops<NK, VALUE, ALLOC>::find(node, hdr, ik, hs);
+    }
+
+    template<int BITS, typename NK> requires (BITS == 8)
+    static const VALUE* find_leaf_(const uint64_t* node, node_header hdr, NK ik,
+                                   uint8_t, const uint8_t*) noexcept {
+        return BO::bitmap_find(node, hdr,
+            static_cast<uint8_t>(ik), 1 + (hdr.skip() > 0));
+    }
+};
+
 template<typename KEY, typename VALUE, typename ALLOC = std::allocator<uint64_t>>
 class kntrie_impl {
     static_assert(std::is_integral_v<KEY>, "KEY must be integral");
@@ -56,111 +132,21 @@ public:
     }
 
     // ==================================================================
-    // Find — recursive template, one bitmask level per instantiation.
-    //
-    // find_node_<BITS, NK>: bitmask descent. NK narrows at type
-    //   boundaries (u64→u32→u16→u8), so lower levels are shared
-    //   across key types. Terminal at BITS=8: always bitmap leaf.
-    //
-    // find_leaf_<BITS, NK>: skip prefix peels bytes via recursion
-    //   with the same narrowing. Suffix type known from NK — no
-    //   runtime dispatch. Terminal at BITS=8: bitmap leaf.
+    // Find — delegates to find_ops<VALUE, ALLOC> (KEY-independent).
     // ==================================================================
 
     const VALUE* find_value(const KEY& key) const noexcept {
+        using FO = find_ops<VALUE, ALLOC>;
         using NK0 = std::conditional_t<KEY_BITS <= 8,  uint8_t,
                     std::conditional_t<KEY_BITS <= 16, uint16_t,
                     std::conditional_t<KEY_BITS <= 32, uint32_t, uint64_t>>>;
         IK ik = KO::to_internal(key);
-        return find_node_<KEY_BITS, NK0>(root_,
+        return FO::template find_node_<KEY_BITS, NK0>(root_,
             static_cast<NK0>(ik >> (IK_BITS - KEY_BITS)));
     }
 
     bool contains(const KEY& key) const noexcept {
         return find_value(key) != nullptr;
-    }
-
-private:
-    // ==================================================================
-    // find_node_<BITS, NK> — bitmask descent, one level per instantiation
-    // NK narrows when remaining bits fit the next smaller type.
-    // ==================================================================
-
-    template<int BITS, typename NK> requires (BITS > 8)
-    const VALUE* find_node_(uint64_t ptr, NK ik) const noexcept {
-        constexpr int NK_BITS = sizeof(NK) * 8;
-
-        // Leaf
-        if (ptr & LEAF_BIT) [[unlikely]] {
-            const uint64_t* node = reinterpret_cast<const uint64_t*>(ptr ^ LEAF_BIT);
-            node_header hdr = *get_header(node);
-            return find_leaf_<BITS, NK>(node, hdr, ik,
-                hdr.skip(), reinterpret_cast<const uint8_t*>(&node[1]));
-        }
-
-        // Bitmask — branchless popcount, tail-call next level
-        const uint64_t* bm = reinterpret_cast<const uint64_t*>(ptr);
-        uint8_t ti = static_cast<uint8_t>(ik >> (NK_BITS - 8));
-        int slot = reinterpret_cast<const bitmap256*>(bm)->
-                       find_slot<slot_mode::BRANCHLESS>(ti);
-        uint64_t child = bm[BITMAP256_U64 + slot];
-
-        // Narrow at type boundary: remaining bits fit in half the width
-        if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
-            using NNK = std::conditional_t<sizeof(NK) == 8, uint32_t,
-                        std::conditional_t<sizeof(NK) == 4, uint16_t, uint8_t>>;
-            return find_node_<BITS - 8, NNK>(child,
-                static_cast<NNK>(static_cast<NK>(ik << 8) >> (NK_BITS / 2)));
-        } else {
-            return find_node_<BITS - 8, NK>(child, static_cast<NK>(ik << 8));
-        }
-    }
-
-    // Terminal: 8 bits remaining — always bitmap leaf
-    template<int BITS, typename NK> requires (BITS == 8)
-    const VALUE* find_node_(uint64_t ptr, NK ik) const noexcept {
-        const uint64_t* node = reinterpret_cast<const uint64_t*>(ptr ^ LEAF_BIT);
-        node_header hdr = *get_header(node);
-        return find_leaf_<8, NK>(node, hdr, ik, 0, nullptr);
-    }
-
-    // ==================================================================
-    // find_leaf_<BITS, NK> — skip prefix peels bytes via recursion
-    //   with narrowing; suffix type known from NK at compile time.
-    // ==================================================================
-
-    template<int BITS, typename NK> requires (BITS > 8)
-    const VALUE* find_leaf_(const uint64_t* node, node_header hdr, NK ik,
-                            uint8_t skip, const uint8_t* prefix) const noexcept {
-        constexpr int NK_BITS = sizeof(NK) * 8;
-
-        if (skip) [[unlikely]] {
-            if (static_cast<uint8_t>(ik >> (NK_BITS - 8)) != *prefix) [[unlikely]]
-                return nullptr;
-            // Narrow at type boundary
-            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
-                using NNK = std::conditional_t<sizeof(NK) == 8, uint32_t,
-                            std::conditional_t<sizeof(NK) == 4, uint16_t, uint8_t>>;
-                return find_leaf_<BITS - 8, NNK>(node, hdr,
-                    static_cast<NNK>(static_cast<NK>(ik << 8) >> (NK_BITS / 2)),
-                    skip - 1, prefix + 1);
-            } else {
-                return find_leaf_<BITS - 8, NK>(node, hdr,
-                    static_cast<NK>(ik << 8), skip - 1, prefix + 1);
-            }
-        }
-
-        // No skip — NK is the suffix type
-        size_t hs = 1 + (hdr.skip() > 0);
-        return compact_ops<NK, VALUE, ALLOC>::find(node, hdr, ik, hs);
-    }
-
-    // Terminal: 8-bit suffix — bitmap leaf
-    template<int BITS, typename NK> requires (BITS == 8)
-    const VALUE* find_leaf_(const uint64_t* node, node_header hdr, NK ik,
-                            uint8_t, const uint8_t*) const noexcept {
-        return BO::bitmap_find(node, hdr,
-            static_cast<uint8_t>(ik), 1 + (hdr.skip() > 0));
     }
 
 public:
