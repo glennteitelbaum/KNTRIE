@@ -56,14 +56,26 @@ struct bitmap256 {
         return slot;
     }
 
-    int find_next_set(int start) const noexcept {
-        if (start >= 256) return -1;
-        int w = start >> 6, b = start & 63;
-        uint64_t masked = words[w] & ~((1ULL << b) - 1);
-        if (masked) return (w << 6) + std::countr_zero(masked);
-        for (int ww = w + 1; ww < 4; ++ww)
-            if (words[ww]) return (ww << 6) + std::countr_zero(words[ww]);
-        return -1;
+    // Iterate all set bits, calling fn(uint8_t bit_index, int slot) in order.
+    // Single pass: each word visited once, each bit popped with clear-lowest.
+    template<typename F>
+    void for_each_set(F&& fn) const noexcept {
+        int slot = 0;
+        for (int w = 0; w < 4; ++w) {
+            uint64_t bits = words[w];
+            while (bits) {
+                int b = std::countr_zero(bits);
+                fn(static_cast<uint8_t>((w << 6) + b), slot++);
+                bits &= bits - 1;
+            }
+        }
+    }
+
+    // Return the lowest set bit index. Undefined if bitmap is empty.
+    uint8_t first_set_bit() const noexcept {
+        for (int w = 0; w < 4; ++w)
+            if (words[w]) return static_cast<uint8_t>((w << 6) + std::countr_zero(words[w]));
+        __builtin_unreachable();
     }
 
     static bitmap256 from_indices(const uint8_t* indices, unsigned count) noexcept {
@@ -418,9 +430,9 @@ struct bitmask_ops {
         constexpr size_t hs = 1;
         const bitmap256& bm = bm_(node, hs);
         const uint64_t* rch = real_children_(node, hs);
-        int slot = 0;
-        for (int i = bm.find_next_set(0); i >= 0; i = bm.find_next_set(i + 1))
-            cb(static_cast<uint8_t>(i), slot, rch[slot++]);
+        bm.for_each_set([&](uint8_t idx, int slot) {
+            cb(idx, slot, rch[slot]);
+        });
     }
 
     // ==================================================================
@@ -626,9 +638,9 @@ struct bitmask_ops {
         size_t hs = hdr_u64(node);
         const bitmap256& bm = bm_(node, hs);
         const VST* vd = bl_vals_(node, hs);
-        int slot = 0;
-        for (int i = bm.find_next_set(0); i >= 0; i = bm.find_next_set(i + 1))
-            cb(static_cast<uint8_t>(i), vd[slot++]);
+        bm.for_each_set([&](uint8_t idx, int slot) {
+            cb(idx, vd[slot]);
+        });
     }
 
     // ==================================================================

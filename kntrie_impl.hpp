@@ -565,13 +565,11 @@ private:
         uint64_t children[256];
         uint16_t descs[256];
         const uint16_t* old_desc = reinterpret_cast<const uint16_t*>(old_ch + final_nc);
-        int si = 0;
-        for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1)) {
-            indices[si] = static_cast<uint8_t>(i);
-            children[si] = old_ch[si];
-            descs[si] = old_desc[si];
-            si++;
-        }
+        fbm.for_each_set([&](uint8_t idx, int slot) {
+            indices[slot] = idx;
+            children[slot] = old_ch[slot];
+            descs[slot] = old_desc[slot];
+        });
 
         if (rem_skip == 0) {
             // Just the final bitmask — create standalone
@@ -823,7 +821,7 @@ private:
         // Collapse when final drops to 1 child
         if (nc == 1) {
             const bitmap256& fbm_after = *reinterpret_cast<const bitmap256*>(node + final_offset);
-            uint8_t sole_idx = static_cast<uint8_t>(fbm_after.find_next_set(0));
+            uint8_t sole_idx = fbm_after.first_set_bit();
             uint64_t sole_child = real_ch[0];
 
             // Collect all skip bytes + sole_idx
@@ -1046,12 +1044,11 @@ private:
         size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
         const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + final_offset);
         const uint64_t* rch = node + final_offset + 5;
-        int slot = 0;
-        for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1)) {
-            uint64_t child_prefix = cur_prefix | (uint64_t(i) << (56 - cur_bits));
-            collect_entries_tagged_(rch[slot++], child_prefix, cur_bits + 8,
+        fbm.for_each_set([&](uint8_t idx, int slot) {
+            uint64_t child_prefix = cur_prefix | (uint64_t(idx) << (56 - cur_bits));
+            collect_entries_tagged_(rch[slot], child_prefix, cur_bits + 8,
                                      keys, vals, wi);
-        }
+        });
     }
 
     // Free all bitmask nodes in subtree without destroying leaf values
@@ -1069,9 +1066,9 @@ private:
         size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
         const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + final_offset);
         const uint64_t* rch = node + final_offset + 5;
-        int slot = 0;
-        for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1))
-            dealloc_bitmask_subtree_(rch[slot++]);
+        fbm.for_each_set([&](uint8_t, int slot) {
+            dealloc_bitmask_subtree_(rch[slot]);
+        });
         dealloc_node(alloc_, node, hdr->alloc_u64());
     }
 
@@ -1199,13 +1196,11 @@ private:
         uint64_t children[256];
         uint16_t descs[256];
         const uint16_t* old_desc = reinterpret_cast<const uint16_t*>(cch + nc);
-        int si = 0;
-        for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1)) {
-            indices[si] = static_cast<uint8_t>(i);
-            children[si] = cch[si];
-            descs[si] = old_desc[si];
-            si++;
-        }
+        fbm.for_each_set([&](uint8_t idx, int slot) {
+            indices[slot] = idx;
+            children[slot] = cch[slot];
+            descs[slot] = old_desc[slot];
+        });
 
         auto* chain = BO::make_skip_chain(all_bytes, total_skip, indices, children, nc, alloc_, descs);
         get_header(chain)->set_descendants(ch->descendants());
@@ -1527,9 +1522,9 @@ private:
             size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
             const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + final_offset);
             const uint64_t* real_ch = node + final_offset + 5;
-            int slot = 0;
-            for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1))
-                remove_node_(real_ch[slot++]);
+            fbm.for_each_set([&](uint8_t, int slot) {
+                remove_node_(real_ch[slot]);
+            });
 
             BO::dealloc_bitmask(node, alloc_);
         }
@@ -1574,9 +1569,9 @@ private:
             size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
             const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(node + final_offset);
             const uint64_t* real_ch = node + final_offset + 5;
-            int slot = 0;
-            for (int i = fbm.find_next_set(0); i >= 0; i = fbm.find_next_set(i + 1))
-                collect_stats_(real_ch[slot++], s);
+            fbm.for_each_set([&](uint8_t, int slot) {
+                collect_stats_(real_ch[slot], s);
+            });
         }
     }
 };
