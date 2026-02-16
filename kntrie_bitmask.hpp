@@ -498,6 +498,122 @@ struct bitmask_ops {
     }
 
     // ==================================================================
+    // build_remainder: extract embeds [from..sc-1] + final bitmask
+    //                  into a new standalone bitmask or skip chain.
+    //
+    // Returns: tagged pointer (bitmask or skip chain).
+    // ==================================================================
+
+    static uint64_t build_remainder(uint64_t* old_node, uint8_t old_sc,
+                                     uint8_t from_pos, ALLOC& alloc) {
+        uint8_t rem_skip = old_sc - from_pos;
+        unsigned final_nc = get_header(old_node)->entries();
+
+        // Extract final bitmask indices + children + descs
+        const bitmap256& fbm = chain_bitmap(old_node, old_sc);
+        const uint64_t* old_ch = chain_children(old_node, old_sc);
+        const uint16_t* old_desc = chain_desc_array(old_node, old_sc, final_nc);
+
+        uint8_t indices[256];
+        uint64_t children[256];
+        uint16_t descs[256];
+        fbm.for_each_set([&](uint8_t idx, int slot) {
+            indices[slot] = idx;
+            children[slot] = old_ch[slot];
+            descs[slot] = old_desc[slot];
+        });
+
+        if (rem_skip == 0) {
+            auto* bm_node = make_bitmask(indices, children, final_nc, alloc, descs);
+            get_header(bm_node)->set_descendants(
+                sum_tagged_array(children, final_nc));
+            return tag_bitmask(bm_node);
+        }
+
+        // rem_skip > 0: extract skip bytes for [from_pos..old_sc-1]
+        uint8_t sb[6];
+        for (uint8_t i = 0; i < rem_skip; ++i)
+            sb[i] = skip_byte(old_node, from_pos + i);
+
+        auto* chain = make_skip_chain(sb, rem_skip, indices, children, final_nc, alloc, descs);
+        get_header(chain)->set_descendants(
+            sum_tagged_array(children, final_nc));
+        return tag_bitmask(chain);
+    }
+
+    // ==================================================================
+    // wrap_in_chain: wrap an existing bitmask node in a skip chain
+    //               with prepended skip bytes.
+    //
+    // Deallocates the old child node. Returns tagged pointer.
+    // ==================================================================
+
+    static uint64_t wrap_in_chain(uint64_t* child, const uint8_t* bytes,
+                                   uint8_t count, ALLOC& alloc) {
+        auto* ch = get_header(child);
+        uint8_t child_sc = ch->skip();
+        unsigned nc = ch->entries();
+
+        // Collect all skip bytes: new prefix + child's existing skip
+        uint8_t all_bytes[12];
+        std::memcpy(all_bytes, bytes, count);
+        skip_bytes(child, child_sc, all_bytes + count);
+        uint8_t total_skip = count + child_sc;
+
+        // Extract final bitmask indices + children + descs
+        const bitmap256& fbm = chain_bitmap(child, child_sc);
+        const uint64_t* cch = chain_children(child, child_sc);
+        const uint16_t* old_desc = chain_desc_array(child, child_sc, nc);
+
+        uint8_t indices[256];
+        uint64_t children[256];
+        uint16_t descs[256];
+        fbm.for_each_set([&](uint8_t idx, int slot) {
+            indices[slot] = idx;
+            children[slot] = cch[slot];
+            descs[slot] = old_desc[slot];
+        });
+
+        auto* new_chain = make_skip_chain(all_bytes, total_skip, indices, children, nc, alloc, descs);
+        get_header(new_chain)->set_descendants(ch->descendants());
+        dealloc_node(alloc, child, ch->alloc_u64());
+        return tag_bitmask(new_chain);
+    }
+
+    // ==================================================================
+    // collapse_info: info needed for single-child collapse
+    // ==================================================================
+
+    struct collapse_info {
+        uint64_t sole_child;       // tagged child pointer
+        uint8_t  bytes[7];         // skip bytes to prepend (skip_bytes[0..sc-1] + sole_idx)
+        uint8_t  total_skip;       // sc + 1
+        uint16_t sole_entries;     // tagged_count of sole_child
+    };
+
+    // Extract collapse info from a skip chain (sc > 0, entries() == 1)
+    static collapse_info chain_collapse_info(const uint64_t* node, uint8_t sc) noexcept {
+        collapse_info ci;
+        skip_bytes(node, sc, ci.bytes);
+        ci.bytes[sc] = chain_bitmap(node, sc).first_set_bit();
+        ci.total_skip = sc + 1;
+        ci.sole_child = chain_children(node, sc)[0];
+        ci.sole_entries = tagged_count(ci.sole_child);
+        return ci;
+    }
+
+    // Extract collapse info from a standalone bitmask (sc == 0, entries() == 1)
+    static collapse_info standalone_collapse_info(const uint64_t* node) noexcept {
+        collapse_info ci;
+        const bitmap256& bm = bm_(node, 1);
+        ci.bytes[0] = bm.first_set_bit();
+        ci.total_skip = 1;
+        ci.sole_child = real_children_(node, 1)[0];
+        ci.sole_entries = tagged_count(ci.sole_child);
+        return ci;
+    }
+
+    // ==================================================================
     // Bitmask node: iterate  cb(uint8_t idx, int slot, uint64_t tagged_child)
     // ==================================================================
 

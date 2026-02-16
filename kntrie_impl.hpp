@@ -703,7 +703,7 @@ private:
             make_single_leaf_(static_cast<IK>(ik << 8), value, bits - 8));
 
         // Build remainder from [split_pos+1..sc-1] + final bitmask
-        uint64_t remainder = build_remainder_tagged_(node, hdr, sc, split_pos + 1);
+        uint64_t remainder = BO::build_remainder(node, sc, split_pos + 1, alloc_);
 
         // Create 2-child bitmask at split point
         uint8_t bi[2];
@@ -715,9 +715,9 @@ private:
             bi[0] = actual_byte; cp[0] = remainder;
             bi[1] = expected;    cp[1] = new_leaf_tagged;
         }
-        uint16_t ds[2] = {tagged_count_(cp[0]), tagged_count_(cp[1])};
+        uint16_t ds[2] = {tagged_count(cp[0]), tagged_count(cp[1])};
         auto* split_node = BO::make_bitmask(bi, cp, 2, alloc_, ds);
-        get_header(split_node)->set_descendants(sum_tagged_array_(cp, 2));
+        get_header(split_node)->set_descendants(sum_tagged_array(cp, 2));
 
         // Wrap in skip chain for prefix bytes [0..split_pos-1]
         uint64_t result;
@@ -727,7 +727,7 @@ private:
                 uint64_t* eb = node + 1 + i * 6;
                 prefix_bytes[i] = reinterpret_cast<const bitmap256*>(eb)->single_bit_index();
             }
-            result = wrap_bitmask_chain_(split_node, prefix_bytes, split_pos);
+            result = BO::wrap_in_chain(split_node, prefix_bytes, split_pos, alloc_);
         } else {
             result = tag_bitmask(split_node);
         }
@@ -737,55 +737,6 @@ private:
     }
 
     // ==================================================================
-    // build_remainder_tagged_: extract embeds [from..sc-1] + final bitmask
-    //                          into a new allocation
-    //
-    // Returns: tagged pointer (bitmask or skip chain).
-    // ==================================================================
-
-    uint64_t build_remainder_tagged_(uint64_t* old_node, node_header* old_hdr,
-                                       uint8_t old_sc, uint8_t from_pos) {
-        uint8_t rem_skip = old_sc - from_pos;
-        unsigned final_nc = old_hdr->entries();
-        size_t old_final_offset = 1 + static_cast<size_t>(old_sc) * 6;
-
-        // Extract final bitmask indices + children
-        const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(
-            old_node + old_final_offset);
-        const uint64_t* old_ch = old_node + old_final_offset + 5;
-
-        uint8_t indices[256];
-        uint64_t children[256];
-        uint16_t descs[256];
-        const uint16_t* old_desc = reinterpret_cast<const uint16_t*>(old_ch + final_nc);
-        fbm.for_each_set([&](uint8_t idx, int slot) {
-            indices[slot] = idx;
-            children[slot] = old_ch[slot];
-            descs[slot] = old_desc[slot];
-        });
-
-        if (rem_skip == 0) {
-            // Just the final bitmask — create standalone
-            auto* bm_node = BO::make_bitmask(indices, children, final_nc, alloc_, descs);
-            get_header(bm_node)->set_descendants(
-                sum_tagged_array_(children, final_nc));
-            return tag_bitmask(bm_node);
-        }
-
-        // rem_skip > 0: extract skip bytes + final
-        uint8_t skip_bytes[6];
-        for (uint8_t i = 0; i < rem_skip; ++i) {
-            uint64_t* eb = old_node + 1 + (from_pos + i) * 6;
-            skip_bytes[i] = reinterpret_cast<const bitmap256*>(eb)->single_bit_index();
-        }
-
-        auto* chain = BO::make_skip_chain(
-            skip_bytes, rem_skip, indices, children, final_nc, alloc_, descs);
-        get_header(chain)->set_descendants(
-            sum_tagged_array_(children, final_nc));
-        return tag_bitmask(chain);
-    }
-
     // ==================================================================
     // erase_node (recursive, tagged)
     //
@@ -866,26 +817,19 @@ private:
 
         // Collapse: single-child bitmask
         if (get_header(nn)->entries() == 1) {
-            uint64_t sole_child = 0;
-            uint8_t sole_idx = 0;
-            BO::for_each_child(nn, [&](uint8_t idx, int, uint64_t tagged) {
-                sole_child = tagged;
-                sole_idx = idx;
-            });
-            uint16_t sole_ent = tagged_count_(sole_child);
-            if (sole_child & LEAF_BIT) {
-                uint64_t* leaf = untag_leaf_mut(sole_child);
-                uint8_t byte_arr[1] = {sole_idx};
-                leaf = prepend_skip_(leaf, 1, byte_arr);
-                size_t nn_au64 = get_header(nn)->alloc_u64();
-                dealloc_node(alloc_, nn, nn_au64);
-                return {tag_leaf(leaf), true, sole_ent};
-            }
-            uint64_t* child_node = bm_to_node(sole_child);
-            uint8_t byte_arr[1] = {sole_idx};
+            auto ci = BO::standalone_collapse_info(nn);
             size_t nn_au64 = get_header(nn)->alloc_u64();
+
+            if (ci.sole_child & LEAF_BIT) {
+                uint64_t* leaf = untag_leaf_mut(ci.sole_child);
+                leaf = prepend_skip_(leaf, ci.total_skip, ci.bytes);
+                dealloc_node(alloc_, nn, nn_au64);
+                return {tag_leaf(leaf), true, ci.sole_entries};
+            }
+            uint64_t* child_node = bm_to_node(ci.sole_child);
             dealloc_node(alloc_, nn, nn_au64);
-            return {wrap_bitmask_chain_(child_node, byte_arr, 1), true, sole_ent};
+            return {BO::wrap_in_chain(child_node, ci.bytes, ci.total_skip, alloc_),
+                    true, ci.sole_entries};
         }
 
         // Multi-child: decrement descendants, check coalesce
@@ -955,29 +899,20 @@ private:
 
         // Collapse when final drops to 1 child
         if (nc == 1) {
-            const bitmap256& fbm_after = BO::chain_bitmap(node, sc);
-            uint8_t sole_idx = fbm_after.first_set_bit();
-            uint64_t sole_child = BO::chain_children(node, sc)[0];
-
-            // Collect all skip bytes + sole_idx
-            uint8_t all_bytes[7];
-            BO::skip_bytes(node, sc, all_bytes);
-            all_bytes[sc] = sole_idx;
-            uint8_t total_skip = sc + 1;
-
+            auto ci = BO::chain_collapse_info(node, sc);
             size_t node_au64 = hdr->alloc_u64();
-            uint16_t sole_ent = tagged_count_(sole_child);
 
-            if (sole_child & LEAF_BIT) {
-                uint64_t* leaf = untag_leaf_mut(sole_child);
-                leaf = prepend_skip_(leaf, total_skip, all_bytes);
+            if (ci.sole_child & LEAF_BIT) {
+                uint64_t* leaf = untag_leaf_mut(ci.sole_child);
+                leaf = prepend_skip_(leaf, ci.total_skip, ci.bytes);
                 dealloc_node(alloc_, node, node_au64);
-                return {tag_leaf(leaf), true, sole_ent};
+                return {tag_leaf(leaf), true, ci.sole_entries};
             }
 
-            uint64_t* child_node = bm_to_node(sole_child);
+            uint64_t* child_node = bm_to_node(ci.sole_child);
             dealloc_node(alloc_, node, node_au64);
-            return {wrap_bitmask_chain_(child_node, all_bytes, total_skip), true, sole_ent};
+            return {BO::wrap_in_chain(child_node, ci.bytes, ci.total_skip, alloc_),
+                    true, ci.sole_entries};
         }
 
         // Multi-child: decrement descendants, check coalesce
@@ -1024,8 +959,6 @@ private:
     // dealloc_bitmask_subtree_: free bitmask nodes (NOT leaf values)
     // ==================================================================
 
-    static constexpr uint16_t COALESCE_CAP = static_cast<uint16_t>(COMPACT_MAX + 1);
-
     // ------------------------------------------------------------------
     // Descendant tracking helpers
     //
@@ -1033,13 +966,6 @@ private:
     // (unused by bitmask). Capped at COALESCE_CAP (COMPACT_MAX + 1).
     // Leaf nodes: use entries() instead.
     // ------------------------------------------------------------------
-
-    // Get descendant count from any tagged pointer (capped)
-    static uint16_t tagged_count_(uint64_t tagged) noexcept {
-        if (tagged & LEAF_BIT)
-            return get_header(untag_leaf(tagged))->entries();
-        return get_header(bm_to_node_const(tagged))->descendants();
-    }
 
     // Sum immediate children's counts from local desc array. No pointer chasing.
     // Early exit when > COMPACT_MAX. Unchecked children assumed to have ≥ 1.
@@ -1083,16 +1009,6 @@ private:
         d = sum_children_desc_(node, sc);
         h->set_descendants(d);
         return d;
-    }
-
-    // Sum tagged children array (for build paths)
-    static uint16_t sum_tagged_array_(const uint64_t* children, unsigned nc) noexcept {
-        uint32_t total = 0;
-        for (unsigned i = 0; i < nc; ++i) {
-            total += tagged_count_(children[i]);
-            if (total > COMPACT_MAX) return COALESCE_CAP;
-        }
-        return static_cast<uint16_t>(total);
     }
 
     // Coalesce: caller already verified total <= COMPACT_MAX.
@@ -1289,51 +1205,6 @@ private:
     }
 
     // ==================================================================
-    // wrap_bitmask_chain_: wrap child bitmask in a skip chain
-    //
-    // child: RAW (untagged) bitmask node pointer (standalone or chain).
-    // Returns: tagged bitmask pointer to the new chain.
-    //
-    // If child is already a skip chain, merges skip bytes.
-    // Extracts child's final bitmap + children, creates a new combined
-    // skip chain allocation, deallocates the old child.
-    // ==================================================================
-
-    uint64_t wrap_bitmask_chain_(uint64_t* child, const uint8_t* bytes, uint8_t count) {
-        auto* ch = get_header(child);
-        uint8_t child_sc = ch->skip();
-        unsigned nc = ch->entries();
-
-        // Collect all skip bytes: new prefix + child's existing skip
-        uint8_t all_bytes[12];
-        std::memcpy(all_bytes, bytes, count);
-        for (uint8_t i = 0; i < child_sc; ++i) {
-            uint64_t* eb = child + 1 + i * 6;
-            all_bytes[count + i] = reinterpret_cast<const bitmap256*>(eb)->single_bit_index();
-        }
-        uint8_t total_skip = count + child_sc;
-
-        // Extract final bitmask indices + children
-        size_t final_offset = 1 + static_cast<size_t>(child_sc) * 6;
-        const bitmap256& fbm = *reinterpret_cast<const bitmap256*>(child + final_offset);
-        const uint64_t* cch = child + final_offset + 5;  // real children
-
-        uint8_t indices[256];
-        uint64_t children[256];
-        uint16_t descs[256];
-        const uint16_t* old_desc = reinterpret_cast<const uint16_t*>(cch + nc);
-        fbm.for_each_set([&](uint8_t idx, int slot) {
-            indices[slot] = idx;
-            children[slot] = cch[slot];
-            descs[slot] = old_desc[slot];
-        });
-
-        auto* chain = BO::make_skip_chain(all_bytes, total_skip, indices, children, nc, alloc_, descs);
-        get_header(chain)->set_descendants(ch->descendants());
-        dealloc_node(alloc_, child, ch->alloc_u64());
-        return tag_bitmask(chain);
-    }
-
     // ==================================================================
     // make_single_leaf: create 1-entry leaf at given bits
     //
@@ -1402,7 +1273,7 @@ private:
             } else {
                 // Wrap bitmask in chain
                 uint64_t* bm_node = bm_to_node(child_tagged);
-                child_tagged = wrap_bitmask_chain_(bm_node, pfx, ps);
+                child_tagged = BO::wrap_in_chain(bm_node, pfx, ps, alloc_);
             }
         }
 
@@ -1507,7 +1378,7 @@ private:
                     return tag_leaf(prepend_skip_(leaf, 1, byte_arr));
                 } else {
                     uint64_t* bm_node = bm_to_node(child_tagged);
-                    return wrap_bitmask_chain_(bm_node, byte_arr, 1);
+                    return BO::wrap_in_chain(bm_node, byte_arr, 1, alloc_);
                 }
             }
         }
@@ -1610,12 +1481,12 @@ private:
             bi[1] = new_idx; cp[1] = tag_leaf(new_leaf);
         }
 
-        uint16_t ds[2] = {tagged_count_(cp[0]), tagged_count_(cp[1])};
+        uint16_t ds[2] = {tagged_count(cp[0]), tagged_count(cp[1])};
         auto* bm_node = BO::make_bitmask(bi, cp, 2, alloc_, ds);
         get_header(bm_node)->set_descendants(
-            sum_tagged_array_(cp, 2));
+            sum_tagged_array(cp, 2));
         if (common > 0)
-            return wrap_bitmask_chain_(bm_node, saved_prefix, common);
+            return BO::wrap_in_chain(bm_node, saved_prefix, common, alloc_);
         return tag_bitmask(bm_node);
     }
 

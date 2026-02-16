@@ -20,11 +20,11 @@ transcript before doing anything.
 
 | File | Lines | Role |
 |------|-------|------|
-| kntrie_support.hpp | 314 | node_header, tagged ptrs, bitmap256 layout constants, next_narrow_t |
+| kntrie_support.hpp | 337 | node_header, tagged ptrs, bitmap256 layout constants, next_narrow_t |
 | kntrie_compact.hpp | 612 | CO<NK>: compact leaf ops |
-| kntrie_bitmask.hpp | 976 | BM: bitmask node ops, bitmap leaf ops, chain accessors, add/remove cores |
+| kntrie_bitmask.hpp | 1092 | BM: bitmask/chain ops (add/remove/build/wrap/collapse) |
 | kntrie_ops.hpp | 93 | Ops<NK>: find (will grow with insert/erase/iter) |
-| kntrie_impl.hpp | 1701 | Insert, erase, iter, build (shrinking) |
+| kntrie_impl.hpp | 1572 | Insert, erase, iter, build (shrinking) |
 | kntrie.hpp | 240 | Public API, KEY→UK, iterators |
 
 ---
@@ -133,19 +133,20 @@ Compile + test + ASAN.
 
 ### 2B: Move chain structural ops to BM
 
-- [ ] 2B.1 Move `build_remainder_tagged_` (impl:913-954) → `BO::build_remainder`
-      - Add `ALLOC& alloc` parameter
-      - Replace raw offset math with internal BM helpers
-
-- [ ] 2B.2 Move `wrap_bitmask_chain_` (impl:1536-1569) → `BO::wrap_in_chain`
-      - Add `ALLOC& alloc` parameter
-
-- [ ] 2B.3 Add `BO::chain_collapse_info(node, sc)` and `BO::standalone_collapse_info(node)`
-      - Extract sole-child info gathering from erase paths
-      - Delete the ~28-line collapse block in `erase_skip_chain_`
-      - Delete the ~22-line standalone collapse in `erase_node_`
-
-- [ ] 2B.4 Update all call sites in impl to use new BM methods
+- [x] 2B.1 Move `build_remainder_tagged_` → `BO::build_remainder` — DONE
+      - Dropped hdr param (reads from node header internally)
+      - Uses chain_bitmap, chain_children, chain_desc_array, skip_byte internally
+- [x] 2B.2 Move `wrap_bitmask_chain_` → `BO::wrap_in_chain` — DONE
+      - Uses skip_bytes, chain_bitmap, chain_children, chain_desc_array internally
+      - Deallocates old child, returns tagged pointer
+- [x] 2B.3 Add `collapse_info` struct + extractors — DONE
+      - `BO::chain_collapse_info(node, sc)` for skip chain collapse
+      - `BO::standalone_collapse_info(node)` for standalone collapse
+      - Both return {sole_child, bytes[], total_skip, sole_entries}
+      - Replaced ~20-line standalone collapse in erase_node_
+      - Replaced ~20-line chain collapse in erase_skip_chain_
+- [x] 2B.4 Update all call sites in impl — DONE
+      - 1 build_remainder call, 6 wrap_in_chain calls, 2 collapse blocks
 
 **⏸ STOP**: Present zip. Wait for confirmation. Compile + test + ASAN.
 
@@ -373,3 +374,4 @@ ALL is_leaf() / set_bitmask() calls replaced by tagged ptr checks.
 | 2026-02-16 | 1 | 1.1-1.6 | Created kntrie_ops.hpp, moved find_ops, added next_narrow_t to support |
 | 2026-02-16 | 1.5 | 1.5.1-1.5.8 | BM read accessors + chain methods. Replaced ~30 raw layout accesses in impl. Tests pass + ASAN |
 | 2026-02-16 | 2A | 2A.1-2A.5 | add_child_at_/remove_child_at_/fix_embeds_ cores. chain_add/remove_child. Deleted ~130 lines from impl |
+| 2026-02-16 | 2B | 2B.1-2B.4 | build_remainder, wrap_in_chain, collapse_info moved to BM. Impl -129 lines |

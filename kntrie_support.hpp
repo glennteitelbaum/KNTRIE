@@ -19,6 +19,7 @@ namespace gteitelbaum {
 inline constexpr size_t BITMAP256_U64 = 4;   // 32 bytes
 inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
+inline constexpr uint16_t COALESCE_CAP = static_cast<uint16_t>(COMPACT_MAX + 1);
 inline constexpr size_t HEADER_U64    = 1;   // base header is 1 u64 (8 bytes), +1 if skip
 
 // u64s needed for N child descriptor entries (uint16_t each)
@@ -186,6 +187,28 @@ alignas(64) inline constinit uint64_t SENTINEL_NODE[8] = {};
 // Tagged sentinel: SENTINEL_NODE with LEAF_BIT set (valid zeroed leaf)
 inline const uint64_t SENTINEL_TAGGED =
     reinterpret_cast<uint64_t>(&SENTINEL_NODE[0]) | LEAF_BIT;
+
+// ==========================================================================
+// Tagged pointer entry counting (NK-independent)
+// ==========================================================================
+
+// Count entries reachable from a tagged pointer.
+// Leaf: entries in header. Bitmask: descendants in header.
+inline uint16_t tagged_count(uint64_t tagged) noexcept {
+    if (tagged & LEAF_BIT)
+        return get_header(untag_leaf(tagged))->entries();
+    return get_header(bm_to_node_const(tagged))->descendants();
+}
+
+// Sum entry counts across an array of tagged children (capped).
+inline uint16_t sum_tagged_array(const uint64_t* children, unsigned nc) noexcept {
+    uint32_t total = 0;
+    for (unsigned i = 0; i < nc; ++i) {
+        total += tagged_count(children[i]);
+        if (total > COMPACT_MAX) return COALESCE_CAP;
+    }
+    return static_cast<uint16_t>(total);
+}
 
 // ==========================================================================
 // key_ops<KEY> -- internal key representation
