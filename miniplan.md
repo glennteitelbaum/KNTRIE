@@ -23,12 +23,12 @@
 
 ## Phase 3: kntrie_impl traversal (kntrie_impl.hpp)
 
-- [ ] Add `iter_result_t { KEY key; VALUE value; bool found; }`
-- [ ] Implement `iter_first_()` — descend always-min from root
-- [ ] Implement `iter_last_()` — descend always-max from root
-- [ ] Implement `iter_next_(KEY key)` — descend tracking resume point, next_set_after
-- [ ] Implement `iter_prev_(KEY key)` — descend tracking resume point, prev_set_before
-- [ ] Key reconstruction logic (accumulate prefix bytes during descent)
+- [x] Add `iter_result_t { KEY key; VALUE value; bool found; }`
+- [x] Implement `iter_first_()` — descend always-min from root
+- [x] Implement `iter_last_()` — descend always-max from root
+- [x] Implement `iter_next_(KEY key)` — descend tracking resume point, next_set_after
+- [x] Implement `iter_prev_(KEY key)` — descend tracking resume point, prev_set_before
+- [x] Key reconstruction logic (accumulate prefix bytes during descent)
 - [ ] **STOP**: zip all headers + plan.md + miniplan.md, wait for user
 
 ## Phase 4: iterator class (kntrie.hpp)
