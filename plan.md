@@ -203,8 +203,6 @@ struct kntrie_ops {
     static uint64_t split_on_prefix_tagged_(..., ALLOC& alloc);
     template<typename NK>
     static uint64_t split_skip_at_(..., ALLOC& alloc);
-    static uint64_t build_remainder_tagged_(..., ALLOC& alloc);
-    static uint64_t* add_child_to_chain_(..., ALLOC& alloc);
 
     // ── Erase ─────────────────────────────────────────────────────
     template<typename NK>
@@ -252,7 +250,9 @@ struct kntrie_ops {
     // ── Skip/node helpers ─────────────────────────────────────────
     static uint64_t* prepend_skip_(..., ALLOC& alloc);
     static uint64_t* remove_skip_(..., ALLOC& alloc);
-    static uint64_t wrap_bitmask_chain_(..., ALLOC& alloc);
+    // NOTE: wrap_bitmask_chain_ moved to BM as wrap_in_chain
+    // NOTE: build_remainder_tagged_ moved to BM as build_remainder
+    // NOTE: add_child_to_chain_ moved to BM as chain_add_child
 
     // ── Destroy / Stats ───────────────────────────────────────────
     static void remove_node_(uint64_t tagged, ALLOC& alloc);
@@ -618,22 +618,38 @@ One function per operation instead of 4-way dispatch. All compile-time.
 - kntrie_impl::find_value calls `Ops::find_node_<BITS, NK0>`
 - **Test**: compile + run all tests. Zero behavior change.
 
-### Phase 2: Move descriptor + skip helpers to ops
+### Phase 1.5: Add BM read accessors, use in impl
 
-Move KEY-independent helpers (no NK template needed):
+Add to bitmask_ops:
+- `skip_byte(node, e)`, `skip_bytes(node, sc, out)`
+- `chain_lookup(node, sc, idx)`, `chain_child(node, sc, slot)`
+- `chain_set_child(node, sc, slot, tagged)`
+- `chain_desc_array(node, sc)` (const + mutable)
+- `chain_for_each_child(node, sc, cb)`
+- `bitmap_ref(bm_tagged)`, `child_at(bm_tagged, slot)`, `first_child(bm_tagged)`
+
+Replace all raw BM layout access in kntrie_impl.hpp with these calls.
+No algorithmic changes — pure mechanical substitution.
+
+**Test**: compile + run all tests. Zero behavior change.
+
+### Phase 2: Move helpers to ops + chain mutations to BM
+
+**Move to ops** (KEY-independent, no NK):
 - `tagged_count_`, `sum_children_desc_`, `set_desc_capped_`
 - `inc_descendants_`, `dec_or_recompute_desc_`, `sum_tagged_array_`
-- `prepend_skip_`, `remove_skip_`, `wrap_bitmask_chain_`
-- `build_remainder_tagged_`, `add_child_to_chain_`
+- `prepend_skip_`, `remove_skip_`
 - `remove_node_`, `destroy_leaf_`, `dealloc_bitmask_subtree_`
-- `remove_all_` → ops gets `remove_node_`, impl destructor calls it
 
-All add `ALLOC& alloc` parameter where they allocate/deallocate.
-Read-only helpers need no alloc.
+**Move to BM** (layout-owning operations):
+- `add_child_to_chain_` → `BO::chain_add_child`
+- erase chain removal block → `BO::chain_remove_child`
+- erase chain collapse extraction → `BO::chain_collapse_info`
+- `build_remainder_tagged_` → `BO::build_remainder`
+- `wrap_bitmask_chain_` → `BO::wrap_in_chain`
 
+All mutating functions add `ALLOC& alloc` parameter.
 Move `iter_result_t` to kntrie_support.hpp, templated on `<IK, VALUE>`.
-
-impl calls `Ops::xxx(args..., alloc_)` everywhere.
 
 **Test**: compile + run all tests after each batch of moves.
 
@@ -642,9 +658,10 @@ impl calls `Ops::xxx(args..., alloc_)` everywhere.
 Convert insert path to NK dispatch:
 
 1. Move `insert_node_` → `Ops::insert_node_<INSERT, ASSIGN, NK>`
-   - Merge skip chain handling into bitmask case
+   - Merge skip chain handling into bitmask case (use BO::skip_byte etc.)
    - Replace `IK ik` with `NK ik`, `IK_BITS` with `NK_BITS`
    - Replace `leaf_insert_` dispatch with `CO<NK>::insert`
+   - Skip chain ops via `BO::chain_lookup`, `BO::chain_add_child`
 
 2. Move `make_single_leaf_` → `Ops::make_single_leaf_<NK>`
    - NK determines leaf type, no suffix_type_for
@@ -656,6 +673,7 @@ Convert insert path to NK dispatch:
    - Recursive builder with narrowing
 
 5. Move `split_on_prefix_tagged_`, `split_skip_at_` → ops with NK
+   - split_skip_at_ calls `BO::build_remainder` + `BO::make_bitmask` + `BO::wrap_in_chain`
 
 6. Impl's insert_dispatch_ becomes ~10 lines calling Ops
 
@@ -664,12 +682,15 @@ Convert insert path to NK dispatch:
 ### Phase 4: Template erase on NK
 
 1. Move `erase_node_` → `Ops::erase_node_<NK>`
-   - Merge skip chain handling
+   - Merge skip chain handling (use BO::skip_byte, chain_lookup)
    - Replace `leaf_erase_` dispatch with `CO<NK>::erase`
+   - Chain child removal via `BO::chain_remove_child`
+   - Collapse via `BO::chain_collapse_info` + `BO::wrap_in_chain`
 
 2. Move `do_coalesce_` → `Ops::do_coalesce_<NK>`
 3. Move `collect_entries_tagged_` → `Ops::collect_entries_<NK>`
    - Uses `leaf_for_each_aligned_<NK>` with narrowing at boundaries
+   - Uses `BO::chain_for_each_child` for bitmask iteration
 4. Move `build_leaf_from_arrays_` → `Ops::build_leaf_from_arrays_<NK>`
 
 **Test**: full test suite + ASAN.
@@ -677,7 +698,9 @@ Convert insert path to NK dispatch:
 ### Phase 5: Template iteration on NK
 
 1. Move iter_next_node_, iter_prev_node_ → ops with `<IK, NK>`
+   - Use `BO::bitmap_ref(ptr)`, `BO::child_at(ptr, slot)` instead of raw access
 2. Move descend_min_, descend_max_ → ops
+   - Use `BO::first_child(ptr)` instead of `bm[BITMAP256_U64 + 1]`
 3. Replace leaf_first_/last_/next_/prev_dispatch_ (4×25 lines of dispatch)
    with 4 compact functions using `CO<NK>::iter_xxx`
 4. Replace combine_suffix_ runtime switch with compile-time shift
@@ -692,10 +715,272 @@ Convert insert path to NK dispatch:
 - Remove `CO16/CO32/CO64` type aliases from impl (ops uses `CO<NK>`)
 - Verify kntrie_impl.hpp is ~200 lines
 
-### Phase 7 (optional): Review CO/BM interfaces
+---
 
-Check if any knowledge that should be in CO/BM leaked into ops.
-Low priority — the current CO/BM interfaces are already clean.
+## BM interface expansion
+
+### Problem
+
+ops currently has ~55 direct accesses to BM internal layout:
+- `node + 1 + e * 6` for skip embed access (15 sites)
+- `final_offset = 1 + sc * 6` calculations (10 sites)
+- `node + final_offset + 5` for chain children (8 sites)
+- `reinterpret_cast<uint16_t*>(real_ch + nc)` for chain desc (6 sites)
+- `bm[BITMAP256_U64 + 1 + slot]` for iteration child access (6 sites)
+- Embed pointer fixup during realloc (4 sites)
+- Skip byte extraction via `bitmap256::single_bit_index()` (8 sites)
+
+### New BM public methods
+
+#### Skip chain read access
+
+```cpp
+// Read skip byte at position e
+static uint8_t skip_byte(const uint64_t* node, uint8_t e) noexcept;
+
+// Copy all skip bytes into caller's buffer
+static void skip_bytes(const uint64_t* node, uint8_t sc,
+                        uint8_t* out) noexcept;
+
+// Lookup byte in chain's final bitmap (analogous to standalone lookup)
+static child_lookup chain_lookup(const uint64_t* node, uint8_t sc,
+                                   uint8_t idx) noexcept;
+
+// Get tagged child at slot in chain's final bitmap
+static uint64_t chain_child(const uint64_t* node, uint8_t sc,
+                              int slot) noexcept;
+
+// Set child at slot in chain's final bitmap
+static void chain_set_child(uint64_t* node, uint8_t sc, int slot,
+                              uint64_t tagged) noexcept;
+
+// Desc array for chain's final bitmap
+static uint16_t* chain_desc_array(uint64_t* node, uint8_t sc) noexcept;
+static const uint16_t* chain_desc_array(const uint64_t* node,
+                                          uint8_t sc) noexcept;
+
+// Iterate chain's final bitmap children
+template<typename Fn>
+static void chain_for_each_child(const uint64_t* node, uint8_t sc,
+                                   Fn&& cb);
+```
+
+#### Skip chain mutation (move FROM ops TO BM)
+
+```cpp
+// Add child to chain's final bitmap (handles realloc + embed fixup)
+// Returns new node pointer (may change due to realloc)
+static uint64_t* chain_add_child(uint64_t* node, node_header* hdr,
+                                   uint8_t sc, uint8_t idx,
+                                   uint64_t child_tagged,
+                                   uint16_t child_desc,
+                                   ALLOC& alloc);
+
+// Remove child from chain's final bitmap
+// Handles: shrink/realloc, desc copy, embed fixup
+// Returns new node + remaining child count
+struct chain_remove_result {
+    uint64_t* node;      // new node pointer
+    unsigned  nc;        // remaining child count in final bitmap
+};
+static chain_remove_result chain_remove_child(
+    uint64_t* node, node_header* hdr, uint8_t sc,
+    int slot, uint8_t idx, ALLOC& alloc);
+
+// Extract [from_pos..sc-1] + final bitmap into new allocation
+// Returns tagged pointer (bitmask or skip chain)
+static uint64_t build_remainder(uint64_t* node, node_header* hdr,
+                                  uint8_t sc, uint8_t from_pos,
+                                  ALLOC& alloc);
+
+// Wrap child bitmask in skip chain, merging existing skip
+// child: RAW untagged bitmask. Returns tagged bitmask.
+static uint64_t wrap_in_chain(uint64_t* child, const uint8_t* bytes,
+                                uint8_t count, ALLOC& alloc);
+
+// Collapse info for single-child chain after removal
+struct collapse_info {
+    uint64_t  sole_child;      // tagged
+    uint8_t   sole_idx;        // byte index of sole child
+    uint16_t  sole_ent;        // entry count
+    uint8_t   all_skip[7];     // all skip bytes + sole_idx combined
+    uint8_t   total_skip;      // length of all_skip
+};
+static collapse_info chain_collapse_info(const uint64_t* node,
+                                           uint8_t sc) noexcept;
+```
+
+#### Standalone bitmask access for iteration
+
+```cpp
+// Get bitmap reference from tagged bitmask pointer (no untag)
+static const bitmap256& bitmap_ref(uint64_t bm_tagged) noexcept;
+
+// Get child at slot from tagged bitmask pointer
+static uint64_t child_at(uint64_t bm_tagged, int slot) noexcept;
+
+// Get first child (slot 0) from tagged bitmask pointer
+static uint64_t first_child(uint64_t bm_tagged) noexcept;
+```
+
+### What moves where
+
+#### Functions that move entirely FROM impl/ops TO BM:
+
+| Function | Current location | Lines | Why BM owns it |
+|----------|-----------------|-------|----------------|
+| `add_child_to_chain_` | impl:775-849 | 75 | Realloc + embed fixup + desc copy |
+| `build_remainder_tagged_` | impl:913-954 | 42 | Extracts partial skip chain |
+| `wrap_bitmask_chain_` | impl:1536-1569 | 34 | Merges skip chains |
+| erase chain removal block | impl:1119-1179 | 61 | Shrink/realloc + desc + embed fixup |
+| erase chain collapse | impl:1182-1209 | 28 | Single-child extraction from chain |
+
+**Total moved to BM: ~240 lines**
+
+#### What ops keeps (BM-layout-free):
+
+| Responsibility | How ops calls BM |
+|---------------|------------------|
+| Walk skip bytes (match key) | `BO::skip_byte(node, e)` per byte |
+| Lookup in chain final bitmap | `BO::chain_lookup(node, sc, byte)` |
+| Read/set child in chain | `BO::chain_child()`, `BO::chain_set_child()` |
+| Update chain desc | `BO::chain_desc_array(node, sc)[slot] = val` |
+| Add child to chain | `BO::chain_add_child(node, hdr, sc, ...)` |
+| Remove child from chain | `BO::chain_remove_child(node, hdr, sc, ...)` |
+| Split skip chain | `BO::build_remainder(node, hdr, sc, pos, alloc)` |
+| Wrap in chain | `BO::wrap_in_chain(child, bytes, count, alloc)` |
+| Collapse info | `BO::chain_collapse_info(node, sc)` |
+| Iterate bitmask children | `BO::bitmap_ref(ptr)`, `BO::child_at(ptr, slot)` |
+
+#### What ops STILL owns (algorithm, not layout):
+
+- **Recursive descent**: which child to visit, when to narrow NK
+- **Split decisions**: key mismatch → ops calls `BO::build_remainder` + `BO::make_bitmask` + `BO::wrap_in_chain`
+- **Coalesce decisions**: desc ≤ COMPACT_MAX → ops calls `BO::chain_for_each_child`, collects entries, builds leaf
+- **Collapse after erase**: ops gets `chain_remove_result{.nc=1}`, calls `BO::chain_collapse_info()`, then decides to `prepend_skip_` or `wrap_in_chain`
+- **Descriptor bookkeeping**: when to increment, recompute, cap at COALESCE_CAP
+
+### Example: erase chain path (before → after)
+
+**BEFORE** (impl, ~100 lines of BM layout math):
+```cpp
+erase_result_t erase_skip_chain_(...) {
+    // Walk skip bytes — raw embed access
+    for (uint8_t e = 0; e < sc; ++e) {
+        uint64_t* embed = node + 1 + e * 6;                    // LAYOUT
+        uint8_t actual = reinterpret_cast<const bitmap256*>(    // LAYOUT
+            embed)->single_bit_index();                          // LAYOUT
+        ...
+    }
+    // Final bitmap lookup — raw offset calc
+    size_t final_offset = 1 + sc * 6;                          // LAYOUT
+    const bitmap256& fbm = *reinterpret_cast<...>(              // LAYOUT
+        node + final_offset);                                    // LAYOUT
+    uint64_t* real_ch = node + final_offset + 5;                // LAYOUT
+
+    // Remove child — 60 lines of raw realloc/shrink/embed fixup
+    size_t needed = final_offset + 5 + nc + desc_u64(nc);      // LAYOUT
+    if (should_shrink_u64(...)) {                               // LAYOUT
+        // alloc new, copy header + embeds, fix embed ptrs...   // LAYOUT ×20
+    } else {
+        // in-place removal, save desc, shift arrays...          // LAYOUT ×10
+    }
+
+    // Collapse — 28 lines extracting sole child + skip bytes
+    if (nc == 1) {
+        for (uint8_t i = 0; i < sc; ++i) {
+            uint64_t* eb = node + 1 + i * 6;                   // LAYOUT
+            all_bytes[i] = reinterpret_cast<...>(eb)->...;      // LAYOUT
+        }
+    }
+}
+```
+
+**AFTER** (ops, ~40 lines, zero layout knowledge):
+```cpp
+template<typename NK>
+static erase_result_t erase_bitmask_(...) {
+    // Walk skip bytes
+    for (uint8_t e = 0; e < sc; ++e) {
+        uint8_t actual = BO::skip_byte(node, e);
+        uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        if (expected != actual) return {tag_bitmask(node), false, 0};
+        ik = static_cast<NK>(ik << 8);
+        bits -= 8;
+    }
+
+    // Final bitmap lookup
+    auto lk = BO::chain_lookup(node, sc, top_byte(ik));
+    if (!lk.found) return {tag_bitmask(node), false, 0};
+
+    // Recurse into child (narrow NK if crossing boundary)
+    auto cr = erase_node_<NK_or_NNK>(lk.child, ...);
+    if (!cr.erased) return {tag_bitmask(node), false, 0};
+
+    if (cr.tagged_ptr) {
+        // Child survived — update
+        if (cr.tagged_ptr != lk.child)
+            BO::chain_set_child(node, sc, lk.slot, cr.tagged_ptr);
+        BO::chain_desc_array(node, sc)[lk.slot] = cr.subtree_entries;
+        // desc bookkeeping stays in ops (algorithm, not layout)
+        ...
+        return ...;
+    }
+
+    // Child erased — BM handles the removal mechanics
+    auto rr = BO::chain_remove_child(node, hdr, sc, lk.slot, ti, alloc);
+    if (rr.nc == 0) return {0, true, 0};
+
+    if (rr.nc == 1) {
+        // Ops decides how to collapse, BM provides the info
+        auto ci = BO::chain_collapse_info(rr.node, sc);
+        size_t node_au64 = get_header(rr.node)->alloc_u64();
+        if (ci.sole_child & LEAF_BIT) {
+            auto* leaf = untag_leaf_mut(ci.sole_child);
+            leaf = prepend_skip_(leaf, ci.total_skip, ci.all_skip, alloc);
+            dealloc_node(alloc, rr.node, node_au64);
+            return {tag_leaf(leaf), true, ci.sole_ent};
+        }
+        auto* cn = bm_to_node(ci.sole_child);
+        dealloc_node(alloc, rr.node, node_au64);
+        return {BO::wrap_in_chain(cn, ci.all_skip, ci.total_skip, alloc),
+                true, ci.sole_ent};
+    }
+
+    // Multi-child — desc bookkeeping + coalesce check (ops algorithm)
+    ...
+}
+```
+
+**~60% less code in ops, zero BM layout leakage.**
+
+### Example: iteration bitmask descent (before → after)
+
+**BEFORE**:
+```cpp
+const auto* bm = reinterpret_cast<const uint64_t*>(ptr);
+const auto& bitmap = *reinterpret_cast<const bitmap256*>(bm);
+uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
+if (bitmap.has_bit(byte)) {
+    int slot = bitmap.find_slot<slot_mode::UNFILTERED>(byte);
+    auto r = iter_next_node_(bm[BITMAP256_U64 + 1 + slot], ...);
+```
+
+**AFTER**:
+```cpp
+const auto& bitmap = BO::bitmap_ref(ptr);
+uint8_t byte = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+if (bitmap.has_bit(byte)) {
+    int slot = bitmap.find_slot<slot_mode::UNFILTERED>(byte);
+    auto r = iter_next_node_<NK>(BO::child_at(ptr, slot), ...);
+```
+
+Same number of lines, but no BITMAP256_U64 constant or raw pointer casts.
+
+### Updated phases and sizes
+
+See **Implementation phases** and **Estimated sizes** sections below —
+updated to reflect BM expansion.
 
 ---
 
@@ -728,7 +1013,7 @@ Low priority — the current CO/BM interfaces are already clean.
 |------|---------|-------|
 | kntrie.hpp | 227 | ~230 (unchanged) |
 | kntrie_impl.hpp | 1942 | ~200 |
-| kntrie_ops.hpp | (new) | ~1400 |
+| kntrie_ops.hpp | (new) | ~1100 |
+| kntrie_bitmask.hpp | 816 | ~1060 (+240 from moved functions) |
 | kntrie_compact.hpp | (unchanged) | (unchanged) |
-| kntrie_bitmask.hpp | (unchanged) | (unchanged) |
 | kntrie_support.hpp | 307 | ~330 (iter_result_t, next_narrow_t) |
