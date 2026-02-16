@@ -104,9 +104,7 @@ private:
     const VALUE* find_node_(uint64_t ptr, IK ik) const noexcept {
         const uint64_t* node = reinterpret_cast<const uint64_t*>(ptr ^ LEAF_BIT);
         node_header hdr = *get_header(node);
-        return BO::bitmap_find(node, hdr,
-            static_cast<uint8_t>(ik >> (IK_BITS - 8)),
-            1 + (hdr.skip() > 0));
+        return find_leaf_<8>(node, hdr, ik, 0, nullptr);
     }
 
     // ==================================================================
