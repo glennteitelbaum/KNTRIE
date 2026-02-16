@@ -23,8 +23,8 @@ transcript before doing anything.
 | kntrie_support.hpp | 337 | node_header, tagged ptrs, bitmap256 layout constants, next_narrow_t |
 | kntrie_compact.hpp | 612 | CO<NK>: compact leaf ops |
 | kntrie_bitmask.hpp | 1092 | BM: bitmask/chain ops (add/remove/build/wrap/collapse) |
-| kntrie_ops.hpp | 93 | Ops<NK>: find (will grow with insert/erase/iter) |
-| kntrie_impl.hpp | 1572 | Insert, erase, iter, build (shrinking) |
+| kntrie_ops.hpp | 206 | Ops<NK>: find + desc helpers + skip helpers + subtree dealloc |
+| kntrie_impl.hpp | 1456 | Insert, erase, iter, build (shrinking) |
 | kntrie.hpp | 240 | Public API, KEY→UK, iterators |
 
 ---
@@ -152,28 +152,18 @@ Compile + test + ASAN.
 
 ### 2C: Move NK-independent helpers to ops
 
-- [ ] 2C.1 Move descriptor helpers to ops (add `ALLOC&` where needed):
-      - `tagged_count_` (line 1266)
-      - `sum_children_desc_` (line 1274)
-      - `set_desc_capped_` (line 1290)
-      - `inc_descendants_` (line 1296)
-      - `dec_or_recompute_desc_` (line 1303)
-      - `sum_tagged_array_` (line 1318)
-
-- [ ] 2C.2 Move skip/node helpers to ops:
-      - `prepend_skip_` (line 1475) — add ALLOC& param
-      - `remove_skip_` (line 1512) — add ALLOC& param
-
-- [ ] 2C.3 Move destroy/cleanup to ops:
-      - `remove_node_` (line 1868) — add ALLOC& param
-      - `destroy_leaf_` (line 1893) — add ALLOC& param
-      - `dealloc_bitmask_subtree_` (line 1416) — add ALLOC& param
-
-- [ ] 2C.4 Move `iter_result_t` to kntrie_support.hpp, template on `<IK, VALUE>`
-
-- [ ] 2C.5 Update all call sites in impl to use `Ops::xxx(args..., alloc_)`
-
-- [ ] 2C.6 Update `remove_all_` and destructor to call `Ops::remove_node_`
+- [x] 2C.1 Move descriptor helpers to ops — DONE
+      - sum_children_desc_, set_desc_capped_, inc_descendants_, dec_or_recompute_desc_
+      - tagged_count and sum_tagged_array were already in support.hpp
+- [x] 2C.2 Move skip/node helpers to ops — DONE
+      - prepend_skip_(+alloc), remove_skip_(+alloc), dealloc_bitmask_subtree_(+alloc)
+- [~] 2C.3 Move destroy/cleanup to ops — DEFERRED
+      - remove_node_ and destroy_leaf_ have suffix_type dispatch (needs KEY_BITS)
+      - Will move naturally when insert/erase are NK-templated (Phase 3+)
+- [~] 2C.4 Move iter_result_t — DEFERRED (uses KEY type, minor)
+- [x] 2C.5 Update all call sites in impl — DONE
+      - All helpers now called as Ops::xxx(args..., alloc_)
+- [~] 2C.6 Update remove_all_/destructor — DEFERRED (depends on remove_node_ staying in impl)
 
 **⏸ STOP**: Present zip. Wait for confirmation. Compile + test + ASAN.
 
@@ -375,3 +365,4 @@ ALL is_leaf() / set_bitmask() calls replaced by tagged ptr checks.
 | 2026-02-16 | 1.5 | 1.5.1-1.5.8 | BM read accessors + chain methods. Replaced ~30 raw layout accesses in impl. Tests pass + ASAN |
 | 2026-02-16 | 2A | 2A.1-2A.5 | add_child_at_/remove_child_at_/fix_embeds_ cores. chain_add/remove_child. Deleted ~130 lines from impl |
 | 2026-02-16 | 2B | 2B.1-2B.4 | build_remainder, wrap_in_chain, collapse_info moved to BM. Impl -129 lines |
+| 2026-02-16 | 2C | 2C.1-2C.5 | Desc helpers, skip helpers, dealloc_bitmask_subtree_ moved to Ops. Impl -116 lines. Deferred: remove_node_/destroy_leaf_ (NK-dependent) |
