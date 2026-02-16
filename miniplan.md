@@ -32,24 +32,22 @@ transcript before doing anything.
 
 **Goal**: New file with find only. Zero behavior change.
 
-- [ ] 1.1 Create `kntrie_ops.hpp` with include guard, includes
-      ```
-      #include "kntrie_bitmask.hpp"
-      #include "kntrie_compact.hpp"
-      ```
-- [ ] 1.2 Define `template<typename NK, typename VALUE, typename ALLOC> struct kntrie_ops`
+- [x] 1.1 Create `kntrie_ops.hpp` with include guard, includes — DONE
+- [x] 1.2 Define `template<typename NK, typename VALUE, typename ALLOC> struct kntrie_ops` — DONE
       with type aliases: BO, VT, VST, CO, NK_BITS, NNK, Narrow
-- [ ] 1.3 Move `find_node_<BITS>` (two overloads, impl lines 20-50) into ops
-      - Remove `template<typename NK>` from method (NK is struct param)
-      - Keep `template<int BITS>` + requires clauses
-- [ ] 1.4 Move `find_leaf_<BITS>` (two overloads, impl lines 54-85) into ops
-      - Same template cleanup
-- [ ] 1.5 Update `kntrie_impl.hpp`:
-      - Add `#include "kntrie_ops.hpp"`
-      - Add `using Ops = kntrie_ops<NK0, VALUE, ALLOC>;` (NK0 = initial key width)
-      - Change `find_value` to call `Ops::template find_node_<KEY_BITS>(...)`
-      - Remove find_ops struct from impl
-- [ ] 1.6 Verify `kntrie.hpp` include chain works (it includes impl which includes ops)
+- [x] 1.3 Move `find_node_<BITS>` (two overloads) into ops — DONE
+      - Removed `template<typename NK>`, NK is struct param
+      - Narrowing calls `Narrow::template find_node_<BITS-8>` instead of `find_node_<BITS-8, NNK>`
+- [x] 1.4 Move `find_leaf_<BITS>` (two overloads) into ops — DONE
+      - BITS>8 version uses `CO::find` (struct-level CO = compact_ops<NK, V, A>)
+      - BITS==8 version uses `BO::bitmap_find`
+- [x] 1.5 Update `kntrie_impl.hpp`: — DONE
+      - Changed include to `#include "kntrie_ops.hpp"` (replaces compact+bitmask includes)
+      - Added `using NK0 = ...` and `using Ops = kntrie_ops<NK0, VALUE, ALLOC>` as class-level aliases
+      - Changed `find_value` to `Ops::template find_node_<KEY_BITS>(...)`
+      - Removed entire `find_ops` struct (~77 lines)
+      - Also added `next_narrow_t<NK>` to kntrie_support.hpp
+- [x] 1.6 Verify include chain: kntrie.hpp → impl → ops → bitmask + compact — DONE
 
 **⏸ STOP**: Present zip of all headers. Wait for confirmation.
 Compile: `g++ -std=c++23 -O2 -march=x86-64-v3 -fsanitize=address`
@@ -378,4 +376,4 @@ ALL is_leaf() / set_bitmask() calls replaced by tagged ptr checks.
 
 | Date | Phase | Step | Notes |
 |------|-------|------|-------|
-| | | | |
+| 2026-02-16 | 1 | 1.1-1.6 | Created kntrie_ops.hpp, moved find_ops, added next_narrow_t to support |

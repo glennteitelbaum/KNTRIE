@@ -28,6 +28,14 @@ inline constexpr size_t desc_u64(size_t n) noexcept { return (n + 3) / 4; }
 static constexpr uint64_t LEAF_BIT = uint64_t(1) << 63;
 
 // ==========================================================================
+// NK narrowing: u64 → u32 → u16 → u8
+// ==========================================================================
+
+template<typename NK>
+using next_narrow_t = std::conditional_t<sizeof(NK) == 8, uint32_t,
+                      std::conditional_t<sizeof(NK) == 4, uint16_t, uint8_t>>;
+
+// ==========================================================================
 // Allocation size classes
 //
 // Up to 8 u64s: exact
