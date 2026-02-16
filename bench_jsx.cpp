@@ -181,7 +181,7 @@ static void bench_all(size_t target_n, const std::string& pattern,
             k_ins = std::min(k_ins, now_ms() - t0);
 
             { uint64_t is = 0; double ti = now_ms();
-              for (auto it = trie.begin(); it != trie.end(); ++it) { auto [k,v] = *it; is += v; }
+              for (const auto& [k,v] : trie) is += v;
               k_iter = std::min(k_iter, now_ms() - ti); do_not_optimize(is); }
 
             uint64_t cs = 0;
