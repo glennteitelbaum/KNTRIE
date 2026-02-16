@@ -6,7 +6,7 @@ A KTRIE for Integral keys
 
 
 
-* [Concepts](./concpts.md)
+* [Concepts](./concepts.md)
 
 
 
