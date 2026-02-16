@@ -643,14 +643,11 @@ struct kntrie_ops {
     // ==================================================================
     // Erase — template<BITS>, NK from struct
     //
-    // CoalesceFn: callable(uint64_t* node, node_header* hdr, int bits,
-    //              uint16_t total) → erase_result_t
-    //   Stays in impl (walks mixed-depth subtrees, runtime dispatch).
+    // Coalesce handled inline via do_coalesce_<BITS>.
     // ==================================================================
 
-    template<int BITS, typename CoalesceFn> requires (BITS >= 8)
-    static erase_result_t erase_node_(uint64_t ptr, NK ik,
-                                       CoalesceFn&& coalesce, ALLOC& alloc) {
+    template<int BITS> requires (BITS >= 8)
+    static erase_result_t erase_node_(uint64_t ptr, NK ik, ALLOC& alloc) {
         if (ptr == SENTINEL_TAGGED) return {ptr, false, 0};
 
         if (ptr & LEAF_BIT) {
@@ -661,7 +658,7 @@ struct kntrie_ops {
             if (skip) [[unlikely]] {
                 const uint8_t* actual = hdr->prefix_bytes();
                 return erase_leaf_skip_<BITS>(
-                    node, hdr, ik, actual, skip, 0, coalesce, alloc);
+                    node, hdr, ik, actual, skip, 0, alloc);
             }
 
             return leaf_erase_(node, hdr, ik, alloc);
@@ -673,18 +670,18 @@ struct kntrie_ops {
 
         if (sc > 0)
             return erase_chain_skip_<BITS>(
-                node, hdr, sc, ik, 0, coalesce, alloc);
+                node, hdr, sc, ik, 0, alloc);
 
         return erase_final_bitmask_<BITS>(
-            node, hdr, 0, ik, coalesce, alloc);
+            node, hdr, 0, ik, alloc);
     }
 
     // --- Leaf skip prefix: recursive byte-at-a-time with narrowing ---
-    template<int BITS, typename CoalesceFn> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static erase_result_t erase_leaf_skip_(
             uint64_t* node, node_header* hdr,
             NK ik, const uint8_t* actual, uint8_t skip, uint8_t pos,
-            CoalesceFn&& coalesce, ALLOC& alloc) {
+            ALLOC& alloc) {
         if (pos >= skip)
             return leaf_erase_(node, hdr, ik, alloc);
 
@@ -698,10 +695,10 @@ struct kntrie_ops {
                 return Narrow::template erase_leaf_skip_<BITS - 8>(
                     node, hdr,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    actual, skip, pos + 1, coalesce, alloc);
+                    actual, skip, pos + 1, alloc);
             } else {
                 return erase_leaf_skip_<BITS - 8>(
-                    node, hdr, shifted, actual, skip, pos + 1, coalesce, alloc);
+                    node, hdr, shifted, actual, skip, pos + 1, alloc);
             }
         }
         __builtin_unreachable();
@@ -718,14 +715,14 @@ struct kntrie_ops {
     }
 
     // --- Skip chain: recursive embed walk with narrowing ---
-    template<int BITS, typename CoalesceFn> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static erase_result_t erase_chain_skip_(
             uint64_t* node, node_header* hdr,
             uint8_t sc, NK ik, uint8_t pos,
-            CoalesceFn&& coalesce, ALLOC& alloc) {
+            ALLOC& alloc) {
         if (pos >= sc)
             return erase_final_bitmask_<BITS>(
-                node, hdr, sc, ik, coalesce, alloc);
+                node, hdr, sc, ik, alloc);
 
         uint8_t actual_byte = BO::skip_byte(node, pos);
         uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
@@ -739,23 +736,21 @@ struct kntrie_ops {
                 return Narrow::template erase_chain_skip_<BITS - 8>(
                     node, hdr, sc,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    pos + 1, coalesce, alloc);
+                    pos + 1, alloc);
             } else {
                 return erase_chain_skip_<BITS - 8>(
-                    node, hdr, sc, shifted, pos + 1, coalesce, alloc);
+                    node, hdr, sc, shifted, pos + 1, alloc);
             }
         }
         __builtin_unreachable();
     }
 
     // --- Final bitmask: lookup + recurse + coalesce check ---
-    template<int BITS, typename CoalesceFn> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static erase_result_t erase_final_bitmask_(
             uint64_t* node, node_header* hdr,
-            uint8_t sc, NK ik,
-            CoalesceFn&& coalesce, ALLOC& alloc) {
+            uint8_t sc, NK ik, ALLOC& alloc) {
         uint8_t ti = static_cast<uint8_t>(ik >> (NK_BITS - 8));
-        constexpr int orig_bits = BITS;
 
         typename BO::child_lookup cl;
         if (sc > 0)
@@ -773,10 +768,10 @@ struct kntrie_ops {
                 cr = Narrow::template erase_node_<BITS - 8>(
                     cl.child,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    coalesce, alloc);
+                    alloc);
             } else {
                 cr = erase_node_<BITS - 8>(
-                    cl.child, shifted, coalesce, alloc);
+                    cl.child, shifted, alloc);
             }
         } else {
             __builtin_unreachable();
@@ -811,7 +806,7 @@ struct kntrie_ops {
                 hdr->set_descendants(d);
             }
             if (d <= COMPACT_MAX)
-                return coalesce(node, hdr, orig_bits, d);
+                return do_coalesce_<BITS>(node, hdr, alloc);
             return {tag_bitmask(node), true, d};
         }
 
@@ -850,8 +845,178 @@ struct kntrie_ops {
         // Multi-child: decrement descendants, check coalesce
         uint16_t desc = dec_or_recompute_desc_(nn, sc);
         if (desc <= COMPACT_MAX)
-            return coalesce(nn, get_header(nn), orig_bits, desc);
+            return do_coalesce_<BITS>(nn, get_header(nn), alloc);
         return {tag_bitmask(nn), true, desc};
+    }
+
+    // ==================================================================
+    // Collect entries — recursive walk with narrowing
+    //
+    // Collects all (bit-63-aligned key, value) pairs from subtree.
+    // prefix/prefix_bits accumulate path from root of collection.
+    // ==================================================================
+
+    template<int BITS> requires (BITS >= 8)
+    static void collect_entries_(uint64_t tagged, uint64_t prefix, int prefix_bits,
+                                  uint64_t* keys, VST* vals, size_t& wi) {
+        if (tagged & LEAF_BIT) {
+            const uint64_t* node = untag_leaf(tagged);
+            auto* hdr = get_header(node);
+
+            uint8_t skip = hdr->skip();
+            if (skip) {
+                const uint8_t* actual = hdr->prefix_bytes();
+                collect_leaf_skip_<BITS>(node, hdr, prefix, prefix_bits,
+                                          actual, skip, 0, keys, vals, wi);
+            } else {
+                leaf_for_each_aligned_(node, hdr, [&](uint64_t suf, VST v) {
+                    keys[wi] = prefix | (suf >> prefix_bits);
+                    vals[wi] = v;
+                    wi++;
+                });
+            }
+            return;
+        }
+
+        const uint64_t* node = bm_to_node_const(tagged);
+        auto* hdr = get_header(node);
+        uint8_t sc = hdr->skip();
+
+        if (sc > 0)
+            collect_bm_skip_<BITS>(node, sc, prefix, prefix_bits, 0, keys, vals, wi);
+        else
+            collect_bm_children_<BITS>(node, 0, prefix, prefix_bits, keys, vals, wi);
+    }
+
+    // --- Leaf skip: accumulate prefix bytes, narrow ---
+    template<int BITS> requires (BITS >= 8)
+    static void collect_leaf_skip_(const uint64_t* node, const node_header* hdr,
+                                    uint64_t prefix, int prefix_bits,
+                                    const uint8_t* actual, uint8_t skip, uint8_t pos,
+                                    uint64_t* keys, VST* vals, size_t& wi) {
+        if (pos >= skip) {
+            leaf_for_each_aligned_(node, hdr, [&](uint64_t suf, VST v) {
+                keys[wi] = prefix | (suf >> prefix_bits);
+                vals[wi] = v;
+                wi++;
+            });
+            return;
+        }
+
+        uint64_t new_prefix = prefix | (uint64_t(actual[pos]) << (56 - prefix_bits));
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                Narrow::template collect_leaf_skip_<BITS - 8>(
+                    node, hdr, new_prefix, prefix_bits + 8,
+                    actual, skip, pos + 1, keys, vals, wi);
+            else
+                collect_leaf_skip_<BITS - 8>(
+                    node, hdr, new_prefix, prefix_bits + 8,
+                    actual, skip, pos + 1, keys, vals, wi);
+        }
+    }
+
+    // --- BM skip: accumulate embed bytes, narrow ---
+    template<int BITS> requires (BITS >= 8)
+    static void collect_bm_skip_(const uint64_t* node, uint8_t sc,
+                                   uint64_t prefix, int prefix_bits, uint8_t pos,
+                                   uint64_t* keys, VST* vals, size_t& wi) {
+        if (pos >= sc) {
+            collect_bm_children_<BITS>(node, sc, prefix, prefix_bits, keys, vals, wi);
+            return;
+        }
+
+        uint8_t byte = BO::skip_byte(node, pos);
+        uint64_t new_prefix = prefix | (uint64_t(byte) << (56 - prefix_bits));
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                Narrow::template collect_bm_skip_<BITS - 8>(
+                    node, sc, new_prefix, prefix_bits + 8,
+                    pos + 1, keys, vals, wi);
+            else
+                collect_bm_skip_<BITS - 8>(
+                    node, sc, new_prefix, prefix_bits + 8,
+                    pos + 1, keys, vals, wi);
+        }
+    }
+
+    // --- BM children: iterate children, recurse with narrowing ---
+    template<int BITS> requires (BITS >= 8)
+    static void collect_bm_children_(const uint64_t* node, uint8_t sc,
+                                      uint64_t prefix, int prefix_bits,
+                                      uint64_t* keys, VST* vals, size_t& wi) {
+        const bitmap256& fbm = BO::chain_bitmap(node, sc);
+        const uint64_t* rch = BO::chain_children(node, sc);
+        fbm.for_each_set([&](uint8_t idx, int slot) {
+            uint64_t child_prefix = prefix | (uint64_t(idx) << (56 - prefix_bits));
+            if constexpr (BITS > 8) {
+                if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                    Narrow::template collect_entries_<BITS - 8>(
+                        rch[slot], child_prefix, prefix_bits + 8, keys, vals, wi);
+                else
+                    collect_entries_<BITS - 8>(
+                        rch[slot], child_prefix, prefix_bits + 8, keys, vals, wi);
+            }
+        });
+    }
+
+    // ==================================================================
+    // do_coalesce_ — collect entries + build leaf at correct NK depth
+    //
+    // BITS: compile-time bits at the bitmask being coalesced.
+    // ==================================================================
+
+    template<int BITS> requires (BITS >= 8)
+    static erase_result_t do_coalesce_(uint64_t* node, node_header* hdr,
+                                        ALLOC& alloc) {
+        uint8_t sc = hdr->skip();
+        uint16_t total = hdr->descendants();
+        uint64_t tagged = tag_bitmask(node);
+
+        auto wk = std::make_unique<uint64_t[]>(total);
+        auto wv = std::make_unique<VST[]>(total);
+        size_t wi = 0;
+        collect_entries_<BITS>(tagged, 0, 0, wk.get(), wv.get(), wi);
+
+        // Strip skip bytes: shift left so suffixes are bit-63-aligned
+        // at the (BITS - sc*8) level
+        if (sc > 0) {
+            unsigned shift = sc * 8;
+            for (size_t i = 0; i < total; ++i)
+                wk[i] <<= shift;
+        }
+
+        // Build leaf at correct NK — narrow through skip bytes
+        uint64_t* leaf = coalesce_build_skip_<BITS>(
+            sc, 0, wk.get(), wv.get(), total, alloc);
+
+        if (sc > 0) {
+            uint8_t sb[6];
+            BO::skip_bytes(node, sc, sb);
+            leaf = prepend_skip_(leaf, sc, sb, alloc);
+        }
+
+        dealloc_bitmask_subtree_(tagged, alloc);
+        return {tag_leaf(leaf), true, COALESCE_CAP};
+    }
+
+    // --- Narrow through skip bytes to find correct NK for build_leaf_ ---
+    template<int BITS> requires (BITS >= 8)
+    static uint64_t* coalesce_build_skip_(uint8_t sc, uint8_t pos,
+                                            uint64_t* wk, VST* wv,
+                                            size_t count, ALLOC& alloc) {
+        if (pos >= sc)
+            return build_leaf_(wk, wv, count, alloc);
+
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template coalesce_build_skip_<BITS - 8>(
+                    sc, pos + 1, wk, wv, count, alloc);
+            else
+                return coalesce_build_skip_<BITS - 8>(
+                    sc, pos + 1, wk, wv, count, alloc);
+        }
+        __builtin_unreachable();
     }
 
     // ==================================================================
