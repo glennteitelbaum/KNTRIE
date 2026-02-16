@@ -661,7 +661,7 @@ private:
             if constexpr (!INSERT) return {tag_bitmask(node), false, false};
             uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
             auto* leaf = make_single_leaf_(static_cast<IK>(ik << 8), value, bits - 8);
-            auto* nn = add_child_to_chain_(node, hdr, sc, ti, tag_leaf(leaf), 1);
+            auto* nn = BO::chain_add_child(node, hdr, sc, ti, tag_leaf(leaf), 1, alloc_);
             inc_descendants_(get_header(nn));
             return {tag_bitmask(nn), true, false};
         }
@@ -679,89 +679,6 @@ private:
             if (da[cl.slot] < COALESCE_CAP) da[cl.slot]++;
         }
         return {tag_bitmask(node), cr.inserted, false};
-    }
-
-    // ==================================================================
-    // add_child_to_chain_: add child to final bitmask of a skip chain
-    //
-    // In-place if allocation has room, realloc whole chain otherwise.
-    // Returns (possibly new) untagged node pointer.
-    // ==================================================================
-
-    uint64_t* add_child_to_chain_(uint64_t* node, node_header* hdr,
-                                    uint8_t sc, uint8_t idx,
-                                    uint64_t child_tagged,
-                                    uint16_t child_desc) {
-        unsigned oc = hdr->entries();
-        unsigned nc = oc + 1;
-        size_t final_offset = 1 + static_cast<size_t>(sc) * 6;
-        size_t needed = final_offset + 5 + nc + desc_u64(nc);
-
-        if (needed <= hdr->alloc_u64()) {
-            // In-place: insert into final bitmask
-            bitmap256& bm = *reinterpret_cast<bitmap256*>(node + final_offset);
-            uint64_t* children = node + final_offset + 5;
-            int isl = bm.find_slot<slot_mode::UNFILTERED>(idx);
-
-            // Save desc (children shift will overwrite it)
-            uint16_t saved_desc[256];
-            uint16_t* od = reinterpret_cast<uint16_t*>(children + oc);
-            std::memcpy(saved_desc, od, oc * sizeof(uint16_t));
-
-            // Insert child
-            std::memmove(children + isl + 1, children + isl, (oc - isl) * sizeof(uint64_t));
-            children[isl] = child_tagged;
-            bm.set_bit(idx);
-            hdr->set_entries(nc);
-
-            // Write desc with insertion
-            uint16_t* nd = reinterpret_cast<uint16_t*>(children + nc);
-            std::memcpy(nd, saved_desc, isl * sizeof(uint16_t));
-            nd[isl] = child_desc;
-            std::memcpy(nd + isl + 1, saved_desc + isl, (oc - isl) * sizeof(uint16_t));
-            return node;
-        }
-
-        // Realloc whole chain
-        size_t au64 = round_up_u64(needed);
-        uint64_t* nn = alloc_node(alloc_, au64);
-
-        // Copy everything up to and including final sentinel
-        size_t prefix_u64 = final_offset + 5;
-        std::memcpy(nn, node, prefix_u64 * 8);
-
-        auto* nh = get_header(nn);
-        nh->set_entries(nc);
-        nh->set_alloc_u64(au64);
-
-        // Fix embed internal pointers (they point into old allocation)
-        for (uint8_t e = 0; e < sc; ++e) {
-            uint64_t* embed_child = nn + 1 + e * 6 + 5;
-            uint64_t* next_bm = nn + 1 + (e + 1) * 6;
-            *embed_child = reinterpret_cast<uint64_t>(next_bm);
-        }
-
-        // Sentinel
-        nn[final_offset + 4] = SENTINEL_TAGGED;
-
-        // Copy-insert children
-        bitmap256& old_bm = *reinterpret_cast<bitmap256*>(node + final_offset);
-        bitmap256& new_bm = *reinterpret_cast<bitmap256*>(nn + final_offset);
-        int isl = old_bm.find_slot<slot_mode::UNFILTERED>(idx);
-        new_bm.set_bit(idx);
-        bitmap256::arr_copy_insert(
-            node + final_offset + 5, nn + final_offset + 5,
-            oc, isl, child_tagged);
-
-        // Copy-insert desc
-        const uint16_t* od = reinterpret_cast<const uint16_t*>(node + final_offset + 5 + oc);
-        uint16_t* nd = reinterpret_cast<uint16_t*>(nn + final_offset + 5 + nc);
-        std::memcpy(nd, od, isl * sizeof(uint16_t));
-        nd[isl] = child_desc;
-        std::memcpy(nd + isl + 1, od + isl, (oc - isl) * sizeof(uint16_t));
-
-        dealloc_node(alloc_, node, hdr->alloc_u64());
-        return nn;
     }
 
     // ==================================================================
@@ -1030,77 +947,17 @@ private:
         }
 
         // Child erased — remove from final bitmask
-        unsigned nc = hdr->entries() - 1;
+        node = BO::chain_remove_child(node, hdr, sc, cl.slot, ti, alloc_);
+        if (!node) return {0, true, 0};
 
-        if (nc == 0) {
-            dealloc_node(alloc_, node, hdr->alloc_u64());
-            return {0, true, 0};
-        }
-
-        // Local aliases for the removal path (deep layout code, moves to BM in Phase 2B)
-        size_t final_offset = BO::chain_hs_(sc);
-        int slot = cl.slot;
-        uint64_t* real_ch = BO::chain_children_mut(node, sc);
-
-        // Remove from final bitmask
-        // Check if we should shrink the allocation
-        size_t needed = final_offset + 5 + nc + desc_u64(nc);
-        if (should_shrink_u64(hdr->alloc_u64(), needed)) {
-            // Realloc: rebuild chain with fewer children
-            size_t au64 = round_up_u64(needed);
-            uint64_t* nn = alloc_node(alloc_, au64);
-
-            // Copy header + embeds + final bitmap + sentinel
-            size_t prefix_u64 = final_offset + 5;
-            std::memcpy(nn, node, prefix_u64 * 8);
-
-            auto* nh = get_header(nn);
-            nh->set_entries(nc);
-            nh->set_alloc_u64(au64);
-
-            // Fix embed internal pointers
-            for (uint8_t e = 0; e < sc; ++e) {
-                uint64_t* embed_child = nn + 1 + e * 6 + 5;
-                uint64_t* next_bm = nn + 1 + (e + 1) * 6;
-                *embed_child = reinterpret_cast<uint64_t>(next_bm);
-            }
-            nn[final_offset + 4] = SENTINEL_TAGGED;
-
-            // Copy children excluding erased slot
-            reinterpret_cast<bitmap256*>(nn + final_offset)->clear_bit(ti);
-            uint64_t* nch = nn + final_offset + 5;
-            bitmap256::arr_copy_remove(real_ch, nch, nc + 1, slot);
-
-            // Copy desc excluding erased slot
-            const uint16_t* od = reinterpret_cast<const uint16_t*>(real_ch + nc + 1);
-            uint16_t* nd = reinterpret_cast<uint16_t*>(nch + nc);
-            std::memcpy(nd, od, slot * sizeof(uint16_t));
-            std::memcpy(nd + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
-
-            dealloc_node(alloc_, node, hdr->alloc_u64());
-            node = nn;
-            hdr = nh;
-            real_ch = nch;
-        } else {
-            // In-place removal — save desc first (children shift overwrites it)
-            uint16_t saved_desc[256];
-            const uint16_t* od = reinterpret_cast<const uint16_t*>(real_ch + nc + 1);
-            std::memcpy(saved_desc, od, slot * sizeof(uint16_t));
-            std::memcpy(saved_desc + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
-
-            bitmap256& bm = *reinterpret_cast<bitmap256*>(node + final_offset);
-            bitmap256::arr_remove(bm, real_ch, nc + 1, slot, ti);
-            hdr->set_entries(nc);
-
-            uint16_t* nd = reinterpret_cast<uint16_t*>(real_ch + nc);
-            std::memcpy(nd, saved_desc, nc * sizeof(uint16_t));
-        }
+        hdr = get_header(node);
+        unsigned nc = hdr->entries();
 
         // Collapse when final drops to 1 child
         if (nc == 1) {
             const bitmap256& fbm_after = BO::chain_bitmap(node, sc);
             uint8_t sole_idx = fbm_after.first_set_bit();
-            uint64_t sole_child = real_ch[0];
+            uint64_t sole_child = BO::chain_children(node, sc)[0];
 
             // Collect all skip bytes + sole_idx
             uint8_t all_bytes[7];

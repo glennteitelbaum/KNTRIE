@@ -354,125 +354,48 @@ struct bitmask_ops {
     }
 
     // ==================================================================
-    // Bitmask node: add child (tagged)
+    // Bitmask node: add child (tagged) — standalone
     // ==================================================================
 
     static uint64_t* add_child(uint64_t* node, node_header* h,
                                 uint8_t idx, uint64_t child_tagged,
                                 uint16_t child_desc, ALLOC& alloc) {
-        constexpr size_t hs = 1;
-        bitmap256& bm = bm_mut_(node, hs);
-        unsigned oc = h->entries();
-        unsigned nc = oc + 1;
-        int isl = bm.find_slot<slot_mode::UNFILTERED>(idx);
-        size_t needed = bitmask_size_u64(nc, hs);
+        return add_child_at_(node, h, 1, idx, child_tagged, child_desc, alloc);
+    }
 
-        // In-place
-        if (needed <= h->alloc_u64()) {
-            // Save desc array (children shift will overwrite it)
-            uint16_t saved_desc[256];
-            const uint16_t* od = desc_array_(node, hs, oc);
-            std::memcpy(saved_desc, od, oc * sizeof(uint16_t));
+    // ==================================================================
+    // Skip chain: add child to final bitmask
+    // ==================================================================
 
-            // Insert child
-            uint64_t* rch = real_children_mut_(node, hs);
-            std::memmove(rch + isl + 1, rch + isl, (oc - isl) * sizeof(uint64_t));
-            rch[isl] = child_tagged;
-            bm.set_bit(idx);
-            h->set_entries(nc);
-
-            // Write desc with insertion
-            uint16_t* nd = desc_array_mut_(node, hs, nc);
-            std::memcpy(nd, saved_desc, isl * sizeof(uint16_t));
-            nd[isl] = child_desc;
-            std::memcpy(nd + isl + 1, saved_desc + isl, (oc - isl) * sizeof(uint16_t));
-            return node;
-        }
-
-        // Realloc
-        size_t au64 = round_up_u64(needed);
-        uint64_t* nn = alloc_node(alloc, au64);
-        auto* nh = get_header(nn);
-        *nh = *h;
-        nh->set_entries(nc);
-        nh->set_alloc_u64(au64);
-
-        bm_mut_(nn, hs) = bm;
-        bm_mut_(nn, hs).set_bit(idx);
-        children_mut_(nn, hs)[0] = SENTINEL_TAGGED;
-
-        bitmap256::arr_copy_insert(real_children_(node, hs), real_children_mut_(nn, hs),
-                                    oc, isl, child_tagged);
-
-        // Copy desc with insertion
-        const uint16_t* od = desc_array_(node, hs, oc);
-        uint16_t* nd = desc_array_mut_(nn, hs, nc);
-        std::memcpy(nd, od, isl * sizeof(uint16_t));
-        nd[isl] = child_desc;
-        std::memcpy(nd + isl + 1, od + isl, (oc - isl) * sizeof(uint16_t));
-
-        dealloc_node(alloc, node, h->alloc_u64());
+    static uint64_t* chain_add_child(uint64_t* node, node_header* h,
+                                      uint8_t sc, uint8_t idx,
+                                      uint64_t child_tagged,
+                                      uint16_t child_desc, ALLOC& alloc) {
+        uint64_t* nn = add_child_at_(node, h, chain_hs_(sc), idx,
+                                      child_tagged, child_desc, alloc);
+        if (nn != node && sc > 0) fix_embeds_(nn, sc);
         return nn;
     }
 
     // ==================================================================
-    // Bitmask node: remove child
+    // Bitmask node: remove child — standalone
     // Returns nullptr if node becomes empty.
     // ==================================================================
 
     static uint64_t* remove_child(uint64_t* node, node_header* h,
                                    int slot, uint8_t idx, ALLOC& alloc) {
-        unsigned oc = h->entries();
-        unsigned nc = oc - 1;
-        if (nc == 0) {
-            dealloc_node(alloc, node, h->alloc_u64());
-            return nullptr;
-        }
+        return remove_child_at_(node, h, 1, slot, idx, alloc);
+    }
 
-        constexpr size_t hs = 1;
-        size_t needed = bitmask_size_u64(nc, hs);
+    // ==================================================================
+    // Skip chain: remove child from final bitmask
+    // ==================================================================
 
-        // In-place
-        if (!should_shrink_u64(h->alloc_u64(), needed)) {
-            // Save desc excluding slot
-            uint16_t saved_desc[256];
-            const uint16_t* od = desc_array_(node, hs, oc);
-            std::memcpy(saved_desc, od, slot * sizeof(uint16_t));
-            std::memcpy(saved_desc + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
-
-            // Remove child
-            bitmap256::arr_remove(bm_mut_(node, hs), real_children_mut_(node, hs),
-                                  oc, slot, idx);
-            h->set_entries(nc);
-
-            // Write back desc at new position
-            uint16_t* nd = desc_array_mut_(node, hs, nc);
-            std::memcpy(nd, saved_desc, nc * sizeof(uint16_t));
-            return node;
-        }
-
-        // Realloc
-        size_t au64 = round_up_u64(needed);
-        uint64_t* nn = alloc_node(alloc, au64);
-        auto* nh = get_header(nn);
-        *nh = *h;
-        nh->set_entries(nc);
-        nh->set_alloc_u64(au64);
-
-        bm_mut_(nn, hs) = bm_(node, hs);
-        bm_mut_(nn, hs).clear_bit(idx);
-        children_mut_(nn, hs)[0] = SENTINEL_TAGGED;
-
-        bitmap256::arr_copy_remove(real_children_(node, hs), real_children_mut_(nn, hs),
-                                    oc, slot);
-
-        // Copy desc excluding slot
-        const uint16_t* od = desc_array_(node, hs, oc);
-        uint16_t* nd = desc_array_mut_(nn, hs, nc);
-        std::memcpy(nd, od, slot * sizeof(uint16_t));
-        std::memcpy(nd + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
-
-        dealloc_node(alloc, node, h->alloc_u64());
+    static uint64_t* chain_remove_child(uint64_t* node, node_header* h,
+                                         uint8_t sc, int slot, uint8_t idx,
+                                         ALLOC& alloc) {
+        uint64_t* nn = remove_child_at_(node, h, chain_hs_(sc), slot, idx, alloc);
+        if (nn && nn != node && sc > 0) fix_embeds_(nn, sc);
         return nn;
     }
 
@@ -867,6 +790,137 @@ struct bitmask_ops {
     }
 
 private:
+    // --- Fix embed internal pointers after reallocation ---
+    static void fix_embeds_(uint64_t* nn, uint8_t sc) noexcept {
+        for (uint8_t e = 0; e < sc; ++e) {
+            uint64_t* next_bm = nn + 1 + static_cast<size_t>(e + 1) * 6;
+            nn[1 + static_cast<size_t>(e) * 6 + 5] = reinterpret_cast<uint64_t>(next_bm);
+        }
+        // Fix sentinel of final bitmap
+        size_t fo = chain_hs_(sc);
+        nn[fo + BITMAP256_U64] = SENTINEL_TAGGED;
+    }
+
+    // --- Shared add child core: works for any header size ---
+    static uint64_t* add_child_at_(uint64_t* node, node_header* h, size_t hs,
+                                    uint8_t idx, uint64_t child_tagged,
+                                    uint16_t child_desc, ALLOC& alloc) {
+        bitmap256& bm = bm_mut_(node, hs);
+        unsigned oc = h->entries();
+        unsigned nc = oc + 1;
+        int isl = bm.find_slot<slot_mode::UNFILTERED>(idx);
+        size_t needed = bitmask_size_u64(nc, hs);
+
+        // In-place
+        if (needed <= h->alloc_u64()) {
+            // Save desc array (children shift will overwrite it)
+            uint16_t saved_desc[256];
+            const uint16_t* od = desc_array_(node, hs, oc);
+            std::memcpy(saved_desc, od, oc * sizeof(uint16_t));
+
+            // Insert child
+            uint64_t* rch = real_children_mut_(node, hs);
+            std::memmove(rch + isl + 1, rch + isl, (oc - isl) * sizeof(uint64_t));
+            rch[isl] = child_tagged;
+            bm.set_bit(idx);
+            h->set_entries(nc);
+
+            // Write desc with insertion
+            uint16_t* nd = desc_array_mut_(node, hs, nc);
+            std::memcpy(nd, saved_desc, isl * sizeof(uint16_t));
+            nd[isl] = child_desc;
+            std::memcpy(nd + isl + 1, saved_desc + isl, (oc - isl) * sizeof(uint16_t));
+            return node;
+        }
+
+        // Realloc
+        size_t au64 = round_up_u64(needed);
+        uint64_t* nn = alloc_node(alloc, au64);
+
+        // Copy header + embeds/bitmap + sentinel (everything before children)
+        size_t prefix_u64 = hs + BITMAP256_U64 + 1;
+        std::memcpy(nn, node, prefix_u64 * 8);
+
+        auto* nh = get_header(nn);
+        nh->set_entries(nc);
+        nh->set_alloc_u64(au64);
+
+        bm_mut_(nn, hs).set_bit(idx);
+        children_mut_(nn, hs)[0] = SENTINEL_TAGGED;
+
+        bitmap256::arr_copy_insert(real_children_(node, hs), real_children_mut_(nn, hs),
+                                    oc, isl, child_tagged);
+
+        // Copy desc with insertion
+        const uint16_t* od = desc_array_(node, hs, oc);
+        uint16_t* nd = desc_array_mut_(nn, hs, nc);
+        std::memcpy(nd, od, isl * sizeof(uint16_t));
+        nd[isl] = child_desc;
+        std::memcpy(nd + isl + 1, od + isl, (oc - isl) * sizeof(uint16_t));
+
+        dealloc_node(alloc, node, h->alloc_u64());
+        return nn;
+    }
+
+    // --- Shared remove child core: works for any header size ---
+    static uint64_t* remove_child_at_(uint64_t* node, node_header* h, size_t hs,
+                                       int slot, uint8_t idx, ALLOC& alloc) {
+        unsigned oc = h->entries();
+        unsigned nc = oc - 1;
+        if (nc == 0) {
+            dealloc_node(alloc, node, h->alloc_u64());
+            return nullptr;
+        }
+
+        size_t needed = bitmask_size_u64(nc, hs);
+
+        // In-place
+        if (!should_shrink_u64(h->alloc_u64(), needed)) {
+            // Save desc excluding slot
+            uint16_t saved_desc[256];
+            const uint16_t* od = desc_array_(node, hs, oc);
+            std::memcpy(saved_desc, od, slot * sizeof(uint16_t));
+            std::memcpy(saved_desc + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
+
+            // Remove child
+            bitmap256::arr_remove(bm_mut_(node, hs), real_children_mut_(node, hs),
+                                  oc, slot, idx);
+            h->set_entries(nc);
+
+            // Write back desc at new position
+            uint16_t* nd = desc_array_mut_(node, hs, nc);
+            std::memcpy(nd, saved_desc, nc * sizeof(uint16_t));
+            return node;
+        }
+
+        // Realloc
+        size_t au64 = round_up_u64(needed);
+        uint64_t* nn = alloc_node(alloc, au64);
+
+        // Copy header + embeds/bitmap + sentinel
+        size_t prefix_u64 = hs + BITMAP256_U64 + 1;
+        std::memcpy(nn, node, prefix_u64 * 8);
+
+        auto* nh = get_header(nn);
+        nh->set_entries(nc);
+        nh->set_alloc_u64(au64);
+
+        bm_mut_(nn, hs).clear_bit(idx);
+        children_mut_(nn, hs)[0] = SENTINEL_TAGGED;
+
+        bitmap256::arr_copy_remove(real_children_(node, hs), real_children_mut_(nn, hs),
+                                    oc, slot);
+
+        // Copy desc excluding slot
+        const uint16_t* od = desc_array_(node, hs, oc);
+        uint16_t* nd = desc_array_mut_(nn, hs, nc);
+        std::memcpy(nd, od, slot * sizeof(uint16_t));
+        std::memcpy(nd + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
+
+        dealloc_node(alloc, node, h->alloc_u64());
+        return nn;
+    }
+
     // --- Shared lookup core: works for any header size ---
     static child_lookup lookup_at_(const uint64_t* node, size_t hs, uint8_t idx) noexcept {
         const bitmap256& bm = bm_(node, hs);

@@ -22,9 +22,9 @@ transcript before doing anything.
 |------|-------|------|
 | kntrie_support.hpp | 314 | node_header, tagged ptrs, bitmap256 layout constants, next_narrow_t |
 | kntrie_compact.hpp | 612 | CO<NK>: compact leaf ops |
-| kntrie_bitmask.hpp | 922 | BM: bitmask node ops, bitmap leaf ops, chain accessors |
+| kntrie_bitmask.hpp | 976 | BM: bitmask node ops, bitmap leaf ops, chain accessors, add/remove cores |
 | kntrie_ops.hpp | 93 | Ops<NK>: find (will grow with insert/erase/iter) |
-| kntrie_impl.hpp | 1844 | Insert, erase, iter, build (shrinking) |
+| kntrie_impl.hpp | 1701 | Insert, erase, iter, build (shrinking) |
 | kntrie.hpp | 240 | Public API, KEY→UK, iterators |
 
 ---
@@ -115,23 +115,19 @@ Compile + test + ASAN.
 
 ### 2A: Refactor BM add/remove to shared core
 
-- [ ] 2A.1 Extract `add_child` core into private `add_child_at_(node, h, hs, ...)`
-      - Current `add_child` becomes `add_child_at_` with hs parameter
-      - Public `add_child(...)` wraps: `return add_child_at_(node, h, 1, ...)`
-
-- [ ] 2A.2 Extract `remove_child` core into private `remove_child_at_(node, h, hs, ...)`
-      - Current `remove_child` becomes `remove_child_at_` with hs parameter
-      - Public `remove_child(...)` wraps: `return remove_child_at_(node, h, 1, ...)`
-
-- [ ] 2A.3 Add chain wrappers:
-      - `chain_add_child(node, h, sc, ...)` → `add_child_at_` + `fix_embeds_`
-      - `chain_remove_child(node, h, sc, ...)` → `remove_child_at_` + `fix_embeds_`
-
-- [ ] 2A.4 Replace `add_child_to_chain_` in impl with `BO::chain_add_child` calls
-      - Delete `add_child_to_chain_` from impl (~75 lines)
-
-- [ ] 2A.5 Replace erase chain removal block in impl with `BO::chain_remove_child` calls
-      - Delete the ~61-line block in `erase_skip_chain_`
+- [x] 2A.1 Extract `add_child` core into private `add_child_at_(node, h, hs, ...)` — DONE
+      - Generalized hs param, prefix_u64 copy for realloc includes embeds
+- [x] 2A.2 Extract `remove_child` core into private `remove_child_at_(node, h, hs, ...)` — DONE
+      - Same generalization
+- [x] 2A.3 Add chain wrappers + fix_embeds_ — DONE
+      - `chain_add_child` → `add_child_at_` + `fix_embeds_` on realloc
+      - `chain_remove_child` → `remove_child_at_` + `fix_embeds_` on realloc
+      - `fix_embeds_` fixes embed internal pointers + final sentinel
+      - `chain_hs_` made public (needed by impl)
+- [x] 2A.4 Replace `add_child_to_chain_` with `BO::chain_add_child` — DONE
+      - Deleted ~80-line function from impl
+- [x] 2A.5 Replace erase chain removal block with `BO::chain_remove_child` — DONE
+      - Deleted ~50-line block, replaced with single call + nc check
 
 **⏸ STOP**: Present zip. Wait for confirmation. Compile + test + ASAN.
 
@@ -376,3 +372,4 @@ ALL is_leaf() / set_bitmask() calls replaced by tagged ptr checks.
 |------|-------|------|-------|
 | 2026-02-16 | 1 | 1.1-1.6 | Created kntrie_ops.hpp, moved find_ops, added next_narrow_t to support |
 | 2026-02-16 | 1.5 | 1.5.1-1.5.8 | BM read accessors + chain methods. Replaced ~30 raw layout accesses in impl. Tests pass + ASAN |
+| 2026-02-16 | 2A | 2A.1-2A.5 | add_child_at_/remove_child_at_/fix_embeds_ cores. chain_add/remove_child. Deleted ~130 lines from impl |
