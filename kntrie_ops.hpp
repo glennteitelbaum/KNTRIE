@@ -641,6 +641,220 @@ struct kntrie_ops {
     }
 
     // ==================================================================
+    // Erase — template<BITS>, NK from struct
+    //
+    // CoalesceFn: callable(uint64_t* node, node_header* hdr, int bits,
+    //              uint16_t total) → erase_result_t
+    //   Stays in impl (walks mixed-depth subtrees, runtime dispatch).
+    // ==================================================================
+
+    template<int BITS, typename CoalesceFn> requires (BITS >= 8)
+    static erase_result_t erase_node_(uint64_t ptr, NK ik,
+                                       CoalesceFn&& coalesce, ALLOC& alloc) {
+        if (ptr == SENTINEL_TAGGED) return {ptr, false, 0};
+
+        if (ptr & LEAF_BIT) {
+            uint64_t* node = untag_leaf_mut(ptr);
+            auto* hdr = get_header(node);
+
+            uint8_t skip = hdr->skip();
+            if (skip) [[unlikely]] {
+                const uint8_t* actual = hdr->prefix_bytes();
+                return erase_leaf_skip_<BITS>(
+                    node, hdr, ik, actual, skip, 0, coalesce, alloc);
+            }
+
+            return leaf_erase_(node, hdr, ik, alloc);
+        }
+
+        uint64_t* node = bm_to_node(ptr);
+        auto* hdr = get_header(node);
+        uint8_t sc = hdr->skip();
+
+        if (sc > 0)
+            return erase_chain_skip_<BITS>(
+                node, hdr, sc, ik, 0, coalesce, alloc);
+
+        return erase_final_bitmask_<BITS>(
+            node, hdr, 0, ik, coalesce, alloc);
+    }
+
+    // --- Leaf skip prefix: recursive byte-at-a-time with narrowing ---
+    template<int BITS, typename CoalesceFn> requires (BITS >= 8)
+    static erase_result_t erase_leaf_skip_(
+            uint64_t* node, node_header* hdr,
+            NK ik, const uint8_t* actual, uint8_t skip, uint8_t pos,
+            CoalesceFn&& coalesce, ALLOC& alloc) {
+        if (pos >= skip)
+            return leaf_erase_(node, hdr, ik, alloc);
+
+        uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        if (expected != actual[pos])
+            return {tag_leaf(node), false, 0};
+
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
+                return Narrow::template erase_leaf_skip_<BITS - 8>(
+                    node, hdr,
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    actual, skip, pos + 1, coalesce, alloc);
+            } else {
+                return erase_leaf_skip_<BITS - 8>(
+                    node, hdr, shifted, actual, skip, pos + 1, coalesce, alloc);
+            }
+        }
+        __builtin_unreachable();
+    }
+
+    // --- Leaf erase: compile-time NK dispatch ---
+    static erase_result_t leaf_erase_(uint64_t* node, node_header* hdr,
+                                       NK ik, ALLOC& alloc) {
+        if constexpr (sizeof(NK) == 1) {
+            return BO::bitmap_erase(node, static_cast<uint8_t>(ik), alloc);
+        } else {
+            return CO::erase(node, hdr, ik, alloc);
+        }
+    }
+
+    // --- Skip chain: recursive embed walk with narrowing ---
+    template<int BITS, typename CoalesceFn> requires (BITS >= 8)
+    static erase_result_t erase_chain_skip_(
+            uint64_t* node, node_header* hdr,
+            uint8_t sc, NK ik, uint8_t pos,
+            CoalesceFn&& coalesce, ALLOC& alloc) {
+        if (pos >= sc)
+            return erase_final_bitmask_<BITS>(
+                node, hdr, sc, ik, coalesce, alloc);
+
+        uint8_t actual_byte = BO::skip_byte(node, pos);
+        uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+
+        if (expected != actual_byte)
+            return {tag_bitmask(node), false, 0};
+
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
+                return Narrow::template erase_chain_skip_<BITS - 8>(
+                    node, hdr, sc,
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    pos + 1, coalesce, alloc);
+            } else {
+                return erase_chain_skip_<BITS - 8>(
+                    node, hdr, sc, shifted, pos + 1, coalesce, alloc);
+            }
+        }
+        __builtin_unreachable();
+    }
+
+    // --- Final bitmask: lookup + recurse + coalesce check ---
+    template<int BITS, typename CoalesceFn> requires (BITS >= 8)
+    static erase_result_t erase_final_bitmask_(
+            uint64_t* node, node_header* hdr,
+            uint8_t sc, NK ik,
+            CoalesceFn&& coalesce, ALLOC& alloc) {
+        uint8_t ti = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        constexpr int orig_bits = BITS;
+
+        typename BO::child_lookup cl;
+        if (sc > 0)
+            cl = BO::chain_lookup(node, sc, ti);
+        else
+            cl = BO::lookup(node, ti);
+
+        if (!cl.found) return {tag_bitmask(node), false, 0};
+
+        // Recurse into child
+        erase_result_t cr;
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
+                cr = Narrow::template erase_node_<BITS - 8>(
+                    cl.child,
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    coalesce, alloc);
+            } else {
+                cr = erase_node_<BITS - 8>(
+                    cl.child, shifted, coalesce, alloc);
+            }
+        } else {
+            __builtin_unreachable();
+        }
+
+        if (!cr.erased) return {tag_bitmask(node), false, 0};
+
+        if (cr.tagged_ptr) {
+            // Child survived
+            if (cr.tagged_ptr != cl.child) {
+                if (sc > 0)
+                    BO::chain_set_child(node, sc, cl.slot, cr.tagged_ptr);
+                else
+                    BO::set_child(node, cl.slot, cr.tagged_ptr);
+            }
+            uint16_t* da;
+            if (sc > 0)
+                da = BO::chain_desc_array_mut(node, sc, hdr->entries());
+            else
+                da = BO::child_desc_array(node);
+            da[cl.slot] = cr.subtree_entries;
+
+            if (cr.subtree_entries == COALESCE_CAP)
+                return {tag_bitmask(node), true, COALESCE_CAP};
+
+            uint16_t d = hdr->descendants();
+            if (d == COALESCE_CAP) {
+                d = sum_children_desc_(node, sc);
+                hdr->set_descendants(d);
+            } else {
+                --d;
+                hdr->set_descendants(d);
+            }
+            if (d <= COMPACT_MAX)
+                return coalesce(node, hdr, orig_bits, d);
+            return {tag_bitmask(node), true, d};
+        }
+
+        // Child fully erased — remove from bitmask
+        uint64_t* nn;
+        if (sc > 0)
+            nn = BO::chain_remove_child(node, hdr, sc, cl.slot, ti, alloc);
+        else
+            nn = BO::remove_child(node, hdr, cl.slot, ti, alloc);
+        if (!nn) return {0, true, 0};
+
+        hdr = get_header(nn);
+        unsigned nc = hdr->entries();
+
+        // Collapse when final bitmask drops to 1 child
+        if (nc == 1) {
+            typename BO::collapse_info ci;
+            if (sc > 0)
+                ci = BO::chain_collapse_info(nn, sc);
+            else
+                ci = BO::standalone_collapse_info(nn);
+            size_t nn_au64 = hdr->alloc_u64();
+
+            if (ci.sole_child & LEAF_BIT) {
+                uint64_t* leaf = untag_leaf_mut(ci.sole_child);
+                leaf = prepend_skip_(leaf, ci.total_skip, ci.bytes, alloc);
+                dealloc_node(alloc, nn, nn_au64);
+                return {tag_leaf(leaf), true, ci.sole_entries};
+            }
+            uint64_t* child_node = bm_to_node(ci.sole_child);
+            dealloc_node(alloc, nn, nn_au64);
+            return {BO::wrap_in_chain(child_node, ci.bytes, ci.total_skip, alloc),
+                    true, ci.sole_entries};
+        }
+
+        // Multi-child: decrement descendants, check coalesce
+        uint16_t desc = dec_or_recompute_desc_(nn, sc);
+        if (desc <= COMPACT_MAX)
+            return coalesce(nn, get_header(nn), orig_bits, desc);
+        return {tag_bitmask(nn), true, desc};
+    }
+
+    // ==================================================================
     // NK-independent helpers (shared across all NK specializations)
     // ==================================================================
 

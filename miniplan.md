@@ -23,8 +23,8 @@ transcript before doing anything.
 | kntrie_support.hpp | 337 | node_header, tagged ptrs, bitmap256 layout constants, next_narrow_t |
 | kntrie_compact.hpp | 612 | CO<NK>: compact leaf ops |
 | kntrie_bitmask.hpp | 1092 | BM: bitmask/chain ops (add/remove/build/wrap/collapse) |
-| kntrie_ops.hpp | 759 | Ops<NK>: find + insert + desc/skip/dealloc helpers + build/convert |
-| kntrie_impl.hpp | 983 | Erase, iter, build_leaf_from_arrays, leaf_for_each_u64 |
+| kntrie_ops.hpp | 973 | Ops<NK>: find + insert + erase + desc/skip/dealloc helpers + build |
+| kntrie_impl.hpp | 772 | Coalesce (runtime dispatch), iter, destroy, stats |
 | kntrie.hpp | 240 | Public API, KEY→UK, iterators |
 
 ---
@@ -226,35 +226,24 @@ Compile + test + ASAN.
 
 ### 4A: Move erase helpers
 
-- [ ] 4A.1 Move `build_leaf_from_arrays_` (impl:1436) → ops
-      - Template on NK, use `CO::make_leaf`
-
-- [ ] 4A.2 Move `collect_entries_tagged_` (impl:1363) → ops
-      - Template on NK, narrowing via `Narrow::collect_entries_tagged_`
-      - Use `BO::chain_for_each_child` instead of raw access
-
-- [ ] 4A.3 Move `do_coalesce_` (impl:1328) → ops
-      - Template on NK, calls collect_entries + build_leaf
-
-- [ ] 4A.4 Move `leaf_erase_` (impl:1223) → ops
-      - Replace suffix_type dispatch with `CO::erase`
+- [x] 4A.1-4 COMBINED with 4B: Full erase path moved to Ops in one pass.
+      - leaf_erase_: sizeof(NK)==1 → BO::bitmap_erase, else → CO::erase
+      - erase_node_<BITS, CoalesceFn>: recursive byte-at-a-time narrowing
+      - erase_leaf_skip_<BITS>: prefix consumption with narrowing
+      - erase_chain_skip_<BITS>: embed walk with narrowing
+      - erase_final_bitmask_<BITS>: lookup + recurse + coalesce check
+      - CoalesceFn callback: do_coalesce_ stays in impl (mixed-depth runtime dispatch)
+      - collect_entries_tagged_, build_leaf_from_arrays_, leaf_for_each_u64_ stay in impl
 
 **⏸ STOP**: Present zip. Wait for confirmation. Compile + test + ASAN.
 
 ### 4B: Move erase dispatch
 
-- [ ] 4B.1 Merge `erase_skip_chain_` into `erase_node_`
-      - Skip loop uses `BO::skip_byte`, `BO::chain_lookup`
-      - Child removal via `BO::chain_remove_child`
-      - Collapse via `BO::chain_collapse_info`
-
-- [ ] 4B.2 Move `erase_node_` (impl:964) → `Ops::erase_node_`
-      - IK param → NK param
-      - Add narrowing at boundary
-      - All leaf dispatch via CO, all BM ops via BO
-
-- [ ] 4B.3 Thin down erase in impl to ~8 lines:
-      - Convert IK → NK0, call `Ops::erase_node_`
+- [x] 4B.1-3 Done as part of 4A above.
+      - erase() thinned to 12 lines: IK→NK0, coalesce lambda, Ops::erase_node_
+      - Old erase_node_, erase_skip_chain_, leaf_erase_ deleted
+      - Also cleaned up do_coalesce_ to use BO::skip_bytes accessor
+      - impl: 983→772 (−211). ops: 759→973 (+214)
 
 **⏸ STOP**: Present zip. Wait for confirmation. Compile + test + ASAN.
 
@@ -366,3 +355,4 @@ ALL is_leaf() / set_bitmask() calls replaced by tagged ptr checks.
 | 2026-02-16 | 2C | 2C.1-2C.5 | Desc helpers, skip helpers, dealloc_bitmask_subtree_ moved to Ops. Impl -116 lines. Deferred: remove_node_/destroy_leaf_ (NK-dependent) |
 | 2026-02-16 | 3A | 3A.1-3A.5 | NK-dependent helpers added to Ops: make_single_leaf_, leaf_for_each_aligned_, build_leaf_, build_node_from_arrays_tagged_, build_bitmask_from_arrays_tagged_, convert_to_bitmask_tagged_. Narrowing at NK/2 boundaries. Deferred 3A.6-7 (runtime prefix consumption) |
 | 2026-02-16 | 3A+3B | 3A.6-7, 3B.1-5 | Full insert path moved to Ops with recursive byte-at-a-time narrowing. split_on_prefix_, split_skip_at_, insert_node_, leaf_insert_, insert_chain_skip_, insert_final_bitmask_ all in Ops. Old IK-based code deleted. impl 1456→983 (−473). ops 387→759 (+372) |
+| 2026-02-16 | 4A+4B | All | Full erase path in Ops: erase_node_<BITS,CoalesceFn>, leaf_erase_, erase_leaf_skip_, erase_chain_skip_, erase_final_bitmask_. CoalesceFn callback for runtime dispatch. impl 983→772 (−211). ops 759→973 (+214) |

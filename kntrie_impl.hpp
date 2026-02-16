@@ -108,7 +108,13 @@ public:
 
         if (root_ == SENTINEL_TAGGED) return false;
 
-        auto [new_tagged, erased, sub_ent] = erase_node_(root_, ik, KEY_BITS);
+        NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
+        auto coalesce = [this](uint64_t* node, node_header* hdr,
+                                int bits, uint16_t total) -> erase_result_t {
+            return do_coalesce_(node, hdr, bits, total);
+        };
+        auto [new_tagged, erased, sub_ent] =
+            Ops::template erase_node_<KEY_BITS>(root_, nk, coalesce, alloc_);
         if (!erased) return false;
 
         root_ = new_tagged ? new_tagged : SENTINEL_TAGGED;
@@ -521,220 +527,6 @@ private:
     }
 
     // ==================================================================
-    // ==================================================================
-    // erase_node (recursive, tagged)
-    //
-    // ptr: tagged pointer
-    // Returns: erase_result_t with tagged_ptr (0 if fully erased)
-    //          and subtree_entries for coalesce walk-up
-    // ==================================================================
-
-    erase_result_t erase_node_(uint64_t ptr, IK ik, int bits) {
-
-        // --- SENTINEL ---
-        if (ptr == SENTINEL_TAGGED) return {ptr, false, 0};
-
-        // --- LEAF ---
-        if (ptr & LEAF_BIT) {
-            uint64_t* node = untag_leaf_mut(ptr);
-            auto* hdr = get_header(node);
-
-            // Leaf skip check
-            uint8_t skip = hdr->skip();
-            if (skip) [[unlikely]] {
-                const uint8_t* actual = hdr->prefix_bytes();
-                for (uint8_t i = 0; i < skip; ++i) {
-                    uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-                    if (expected != actual[i]) return {ptr, false, 0};
-                    ik = static_cast<IK>(ik << 8);
-                    bits -= 8;
-                }
-            }
-
-            // leaf_erase_ returns tagged result with subtree_entries
-            return leaf_erase_(node, hdr, ik);
-        }
-
-        // --- BITMASK ---
-        uint64_t* node = bm_to_node(ptr);
-        auto* hdr = get_header(node);
-        uint8_t sc = hdr->skip();
-
-        if (sc > 0)
-            return erase_skip_chain_(node, hdr, sc, ik, bits);
-
-        // Standalone bitmask (skip=0)
-        uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        auto lk = BO::lookup(node, ti);
-        if (!lk.found) return {tag_bitmask(node), false, 0};
-
-        // Recurse into child
-        auto cr = erase_node_(lk.child, static_cast<IK>(ik << 8), bits - 8);
-        if (!cr.erased) return {tag_bitmask(node), false, 0};
-
-        if (cr.tagged_ptr) {
-            // Child survived
-            if (cr.tagged_ptr != lk.child)
-                BO::set_child(node, lk.slot, cr.tagged_ptr);
-            // Update desc for this slot
-            BO::child_desc_array(node)[lk.slot] = cr.subtree_entries;
-            // If child is still above COMPACT_MAX, so is parent — bail
-            if (cr.subtree_entries == COALESCE_CAP)
-                return {tag_bitmask(node), true, COALESCE_CAP};
-            // Child returned exact count — decrement if exact, recompute if capped
-            uint16_t d = hdr->descendants();
-            if (d == COALESCE_CAP) {
-                d = Ops::sum_children_desc_(node, 0);
-                hdr->set_descendants(d);
-            } else {
-                --d;
-                hdr->set_descendants(d);
-            }
-            if (d <= COMPACT_MAX)
-                return do_coalesce_(node, hdr, bits, d);
-            return {tag_bitmask(node), true, d};
-        }
-
-        // Child fully erased — remove from bitmask
-        auto* nn = BO::remove_child(node, hdr, lk.slot, ti, alloc_);
-        if (!nn) return {0, true, 0};
-
-        // Collapse: single-child bitmask
-        if (get_header(nn)->entries() == 1) {
-            auto ci = BO::standalone_collapse_info(nn);
-            size_t nn_au64 = get_header(nn)->alloc_u64();
-
-            if (ci.sole_child & LEAF_BIT) {
-                uint64_t* leaf = untag_leaf_mut(ci.sole_child);
-                leaf = Ops::prepend_skip_(leaf, ci.total_skip, ci.bytes, alloc_);
-                dealloc_node(alloc_, nn, nn_au64);
-                return {tag_leaf(leaf), true, ci.sole_entries};
-            }
-            uint64_t* child_node = bm_to_node(ci.sole_child);
-            dealloc_node(alloc_, nn, nn_au64);
-            return {BO::wrap_in_chain(child_node, ci.bytes, ci.total_skip, alloc_),
-                    true, ci.sole_entries};
-        }
-
-        // Multi-child: decrement descendants, check coalesce
-        uint16_t desc = Ops::dec_or_recompute_desc_(nn, 0);
-        if (desc <= COMPACT_MAX)
-            return do_coalesce_(nn, get_header(nn), bits, desc);
-        return {tag_bitmask(nn), true, desc};
-    }
-
-    // ==================================================================
-    // erase_skip_chain_: walk embedded bo<1> nodes, erase from final
-    //
-    // Uses stored descendants for O(1) coalesce check.
-    // ==================================================================
-
-    erase_result_t erase_skip_chain_(uint64_t* node, node_header* hdr,
-                                       uint8_t sc, IK ik, int bits) {
-        int orig_bits = bits;  // save for coalesce (includes skip)
-
-        for (uint8_t e = 0; e < sc; ++e) {
-            uint8_t actual = BO::skip_byte(node, e);
-            uint8_t expected = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-            if (expected != actual) return {tag_bitmask(node), false, 0};
-            ik = static_cast<IK>(ik << 8);
-            bits -= 8;
-        }
-
-        // Final bitmask
-        uint8_t ti = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-        auto cl = BO::chain_lookup(node, sc, ti);
-        if (!cl.found) return {tag_bitmask(node), false, 0};
-
-        uint64_t old_child = cl.child;
-
-        auto cr = erase_node_(old_child, static_cast<IK>(ik << 8), bits - 8);
-        if (!cr.erased) return {tag_bitmask(node), false, 0};
-
-        if (cr.tagged_ptr) {
-            // Child survived
-            if (cr.tagged_ptr != old_child)
-                BO::chain_set_child(node, sc, cl.slot, cr.tagged_ptr);
-            // Update desc for this slot
-            unsigned nc_cur = hdr->entries();
-            uint16_t* da = BO::chain_desc_array_mut(node, sc, nc_cur);
-            da[cl.slot] = cr.subtree_entries;
-            if (cr.subtree_entries == COALESCE_CAP)
-                return {tag_bitmask(node), true, COALESCE_CAP};
-            uint16_t d = hdr->descendants();
-            if (d == COALESCE_CAP) {
-                d = Ops::sum_children_desc_(node, sc);
-                hdr->set_descendants(d);
-            } else {
-                --d;
-                hdr->set_descendants(d);
-            }
-            if (d <= COMPACT_MAX)
-                return do_coalesce_(node, hdr, orig_bits, d);
-            return {tag_bitmask(node), true, d};
-        }
-
-        // Child erased — remove from final bitmask
-        node = BO::chain_remove_child(node, hdr, sc, cl.slot, ti, alloc_);
-        if (!node) return {0, true, 0};
-
-        hdr = get_header(node);
-        unsigned nc = hdr->entries();
-
-        // Collapse when final drops to 1 child
-        if (nc == 1) {
-            auto ci = BO::chain_collapse_info(node, sc);
-            size_t node_au64 = hdr->alloc_u64();
-
-            if (ci.sole_child & LEAF_BIT) {
-                uint64_t* leaf = untag_leaf_mut(ci.sole_child);
-                leaf = Ops::prepend_skip_(leaf, ci.total_skip, ci.bytes, alloc_);
-                dealloc_node(alloc_, node, node_au64);
-                return {tag_leaf(leaf), true, ci.sole_entries};
-            }
-
-            uint64_t* child_node = bm_to_node(ci.sole_child);
-            dealloc_node(alloc_, node, node_au64);
-            return {BO::wrap_in_chain(child_node, ci.bytes, ci.total_skip, alloc_),
-                    true, ci.sole_entries};
-        }
-
-        // Multi-child: decrement descendants, check coalesce
-        uint16_t desc = Ops::dec_or_recompute_desc_(node, sc);
-        if (desc <= COMPACT_MAX)
-            return do_coalesce_(node, hdr, orig_bits, desc);
-        return {tag_bitmask(node), true, desc};
-    }
-
-    // ==================================================================
-    // leaf_erase: dispatch by suffix_type
-    // Returns tagged result
-    // ==================================================================
-
-    erase_result_t leaf_erase_(uint64_t* node, node_header* hdr, IK ik) {
-        uint8_t st = hdr->suffix_type();
-
-        if (st == 0)
-            return BO::bitmap_erase(node,
-                static_cast<uint8_t>(ik >> (IK_BITS - 8)), alloc_);
-
-        if constexpr (KEY_BITS > 16) {
-            if (st & 0b10) {
-                if constexpr (KEY_BITS > 32) {
-                    if (st & 0b01)
-                        return CO64::erase(node, hdr,
-                            static_cast<uint64_t>(ik), alloc_);
-                }
-                return CO32::erase(node, hdr,
-                    static_cast<uint32_t>(ik >> (IK_BITS - 32)), alloc_);
-            }
-        }
-
-        return CO16::erase(node, hdr,
-            static_cast<uint16_t>(ik >> (IK_BITS - 16)), alloc_);
-    }
-
-    // ==================================================================
     // Coalesce: collapse bitmask subtree back into compact leaf
     //
     // Descendant tracking via stored counts makes coalesce O(1) check.
@@ -777,10 +569,7 @@ private:
 
         if (sc > 0) {
             uint8_t skip_bytes[6];
-            for (uint8_t i = 0; i < sc; ++i) {
-                uint64_t* eb = node + 1 + i * 6;
-                skip_bytes[i] = reinterpret_cast<const bitmap256*>(eb)->single_bit_index();
-            }
+            BO::skip_bytes(node, sc, skip_bytes);
             leaf = Ops::prepend_skip_(leaf, sc, skip_bytes, alloc_);
         }
 
