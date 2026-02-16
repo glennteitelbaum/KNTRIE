@@ -88,6 +88,187 @@ struct kntrie_ops {
     }
 
     // ==================================================================
+    // NK-dependent helpers (compile-time suffix_type dispatch)
+    // ==================================================================
+
+    // Create a 1-entry leaf. Returns raw (untagged) pointer.
+    static uint64_t* make_single_leaf_(NK suffix, VST value, ALLOC& alloc) {
+        if constexpr (sizeof(NK) == 1) {
+            return BO::make_single_bitmap(static_cast<uint8_t>(suffix), value, alloc);
+        } else {
+            return CO::make_leaf(&suffix, &value, 1, 0, nullptr, alloc);
+        }
+    }
+
+    // Iterate leaf entries, callback receives (uint64_t bit63_aligned, VST value)
+    template<typename Fn>
+    static void leaf_for_each_aligned_(const uint64_t* node, const node_header* hdr,
+                                        Fn&& cb) {
+        constexpr int SHIFT = 64 - NK_BITS;
+        if constexpr (sizeof(NK) == 1) {
+            BO::for_each_bitmap(node, [&](uint8_t s, VST v) {
+                cb(uint64_t(s) << SHIFT, v);
+            });
+        } else {
+            CO::for_each(node, hdr, [&](NK s, VST v) {
+                if constexpr (SHIFT > 0)
+                    cb(uint64_t(s) << SHIFT, v);
+                else
+                    cb(uint64_t(s), v);
+            });
+        }
+    }
+
+    // Build leaf from bit-63-aligned uint64_t arrays. Returns raw pointer.
+    static uint64_t* build_leaf_(uint64_t* suf, VST* vals, size_t count, ALLOC& alloc) {
+        if constexpr (sizeof(NK) == 1) {
+            auto bk = std::make_unique<uint8_t[]>(count);
+            for (size_t i = 0; i < count; ++i)
+                bk[i] = static_cast<uint8_t>(suf[i] >> 56);
+            return BO::make_bitmap_leaf(bk.get(), vals,
+                static_cast<uint32_t>(count), alloc);
+        } else {
+            constexpr int SHIFT = 64 - NK_BITS;
+            auto tk = std::make_unique<NK[]>(count);
+            for (size_t i = 0; i < count; ++i)
+                tk[i] = static_cast<NK>(suf[i] >> SHIFT);
+            return CO::make_leaf(tk.get(), vals,
+                static_cast<uint32_t>(count), 0, nullptr, alloc);
+        }
+    }
+
+    // Build from bit-63-aligned arrays. Returns tagged pointer.
+    // bits: remaining key bits at this level.
+    static uint64_t build_node_from_arrays_tagged_(uint64_t* suf, VST* vals,
+                                                    size_t count, int bits,
+                                                    ALLOC& alloc) {
+        // Leaf case
+        if (count <= COMPACT_MAX)
+            return tag_leaf(build_leaf_(suf, vals, count, alloc));
+
+        // Skip compression: all entries share same top byte?
+        if (bits > 8) {
+            uint8_t first_top = static_cast<uint8_t>(suf[0] >> 56);
+            bool all_same = true;
+            for (size_t i = 1; i < count; ++i)
+                if (static_cast<uint8_t>(suf[i] >> 56) != first_top)
+                    { all_same = false; break; }
+
+            if (all_same) {
+                for (size_t i = 0; i < count; ++i) suf[i] <<= 8;
+                uint64_t child_tagged;
+                if constexpr (NK_BITS > 8) {
+                    if (bits - 8 <= static_cast<int>(NK_BITS / 2))
+                        child_tagged = Narrow::build_node_from_arrays_tagged_(
+                            suf, vals, count, bits - 8, alloc);
+                    else
+                        child_tagged = build_node_from_arrays_tagged_(
+                            suf, vals, count, bits - 8, alloc);
+                } else {
+                    child_tagged = build_node_from_arrays_tagged_(
+                        suf, vals, count, bits - 8, alloc);
+                }
+                uint8_t byte_arr[1] = {first_top};
+                if (child_tagged & LEAF_BIT) {
+                    uint64_t* leaf = untag_leaf_mut(child_tagged);
+                    return tag_leaf(prepend_skip_(leaf, 1, byte_arr, alloc));
+                } else {
+                    uint64_t* bm_node = bm_to_node(child_tagged);
+                    return BO::wrap_in_chain(bm_node, byte_arr, 1, alloc);
+                }
+            }
+        }
+
+        return build_bitmask_from_arrays_tagged_(suf, vals, count, bits, alloc);
+    }
+
+    // Groups by top byte, recurses, creates bitmask node.
+    static uint64_t build_bitmask_from_arrays_tagged_(uint64_t* suf, VST* vals,
+                                                       size_t count, int bits,
+                                                       ALLOC& alloc) {
+        uint8_t  indices[256];
+        uint64_t child_tagged[256];
+        uint16_t descs[256];
+        int      n_children = 0;
+
+        size_t i = 0;
+        while (i < count) {
+            uint8_t ti = static_cast<uint8_t>(suf[i] >> 56);
+            size_t start = i;
+            while (i < count && static_cast<uint8_t>(suf[i] >> 56) == ti) ++i;
+            size_t cc = i - start;
+
+            auto cs = std::make_unique<uint64_t[]>(cc);
+            for (size_t j = 0; j < cc; ++j)
+                cs[j] = suf[start + j] << 8;
+
+            if constexpr (NK_BITS > 8) {
+                if (bits - 8 <= static_cast<int>(NK_BITS / 2))
+                    child_tagged[n_children] = Narrow::build_node_from_arrays_tagged_(
+                        cs.get(), vals + start, cc, bits - 8, alloc);
+                else
+                    child_tagged[n_children] = build_node_from_arrays_tagged_(
+                        cs.get(), vals + start, cc, bits - 8, alloc);
+            } else {
+                child_tagged[n_children] = build_node_from_arrays_tagged_(
+                    cs.get(), vals + start, cc, bits - 8, alloc);
+            }
+            indices[n_children] = ti;
+            descs[n_children] = cc > COMPACT_MAX ? COALESCE_CAP
+                                                   : static_cast<uint16_t>(cc);
+            n_children++;
+        }
+
+        auto* node = BO::make_bitmask(indices, child_tagged, n_children, alloc, descs);
+        set_desc_capped_(node, count);
+        return tag_bitmask(node);
+    }
+
+    // Convert overflowing compact leaf to bitmask tree.
+    // suffix: NK-typed suffix, value: new value to insert.
+    // bits: remaining key bits. Returns tagged pointer.
+    static uint64_t convert_to_bitmask_tagged_(const uint64_t* node,
+                                                const node_header* hdr,
+                                                NK suffix, VST value,
+                                                int bits, ALLOC& alloc) {
+        uint16_t old_count = hdr->entries();
+        size_t total = old_count + 1;
+        auto wk = std::make_unique<uint64_t[]>(total);
+        auto wv = std::make_unique<VST[]>(total);
+
+        uint64_t new_suf = uint64_t(suffix) << (64 - NK_BITS);
+        size_t wi = 0;
+        bool ins = false;
+        leaf_for_each_aligned_(node, hdr, [&](uint64_t s, VST v) {
+            if (!ins && new_suf < s) {
+                wk[wi] = new_suf; wv[wi] = value; wi++; ins = true;
+            }
+            wk[wi] = s; wv[wi] = v; wi++;
+        });
+        if (!ins) { wk[wi] = new_suf; wv[wi] = value; }
+
+        uint64_t child_tagged = build_node_from_arrays_tagged_(
+            wk.get(), wv.get(), total, bits, alloc);
+
+        // Propagate old skip/prefix to new child
+        uint8_t ps = hdr->skip();
+        if (ps > 0) {
+            const uint8_t* pfx = hdr->prefix_bytes();
+            if (child_tagged & LEAF_BIT) {
+                uint64_t* leaf = untag_leaf_mut(child_tagged);
+                leaf = prepend_skip_(leaf, ps, pfx, alloc);
+                child_tagged = tag_leaf(leaf);
+            } else {
+                uint64_t* bm_node = bm_to_node(child_tagged);
+                child_tagged = BO::wrap_in_chain(bm_node, pfx, ps, alloc);
+            }
+        }
+
+        dealloc_node(alloc, const_cast<uint64_t*>(node), hdr->alloc_u64());
+        return child_tagged;
+    }
+
+    // ==================================================================
     // NK-independent helpers (shared across all NK specializations)
     // ==================================================================
 

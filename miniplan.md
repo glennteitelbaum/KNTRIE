@@ -23,8 +23,8 @@ transcript before doing anything.
 | kntrie_support.hpp | 337 | node_header, tagged ptrs, bitmap256 layout constants, next_narrow_t |
 | kntrie_compact.hpp | 612 | CO<NK>: compact leaf ops |
 | kntrie_bitmask.hpp | 1092 | BM: bitmask/chain ops (add/remove/build/wrap/collapse) |
-| kntrie_ops.hpp | 206 | Ops<NK>: find + desc helpers + skip helpers + subtree dealloc |
-| kntrie_impl.hpp | 1456 | Insert, erase, iter, build (shrinking) |
+| kntrie_ops.hpp | 387 | Ops<NK>: find + desc/skip/dealloc helpers + NK-dependent build/convert |
+| kntrie_impl.hpp | 1456 | Insert, erase, iter, build (old dups pending 3B deletion) |
 | kntrie.hpp | 240 | Public API, KEY→UK, iterators |
 
 ---
@@ -175,28 +175,23 @@ Compile + test + ASAN.
 
 ### 3A: Move leaf/build helpers
 
-- [ ] 3A.1 Move `make_single_leaf_` (impl:1577) → `Ops::make_single_leaf_`
-      - IK param → NK param
-      - Use `CO::make_leaf(...)` instead of suffix_type dispatch
+- [x] 3A.1 `make_single_leaf_` → `Ops::make_single_leaf_(NK suffix, VST, ALLOC&)` — DONE
+      - sizeof(NK)==1 → BO::make_single_bitmap, else → CO::make_leaf
+- [x] 3A.2 `leaf_for_each_u64_` → `Ops::leaf_for_each_aligned_` — DONE
+      - sizeof(NK)==1 → BO::for_each_bitmap, else → CO::for_each
+      - Shift is constexpr (64 - NK_BITS)
+- [x] 3A.3 `convert_to_bitmask_tagged_` → `Ops::convert_to_bitmask_tagged_` — DONE
+      - Takes NK suffix instead of IK, uses leaf_for_each_aligned_
+- [x] 3A.4 `build_node_from_arrays_tagged_` → `Ops::` — DONE
+      - Added build_leaf_ helper (NK compile-time dispatch)
+      - Narrowing: `if (bits-8 <= NK_BITS/2) Narrow::build_node_...`
+- [x] 3A.5 `build_bitmask_from_arrays_tagged_` → `Ops::` — DONE
+      - Same narrowing pattern as 3A.4
 
-- [ ] 3A.2 Move `leaf_for_each_u64_` (impl:1652) → `Ops::leaf_for_each_aligned_`
-      - Replace 4-way suffix_type dispatch with:
-        `if constexpr (sizeof(NK)==1) BO::for_each_bitmap else CO::for_each`
-
-- [ ] 3A.3 Move `convert_to_bitmask_tagged_` (impl:1606) → ops
-      - Use `leaf_for_each_aligned_` instead of `leaf_for_each_u64_`
-
-- [ ] 3A.4 Move `build_node_from_arrays_tagged_` (impl:1684) → ops
-      - Template on NK, narrowing via `Narrow::build_node_from_arrays_tagged_`
-
-- [ ] 3A.5 Move `build_bitmask_from_arrays_tagged_` (impl:1759) → ops
-      - Template on NK for child subtree construction
-
-- [ ] 3A.6 Move `split_on_prefix_tagged_` (impl:1797) → ops
-
-- [ ] 3A.7 Move `split_skip_at_` (impl:861) → ops
-      - Use `BO::build_remainder`, `BO::wrap_in_chain` instead of raw layout
-      - Use `BO::skip_byte` / `BO::skip_bytes` instead of raw embed access
+- [~] 3A.6 `split_on_prefix_tagged_` — DEFERRED
+      - Runtime variable prefix consumption → can't determine leaf NK at compile time
+      - Write-path: suffix_type dispatch cost negligible vs alloc
+- [~] 3A.7 `split_skip_at_` — DEFERRED (same reason)
 
 **⏸ STOP**: Present zip. Wait for confirmation. Compile + test + ASAN.
 
@@ -366,3 +361,4 @@ ALL is_leaf() / set_bitmask() calls replaced by tagged ptr checks.
 | 2026-02-16 | 2A | 2A.1-2A.5 | add_child_at_/remove_child_at_/fix_embeds_ cores. chain_add/remove_child. Deleted ~130 lines from impl |
 | 2026-02-16 | 2B | 2B.1-2B.4 | build_remainder, wrap_in_chain, collapse_info moved to BM. Impl -129 lines |
 | 2026-02-16 | 2C | 2C.1-2C.5 | Desc helpers, skip helpers, dealloc_bitmask_subtree_ moved to Ops. Impl -116 lines. Deferred: remove_node_/destroy_leaf_ (NK-dependent) |
+| 2026-02-16 | 3A | 3A.1-3A.5 | NK-dependent helpers added to Ops: make_single_leaf_, leaf_for_each_aligned_, build_leaf_, build_node_from_arrays_tagged_, build_bitmask_from_arrays_tagged_, convert_to_bitmask_tagged_. Narrowing at NK/2 boundaries. Deferred 3A.6-7 (runtime prefix consumption) |
