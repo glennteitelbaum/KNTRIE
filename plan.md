@@ -50,6 +50,11 @@ else
 - `leaf_first_/last_/next_/prev_dispatch_` → `CO<NK>::iter_xxx`
 - `combine_suffix_` → compile-time shift
 
+**Enables node_header simplification**: with suffix_type no longer read
+at runtime, and BITMASK_BIT redundant with tagged pointer dispatch,
+node_header drops from bit-packed flags to 4 clean uint16 fields.
+See **node_header redesign** section.
+
 ---
 
 ## NK narrowing mechanics
@@ -607,7 +612,7 @@ static void collect_entries_tagged_(uint64_t tagged, uint64_t prefix,
 ### Iteration functions (current ~310 lines → ops ~250 lines)
 
 The big win: leaf_first_/last_/next_/prev_dispatch_ (4 functions × 25 lines
-each = 100 lines of suffix_type dispatch) become:
+each = 100 lines of suffix_type dispatch) become compile-time via NK:
 
 ```cpp
 // leaf_next in ops
@@ -629,6 +634,105 @@ static iter_result_t<IK,VALUE> leaf_next_(const uint64_t* node,
 ```
 
 One function per operation instead of 4-way dispatch. All compile-time.
+
+---
+
+## node_header redesign
+
+### Current (8 bytes, awkward bit packing)
+
+```
+byte 0:  flags_        uint8   [bit 0: BITMASK_BIT, bits 1-3: skip, bits 4-7: unused]
+byte 1:  suffix_type_  uint8   [0=bitmap, 1=CO16, 2=CO32, 3=CO64]
+byte 2-3: entries_     uint16
+byte 4-5: alloc_u64_   uint16
+byte 6-7: total_slots_ uint16
+```
+
+### New (8 bytes, 4 aligned uint16s)
+
+```
+byte 0-1: skip_count_   uint16  [max 6 in practice, bits 3-15 free for future flags]
+byte 2-3: entries_       uint16
+byte 4-5: alloc_u64_     uint16
+byte 6-7: total_slots_   uint16
+```
+
+### What's removed and why
+
+**BITMASK_BIT** — Every caller already branches on the tagged pointer
+(`ptr & LEAF_BIT`), never the header flag. `is_leaf()` / `set_bitmask()`
+are dead code. Verified: find_leaf_, insert_node_, erase_node_,
+remove_node_, collect_stats_ — all check tagged pointer first.
+
+**suffix_type_** — With NK templating, `CO<NK>` is resolved at compile
+time. `NK=u8` → bitmap leaf. `NK=u16/u32/u64` → compact leaf with that
+suffix width. The node never needs to self-describe its format at runtime.
+`suffix_type_for()` and all 4-way dispatch on suffix_type are eliminated.
+
+**skip_count_ as uint16** — Current 3-bit extraction
+`(flags_ >> 1) & 0x07` becomes a single aligned uint16 load. Simpler
+access, no bit manipulation. Max value is 6, so bits 3–15 are free
+for future use (type flags, format version, etc.) without changing
+the skip_count access pattern (just mask low bits if needed).
+
+### Debug concern
+
+After removing suffix_type_, raw node dumps without template context
+can't determine leaf format. Acceptable trade-off: the spare bits in
+skip_count_ (bits 3–15) can store a format tag if debug inspection
+is ever needed.
+
+### Changes to code
+
+**Prerequisite**: all NK templating complete (Phases 3-5) so no code
+reads `suffix_type_` or `is_leaf()` anymore. Implemented as Phase 5.5.
+
+**kntrie_support.hpp** — replace node_header struct:
+```cpp
+struct node_header {
+    uint16_t skip_count_  = 0;
+    uint16_t entries_     = 0;
+    uint16_t alloc_u64_   = 0;
+    uint16_t total_slots_ = 0;
+
+    // --- skip ---
+    uint16_t skip()    const noexcept { return skip_count_; }
+    bool     is_skip() const noexcept { return skip_count_ != 0; }
+    void set_skip(uint16_t s) noexcept { skip_count_ = s; }
+
+    // --- entries / alloc ---
+    unsigned entries()   const noexcept { return entries_; }
+    void set_entries(unsigned n) noexcept { entries_ = static_cast<uint16_t>(n); }
+
+    unsigned alloc_u64() const noexcept { return alloc_u64_; }
+    void set_alloc_u64(unsigned n) noexcept { alloc_u64_ = static_cast<uint16_t>(n); }
+
+    unsigned total_slots() const noexcept { return total_slots_; }
+    void set_total_slots(unsigned n) noexcept { total_slots_ = static_cast<uint16_t>(n); }
+
+    // Bitmask-only: total_slots_ as descendant count
+    uint16_t descendants() const noexcept { return total_slots_; }
+    void set_descendants(uint16_t n) noexcept { total_slots_ = n; }
+};
+static_assert(sizeof(node_header) == 8);
+```
+
+**Remove from kntrie_support.hpp:**
+- `BITMASK_BIT` constant
+- `is_leaf()`, `set_bitmask()` methods
+- `suffix_type()`, `set_suffix_type()` methods
+- `suffix_type_for()` free function (if present)
+
+**kntrie_compact.hpp** — remove all `set_suffix_type()` calls in
+`make_leaf`, `grow_and_insert`, etc. CO already knows its suffix width
+from its NK template parameter.
+
+**kntrie_bitmask.hpp** — remove `set_bitmask()` calls in `make_bitmask`,
+`make_skip_chain`, etc. Bitmask vs leaf is determined by tagged pointer.
+
+**kntrie_impl.hpp** — remove all `suffix_type()` reads in dispatch code.
+This is eliminated by NK anyway, but the header cleanup comes first.
 
 ---
 
@@ -732,13 +836,26 @@ Convert insert path to NK dispatch:
 
 **Test**: full iteration test suite.
 
+### Phase 5.5: Simplify node_header
+
+Prerequisite: all suffix_type_ reads eliminated by NK templating (Phases 3-5).
+All is_leaf() / set_bitmask() calls replaced by tagged pointer checks.
+
+- Replace node_header struct: 4 aligned uint16 fields
+- Remove `BITMASK_BIT`, `is_leaf()`, `set_bitmask()`, `suffix_type()`,
+  `set_suffix_type()` from header and all call sites
+- Replace `skip()` 3-bit extraction with uint16 field access
+- Remove `set_bitmask()` from BM's make_bitmask/make_skip_chain
+- Remove `set_suffix_type()` from CO's make_leaf/grow_and_insert
+- **Test**: compile + run all tests + ASAN. Zero behavior change
+  (all removed fields are now dead code).
+
 ### Phase 6: Clean up
 
 - Remove dead code from kntrie_impl.hpp
-- Remove `suffix_type_for()` if no longer used (kept in support for
-  header encoding, but runtime dispatch eliminated)
 - Remove `CO16/CO32/CO64` type aliases from impl (ops uses `CO<NK>`)
 - Verify kntrie_impl.hpp is ~200 lines
+- Final audit: grep for any remaining raw BM layout access in ops
 
 ---
 
