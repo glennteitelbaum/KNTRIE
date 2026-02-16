@@ -247,7 +247,7 @@ public:
             uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
             ik <<= 8;
 
-            if (bitmap.test_bit(byte)) {
+            if (bitmap.has_bit(byte)) {
                 auto adj = bitmap.next_set_after(byte);
                 if (adj.found) {
                     IK rp = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
@@ -323,7 +323,7 @@ public:
             uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
             ik <<= 8;
 
-            if (bitmap.test_bit(byte)) {
+            if (bitmap.has_bit(byte)) {
                 auto adj = bitmap.prev_set_before(byte);
                 if (adj.found) {
                     IK rp = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));

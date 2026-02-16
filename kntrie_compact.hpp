@@ -160,7 +160,10 @@ struct compact_ops {
         const VST* vd = vals_(node, ts, hs);
         const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
         unsigned p = static_cast<unsigned>(base - kd);
-        // Advance past suffix and its dups
+        // find_base lands on last position where kd[p] <= suffix,
+        // or stays at 0 if all entries > suffix
+        if (kd[p] > suffix) return {kd[p], &vd[p], true};
+        // kd[p] <= suffix — advance past it and any dups
         unsigned i = p + 1;
         while (i < ts && kd[i] <= suffix) ++i;
         if (i < ts) return {kd[i], &vd[i], true};
