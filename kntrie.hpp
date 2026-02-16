@@ -11,7 +11,18 @@ template<typename KEY, typename VALUE, typename ALLOC = std::allocator<uint64_t>
 class kntrie {
     static_assert(std::is_integral_v<KEY>, "KEY must be integral");
 
-    using impl_t = kntrie_impl<KEY, VALUE, ALLOC>;
+    using UK     = std::make_unsigned_t<KEY>;
+    using impl_t = kntrie_impl<UK, VALUE, ALLOC>;
+
+    static constexpr UK SIGN_BIT = std::is_signed_v<KEY>
+        ? (UK(1) << (sizeof(KEY) * 8 - 1)) : UK(0);
+
+    static UK to_unsigned(KEY k) noexcept {
+        return static_cast<UK>(k) ^ SIGN_BIT;
+    }
+    static KEY from_unsigned(UK u) noexcept {
+        return static_cast<KEY>(u ^ SIGN_BIT);
+    }
 
 public:
     using key_type        = KEY;
@@ -28,12 +39,12 @@ public:
     class const_iterator {
         friend class kntrie;
         const impl_t* parent_ = nullptr;
-        KEY   key_{};
+        UK    ukey_{};
         VALUE value_{};
         bool  valid_ = false;
 
-        const_iterator(const impl_t* p, KEY k, VALUE v, bool valid)
-            : parent_(p), key_(k), value_(v), valid_(valid) {}
+        const_iterator(const impl_t* p, UK uk, VALUE v, bool valid)
+            : parent_(p), ukey_(uk), value_(v), valid_(valid) {}
 
         static const_iterator from_result(const impl_t* p,
                                            const typename impl_t::iter_result_t& r) {
@@ -49,16 +60,16 @@ public:
 
         const_iterator() = default;
 
-        const KEY&   key()   const noexcept { return key_; }
+        KEY          key()   const noexcept { return from_unsigned(ukey_); }
         const VALUE& value() const noexcept { return value_; }
 
         std::pair<const KEY, const VALUE&> operator*() const noexcept {
-            return {key_, value_};
+            return {from_unsigned(ukey_), value_};
         }
 
         const_iterator& operator++() {
-            auto r = parent_->iter_next_(key_);
-            key_   = r.key;
+            auto r = parent_->iter_next_(ukey_);
+            ukey_  = r.key;
             value_ = r.value;
             valid_ = r.found;
             return *this;
@@ -71,8 +82,8 @@ public:
         }
 
         const_iterator& operator--() {
-            auto r = parent_->iter_prev_(key_);
-            key_   = r.key;
+            auto r = parent_->iter_prev_(ukey_);
+            ukey_  = r.key;
             value_ = r.value;
             valid_ = r.found;
             return *this;
@@ -87,7 +98,7 @@ public:
         bool operator==(const const_iterator& o) const noexcept {
             if (!valid_ && !o.valid_) return true;
             if (valid_ != o.valid_) return false;
-            return key_ == o.key_;
+            return ukey_ == o.ukey_;
         }
 
         bool operator!=(const const_iterator& o) const noexcept {
@@ -118,17 +129,17 @@ public:
     // ==================================================================
 
     std::pair<iterator, bool> insert(const value_type& kv) {
-        auto [ok, ins] = impl_.insert(kv.first, kv.second);
+        auto [ok, ins] = impl_.insert(to_unsigned(kv.first), kv.second);
         return {iterator{}, ins};
     }
     std::pair<bool, bool> insert(const KEY& key, const VALUE& value) {
-        return impl_.insert(key, value);
+        return impl_.insert(to_unsigned(key), value);
     }
     std::pair<bool, bool> insert_or_assign(const KEY& key, const VALUE& value) {
-        return impl_.insert_or_assign(key, value);
+        return impl_.insert_or_assign(to_unsigned(key), value);
     }
     std::pair<bool, bool> assign(const KEY& key, const VALUE& value) {
-        return impl_.assign(key, value);
+        return impl_.assign(to_unsigned(key), value);
     }
     template<typename... Args>
     std::pair<iterator, bool> emplace(Args&&... args) {
@@ -137,29 +148,30 @@ public:
     }
 
     void clear() noexcept { impl_.clear(); }
-    size_type erase(const KEY& key) { return impl_.erase(key) ? 1 : 0; }
+    size_type erase(const KEY& key) { return impl_.erase(to_unsigned(key)) ? 1 : 0; }
 
     // ==================================================================
     // Lookup
     // ==================================================================
 
-    const VALUE* find_value(const KEY& key) const noexcept { return impl_.find_value(key); }
-    bool contains(const KEY& key) const noexcept { return impl_.contains(key); }
+    const VALUE* find_value(const KEY& key) const noexcept { return impl_.find_value(to_unsigned(key)); }
+    bool contains(const KEY& key) const noexcept { return impl_.contains(to_unsigned(key)); }
     size_type count(const KEY& key) const noexcept { return contains(key) ? 1 : 0; }
 
     VALUE& operator[](const KEY& key) {
-        const VALUE* v = impl_.find_value(key);
+        UK uk = to_unsigned(key);
+        const VALUE* v = impl_.find_value(uk);
         if (v) return const_cast<VALUE&>(*v);
-        impl_.insert(key, VALUE{});
-        return const_cast<VALUE&>(*impl_.find_value(key));
+        impl_.insert(uk, VALUE{});
+        return const_cast<VALUE&>(*impl_.find_value(uk));
     }
     const VALUE& at(const KEY& key) const {
-        const VALUE* v = impl_.find_value(key);
+        const VALUE* v = impl_.find_value(to_unsigned(key));
         if (!v) throw std::out_of_range("kntrie::at: key not found");
         return *v;
     }
     VALUE& at(const KEY& key) {
-        const VALUE* v = impl_.find_value(key);
+        const VALUE* v = impl_.find_value(to_unsigned(key));
         if (!v) throw std::out_of_range("kntrie::at: key not found");
         return const_cast<VALUE&>(*v);
     }
@@ -185,20 +197,22 @@ public:
     }
 
     const_iterator find(const KEY& key) const noexcept {
-        const VALUE* v = impl_.find_value(key);
+        UK uk = to_unsigned(key);
+        const VALUE* v = impl_.find_value(uk);
         if (!v) return end();
-        return const_iterator(&impl_, key, *v, true);
+        return const_iterator(&impl_, uk, *v, true);
     }
 
     const_iterator lower_bound(const KEY& k) const noexcept {
-        const VALUE* v = impl_.find_value(k);
-        if (v) return const_iterator(&impl_, k, *v, true);
-        auto r = impl_.iter_next_(k);
+        UK uk = to_unsigned(k);
+        const VALUE* v = impl_.find_value(uk);
+        if (v) return const_iterator(&impl_, uk, *v, true);
+        auto r = impl_.iter_next_(uk);
         return const_iterator::from_result(&impl_, r);
     }
 
     const_iterator upper_bound(const KEY& k) const noexcept {
-        auto r = impl_.iter_next_(k);
+        auto r = impl_.iter_next_(to_unsigned(k));
         return const_iterator::from_result(&impl_, r);
     }
 
