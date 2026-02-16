@@ -29,16 +29,19 @@
 - [x] Implement `iter_next_(KEY key)` — descend tracking resume point, next_set_after
 - [x] Implement `iter_prev_(KEY key)` — descend tracking resume point, prev_set_before
 - [x] Key reconstruction logic (accumulate prefix bytes during descent)
-- [ ] **STOP**: zip all headers + plan.md + miniplan.md, wait for user
+- [x] **STOP**: zip all headers + plan.md + miniplan.md, wait for user
 
 ## Phase 4: iterator class (kntrie.hpp)
 
-- [ ] Define `iterator` class (parent ptr, key, value copy, valid bool)
-- [ ] `operator++` calls `parent_->iter_next_(key_)`
-- [ ] `operator--` calls `parent_->iter_prev_(key_)`
-- [ ] `operator==` (both invalid = equal)
-- [ ] `operator*` / `operator->` (returns key/value ref)
-- [ ] `begin()` / `end()` / `rbegin()` / `rend()`
+- [x] Define `const_iterator` class (parent ptr, key, value copy, valid bool)
+- [x] `operator++` calls `parent_->iter_next_(key_)`
+- [x] `operator--` calls `parent_->iter_prev_(key_)`
+- [x] `operator==` (both invalid = equal)
+- [x] `operator*` (returns pair<const KEY, const VALUE&>)
+- [x] `begin()` / `end()` / `cbegin()` / `cend()`
+- [x] `find()` / `lower_bound()` / `upper_bound()` / `equal_range()`
+- [x] `impl()` accessor for testing
+- [x] `iterator` = `const_iterator` (values not mutable through iterator)
 - [ ] **STOP**: zip all headers + plan.md + miniplan.md, wait for user
 
 ## Phase 5: testing
