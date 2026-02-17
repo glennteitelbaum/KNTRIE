@@ -246,6 +246,17 @@ struct key_ops {
 };
 
 // ==========================================================================
+// Iteration result (free struct, shared across all NK specializations)
+// ==========================================================================
+
+template<typename IK, typename VST>
+struct iter_ops_result_t {
+    IK key;
+    const VST* value;
+    bool found;
+};
+
+// ==========================================================================
 // Value traits
 // ==========================================================================
 

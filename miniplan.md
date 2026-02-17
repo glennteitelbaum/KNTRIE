@@ -257,29 +257,16 @@ Compile + test + ASAN.
 
 **Goal**: Iteration uses NK. Eliminates 4×25-line leaf dispatch.
 
-- [ ] 5.1 Move `combine_suffix_` (impl:380) → ops
-      - Compile-time shift based on NK, no suffix_type switch
-
-- [ ] 5.2 Move `descend_min_` (impl:392) → ops
-      - Template on `<IK>` (IK is method-level, NK is struct-level)
-      - Use `BO::bitmap_ref`, `BO::first_child`, `BO::child_at`
-      - Leaf dispatch: `CO::iter_first` or `BO::bitmap_iter_first`
-      - Narrowing via `Narrow::template descend_min_<IK>`
-
-- [ ] 5.3 Move `descend_max_` (impl:417) → ops
-      - Same pattern as descend_min_
-
-- [ ] 5.4 Move `iter_next_node_` (impl:273) → ops
-      - Template on `<IK>`
-      - Use BO:: accessors for bitmask child access
-      - Leaf dispatch via CO/BO compile-time
-      - Narrowing via `Narrow::template iter_next_node_<IK>`
-
-- [ ] 5.5 Move `iter_prev_node_` (impl:326) → ops
-      - Same pattern
-
-- [ ] 5.6 Thin down iter_first_/last_/next_/prev_ in impl to 4 one-liners:
-      - Each calls `Ops::template descend_min_<IK>(...)` etc.
+- [x] 5.1 combine_suffix_ → inline in leaf helpers with `(IK(suffix) << (IK_BITS - NK_BITS)) >> bits`
+- [x] 5.2 descend_min_ → ops (compile-time recursive: leaf_skip_, chain_skip_, bm_final_)
+- [x] 5.3 descend_max_ → ops (same structure)
+- [x] 5.4 iter_next_node_ → ops (compile-time: leaf_skip_, chain_skip_, bm_final_)
+- [x] 5.5 iter_prev_node_ → ops (same structure)
+- [x] 5.6 impl iter_first_/last_/next_/prev_ are 4 one-liners calling Ops
+      - Deleted: combine_suffix_, descend_min_, descend_max_, iter_next_node_,
+        iter_prev_node_, leaf_first_, leaf_last_, leaf_next_dispatch_, leaf_prev_dispatch_
+      - Added iter_ops_result_t<IK,VST> to support.hpp as free struct
+      - impl: 604→314 (−290). ops: 1173→1706 (+533). support: 324→335 (+11)
 
 **⏸ STOP**: Present zip. Wait for confirmation. Compile + test + ASAN.
 

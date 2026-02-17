@@ -1055,6 +1055,539 @@ struct kntrie_ops {
     }
 
     // ==================================================================
+
+    // ==================================================================
+
+    // ==================================================================
+    // Iteration — compile-time recursive, mirrors find/erase pattern.
+    //
+    // NK ik: narrowing key (byte-at-a-time, same as find/insert/erase).
+    // IK prefix + int bits: accumulated result key from root.
+    // BITS: compile-time remaining key bits for NK narrowing.
+    // ==================================================================
+
+    // --- leaf dispatch helpers (compile-time CO/BO) ---
+    // Suffix is NK-typed: stored value with remaining key in top bits of NK.
+    // To position in IK: shift left to top of IK, then right by consumed bits.
+    // Formula: prefix | ((IK(suffix) << (IK_BITS - NK_BITS)) >> bits)
+
+    template<typename IK>
+    static iter_ops_result_t<IK, VST> leaf_first_(const uint64_t* node,
+                                                    const node_header* hdr,
+                                                    IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if constexpr (sizeof(NK) == 1) {
+            size_t hs = 1 + (hdr->is_skip() ? 1 : 0);
+            auto r = BO::bitmap_iter_first(node, hs);
+            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
+            return {prefix | contrib, r.value, true};
+        } else {
+            auto r = CO::iter_first(node, hdr);
+            if (!r.found) return {IK{}, nullptr, false};
+            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
+            return {prefix | contrib, r.value, true};
+        }
+    }
+
+    template<typename IK>
+    static iter_ops_result_t<IK, VST> leaf_last_(const uint64_t* node,
+                                                   const node_header* hdr,
+                                                   IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if constexpr (sizeof(NK) == 1) {
+            size_t hs = 1 + (hdr->is_skip() ? 1 : 0);
+            auto r = BO::bitmap_iter_last(node, *hdr, hs);
+            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
+            return {prefix | contrib, r.value, true};
+        } else {
+            auto r = CO::iter_last(node, hdr);
+            if (!r.found) return {IK{}, nullptr, false};
+            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
+            return {prefix | contrib, r.value, true};
+        }
+    }
+
+    template<typename IK>
+    static iter_ops_result_t<IK, VST> leaf_next_(const uint64_t* node,
+                                                   const node_header* hdr,
+                                                   NK suf, IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if constexpr (sizeof(NK) == 1) {
+            size_t hs = 1 + (hdr->is_skip() ? 1 : 0);
+            auto r = BO::bitmap_iter_next(node, static_cast<uint8_t>(suf), hs);
+            if (!r.found) return {IK{}, nullptr, false};
+            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
+            return {prefix | contrib, r.value, true};
+        } else {
+            auto r = CO::iter_next(node, hdr, suf);
+            if (!r.found) return {IK{}, nullptr, false};
+            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
+            return {prefix | contrib, r.value, true};
+        }
+    }
+
+    template<typename IK>
+    static iter_ops_result_t<IK, VST> leaf_prev_(const uint64_t* node,
+                                                   const node_header* hdr,
+                                                   NK suf, IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if constexpr (sizeof(NK) == 1) {
+            size_t hs = 1 + (hdr->is_skip() ? 1 : 0);
+            auto r = BO::bitmap_iter_prev(node, static_cast<uint8_t>(suf), hs);
+            if (!r.found) return {IK{}, nullptr, false};
+            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
+            return {prefix | contrib, r.value, true};
+        } else {
+            auto r = CO::iter_prev(node, hdr, suf);
+            if (!r.found) return {IK{}, nullptr, false};
+            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
+            return {prefix | contrib, r.value, true};
+        }
+    }
+
+    // ==================================================================
+    // descend_min_: walk always-min path
+    // Compile-time recursive through skips (leaf prefix + chain embed).
+    // ==================================================================
+
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> descend_min_(uint64_t ptr,
+                                                     IK prefix, int bits) noexcept {
+        if (ptr & LEAF_BIT) {
+            const uint64_t* node = untag_leaf(ptr);
+            auto* hdr = get_header(node);
+            if (hdr->entries() == 0) return {IK{}, nullptr, false};
+            uint8_t skip = hdr->skip();
+            if (skip)
+                return descend_min_leaf_skip_<BITS, IK>(
+                    node, hdr, hdr->prefix_bytes(), skip, 0, prefix, bits);
+            return leaf_first_<IK>(node, hdr, prefix, bits);
+        }
+
+        const uint64_t* node = bm_to_node_const(ptr);
+        uint8_t sc = get_header(node)->skip();
+        if (sc > 0)
+            return descend_min_chain_skip_<BITS, IK>(node, sc, 0, prefix, bits);
+        return descend_min_bm_final_<BITS, IK>(node, sc, prefix, bits);
+    }
+
+    // Leaf prefix: accumulate bytes, compile-time narrow
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> descend_min_leaf_skip_(
+            const uint64_t* node, const node_header* hdr,
+            const uint8_t* pb, uint8_t skip, uint8_t pos,
+            IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if (pos >= skip)
+            return leaf_first_<IK>(node, hdr, prefix, bits);
+
+        prefix |= IK(pb[pos]) << (IK_BITS - bits - 8);
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template descend_min_leaf_skip_<BITS - 8, IK>(
+                    node, hdr, pb, skip, pos + 1, prefix, bits + 8);
+            else
+                return descend_min_leaf_skip_<BITS - 8, IK>(
+                    node, hdr, pb, skip, pos + 1, prefix, bits + 8);
+        }
+        __builtin_unreachable();
+    }
+
+    // Chain embed: accumulate bytes, compile-time narrow
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> descend_min_chain_skip_(
+            const uint64_t* node, uint8_t sc, uint8_t pos,
+            IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if (pos >= sc)
+            return descend_min_bm_final_<BITS, IK>(node, sc, prefix, bits);
+
+        prefix |= IK(BO::skip_byte(node, pos)) << (IK_BITS - bits - 8);
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template descend_min_chain_skip_<BITS - 8, IK>(
+                    node, sc, pos + 1, prefix, bits + 8);
+            else
+                return descend_min_chain_skip_<BITS - 8, IK>(
+                    node, sc, pos + 1, prefix, bits + 8);
+        }
+        __builtin_unreachable();
+    }
+
+    // Final bitmap: first child, recurse
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> descend_min_bm_final_(
+            const uint64_t* node, uint8_t sc,
+            IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        const bitmap256& fbm = BO::chain_bitmap(node, sc);
+        uint8_t byte = fbm.first_set_bit();
+        prefix |= IK(byte) << (IK_BITS - bits - 8);
+        uint64_t child = BO::chain_children(node, sc)[0];
+
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template descend_min_<BITS - 8, IK>(
+                    child, prefix, bits + 8);
+            else
+                return descend_min_<BITS - 8, IK>(child, prefix, bits + 8);
+        }
+        __builtin_unreachable();
+    }
+
+    // ==================================================================
+    // descend_max_: walk always-max path (same structure as min)
+    // ==================================================================
+
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> descend_max_(uint64_t ptr,
+                                                     IK prefix, int bits) noexcept {
+        if (ptr & LEAF_BIT) {
+            const uint64_t* node = untag_leaf(ptr);
+            auto* hdr = get_header(node);
+            if (hdr->entries() == 0) return {IK{}, nullptr, false};
+            uint8_t skip = hdr->skip();
+            if (skip)
+                return descend_max_leaf_skip_<BITS, IK>(
+                    node, hdr, hdr->prefix_bytes(), skip, 0, prefix, bits);
+            return leaf_last_<IK>(node, hdr, prefix, bits);
+        }
+
+        const uint64_t* node = bm_to_node_const(ptr);
+        uint8_t sc = get_header(node)->skip();
+        if (sc > 0)
+            return descend_max_chain_skip_<BITS, IK>(node, sc, 0, prefix, bits);
+        return descend_max_bm_final_<BITS, IK>(node, sc, prefix, bits);
+    }
+
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> descend_max_leaf_skip_(
+            const uint64_t* node, const node_header* hdr,
+            const uint8_t* pb, uint8_t skip, uint8_t pos,
+            IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if (pos >= skip)
+            return leaf_last_<IK>(node, hdr, prefix, bits);
+        prefix |= IK(pb[pos]) << (IK_BITS - bits - 8);
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template descend_max_leaf_skip_<BITS - 8, IK>(
+                    node, hdr, pb, skip, pos + 1, prefix, bits + 8);
+            else
+                return descend_max_leaf_skip_<BITS - 8, IK>(
+                    node, hdr, pb, skip, pos + 1, prefix, bits + 8);
+        }
+        __builtin_unreachable();
+    }
+
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> descend_max_chain_skip_(
+            const uint64_t* node, uint8_t sc, uint8_t pos,
+            IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if (pos >= sc)
+            return descend_max_bm_final_<BITS, IK>(node, sc, prefix, bits);
+        prefix |= IK(BO::skip_byte(node, pos)) << (IK_BITS - bits - 8);
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template descend_max_chain_skip_<BITS - 8, IK>(
+                    node, sc, pos + 1, prefix, bits + 8);
+            else
+                return descend_max_chain_skip_<BITS - 8, IK>(
+                    node, sc, pos + 1, prefix, bits + 8);
+        }
+        __builtin_unreachable();
+    }
+
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> descend_max_bm_final_(
+            const uint64_t* node, uint8_t sc,
+            IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        const bitmap256& fbm = BO::chain_bitmap(node, sc);
+        uint8_t byte = fbm.last_set_bit();
+        int slot = fbm.template find_slot<slot_mode::UNFILTERED>(byte);
+        prefix |= IK(byte) << (IK_BITS - bits - 8);
+        uint64_t child = BO::chain_children(node, sc)[slot];
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template descend_max_<BITS - 8, IK>(
+                    child, prefix, bits + 8);
+            else
+                return descend_max_<BITS - 8, IK>(child, prefix, bits + 8);
+        }
+        __builtin_unreachable();
+    }
+
+    // ==================================================================
+    // iter_next_node_: find smallest key > ik
+    // NK ik narrows byte-by-byte like find/erase.
+    // ==================================================================
+
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> iter_next_node_(uint64_t ptr, NK ik,
+                                                        IK prefix, int bits) noexcept {
+        // --- LEAF ---
+        if (ptr & LEAF_BIT) {
+            const uint64_t* node = untag_leaf(ptr);
+            auto* hdr = get_header(node);
+            if (hdr->entries() == 0) return {IK{}, nullptr, false};
+            uint8_t skip = hdr->skip();
+            if (skip)
+                return iter_next_leaf_skip_<BITS, IK>(
+                    node, hdr, ik, hdr->prefix_bytes(), skip, 0, prefix, bits);
+            return leaf_next_<IK>(node, hdr, ik, prefix, bits);
+        }
+
+        // --- BITMASK ---
+        const uint64_t* node = bm_to_node_const(ptr);
+        uint8_t sc = get_header(node)->skip();
+        if (sc > 0)
+            return iter_next_chain_skip_<BITS, IK>(node, sc, ik, 0, prefix, bits);
+        return iter_next_bm_final_<BITS, IK>(node, sc, ik, prefix, bits);
+    }
+
+    // Leaf prefix: compare byte-by-byte, narrow NK
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> iter_next_leaf_skip_(
+            const uint64_t* node, const node_header* hdr,
+            NK ik, const uint8_t* pb, uint8_t skip, uint8_t pos,
+            IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if (pos >= skip)
+            return leaf_next_<IK>(node, hdr, ik, prefix, bits);
+
+        uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        if (kb < pb[pos]) {
+            // Prefix > key: descend min through remaining prefix
+            return descend_min_leaf_skip_<BITS, IK>(
+                node, hdr, pb, skip, pos, prefix, bits);
+        }
+        if (kb > pb[pos]) return {IK{}, nullptr, false};
+
+        prefix |= IK(pb[pos]) << (IK_BITS - bits - 8);
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template iter_next_leaf_skip_<BITS - 8, IK>(
+                    node, hdr,
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    pb, skip, pos + 1, prefix, bits + 8);
+            else
+                return iter_next_leaf_skip_<BITS - 8, IK>(
+                    node, hdr, shifted, pb, skip, pos + 1, prefix, bits + 8);
+        }
+        __builtin_unreachable();
+    }
+
+    // Chain embed: compare byte-by-byte, narrow NK
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> iter_next_chain_skip_(
+            const uint64_t* node, uint8_t sc,
+            NK ik, uint8_t pos,
+            IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if (pos >= sc)
+            return iter_next_bm_final_<BITS, IK>(node, sc, ik, prefix, bits);
+
+        uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        uint8_t sb = BO::skip_byte(node, pos);
+        if (kb < sb) {
+            // Chain byte > key: descend min from here
+            return descend_min_chain_skip_<BITS, IK>(node, sc, pos, prefix, bits);
+        }
+        if (kb > sb) return {IK{}, nullptr, false};
+
+        prefix |= IK(sb) << (IK_BITS - bits - 8);
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template iter_next_chain_skip_<BITS - 8, IK>(
+                    node, sc,
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    pos + 1, prefix, bits + 8);
+            else
+                return iter_next_chain_skip_<BITS - 8, IK>(
+                    node, sc, shifted, pos + 1, prefix, bits + 8);
+        }
+        __builtin_unreachable();
+    }
+
+    // Final bitmap: lookup byte, recurse child or next sibling
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> iter_next_bm_final_(
+            const uint64_t* node, uint8_t sc,
+            NK ik, IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        const bitmap256& fbm = BO::chain_bitmap(node, sc);
+        const uint64_t* children = BO::chain_children(node, sc);
+        uint8_t byte = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+
+        if (fbm.has_bit(byte)) {
+            int slot = fbm.template find_slot<slot_mode::UNFILTERED>(byte);
+            IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
+
+            if constexpr (BITS > 8) {
+                NK shifted = static_cast<NK>(ik << 8);
+                iter_ops_result_t<IK, VST> r;
+                if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                    r = Narrow::template iter_next_node_<BITS - 8, IK>(
+                        children[slot],
+                        static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                        cp, bits + 8);
+                else
+                    r = iter_next_node_<BITS - 8, IK>(
+                        children[slot], shifted, cp, bits + 8);
+                if (r.found) return r;
+            }
+        }
+
+        auto adj = fbm.next_set_after(byte);
+        if (adj.found) {
+            IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
+            if constexpr (BITS > 8) {
+                if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                    return Narrow::template descend_min_<BITS - 8, IK>(
+                        children[adj.slot], np, bits + 8);
+                else
+                    return descend_min_<BITS - 8, IK>(
+                        children[adj.slot], np, bits + 8);
+            }
+        }
+        return {IK{}, nullptr, false};
+    }
+
+    // ==================================================================
+    // iter_prev_node_: find largest key < ik (mirrors iter_next)
+    // ==================================================================
+
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> iter_prev_node_(uint64_t ptr, NK ik,
+                                                        IK prefix, int bits) noexcept {
+        if (ptr & LEAF_BIT) {
+            const uint64_t* node = untag_leaf(ptr);
+            auto* hdr = get_header(node);
+            if (hdr->entries() == 0) return {IK{}, nullptr, false};
+            uint8_t skip = hdr->skip();
+            if (skip)
+                return iter_prev_leaf_skip_<BITS, IK>(
+                    node, hdr, ik, hdr->prefix_bytes(), skip, 0, prefix, bits);
+            return leaf_prev_<IK>(node, hdr, ik, prefix, bits);
+        }
+
+        const uint64_t* node = bm_to_node_const(ptr);
+        uint8_t sc = get_header(node)->skip();
+        if (sc > 0)
+            return iter_prev_chain_skip_<BITS, IK>(node, sc, ik, 0, prefix, bits);
+        return iter_prev_bm_final_<BITS, IK>(node, sc, ik, prefix, bits);
+    }
+
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> iter_prev_leaf_skip_(
+            const uint64_t* node, const node_header* hdr,
+            NK ik, const uint8_t* pb, uint8_t skip, uint8_t pos,
+            IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if (pos >= skip)
+            return leaf_prev_<IK>(node, hdr, ik, prefix, bits);
+
+        uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        if (kb > pb[pos]) {
+            return descend_max_leaf_skip_<BITS, IK>(
+                node, hdr, pb, skip, pos, prefix, bits);
+        }
+        if (kb < pb[pos]) return {IK{}, nullptr, false};
+
+        prefix |= IK(pb[pos]) << (IK_BITS - bits - 8);
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template iter_prev_leaf_skip_<BITS - 8, IK>(
+                    node, hdr,
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    pb, skip, pos + 1, prefix, bits + 8);
+            else
+                return iter_prev_leaf_skip_<BITS - 8, IK>(
+                    node, hdr, shifted, pb, skip, pos + 1, prefix, bits + 8);
+        }
+        __builtin_unreachable();
+    }
+
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> iter_prev_chain_skip_(
+            const uint64_t* node, uint8_t sc,
+            NK ik, uint8_t pos,
+            IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        if (pos >= sc)
+            return iter_prev_bm_final_<BITS, IK>(node, sc, ik, prefix, bits);
+
+        uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+        uint8_t sb = BO::skip_byte(node, pos);
+        if (kb > sb) {
+            return descend_max_chain_skip_<BITS, IK>(node, sc, pos, prefix, bits);
+        }
+        if (kb < sb) return {IK{}, nullptr, false};
+
+        prefix |= IK(sb) << (IK_BITS - bits - 8);
+        if constexpr (BITS > 8) {
+            NK shifted = static_cast<NK>(ik << 8);
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                return Narrow::template iter_prev_chain_skip_<BITS - 8, IK>(
+                    node, sc,
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                    pos + 1, prefix, bits + 8);
+            else
+                return iter_prev_chain_skip_<BITS - 8, IK>(
+                    node, sc, shifted, pos + 1, prefix, bits + 8);
+        }
+        __builtin_unreachable();
+    }
+
+    template<int BITS, typename IK> requires (BITS >= 8)
+    static iter_ops_result_t<IK, VST> iter_prev_bm_final_(
+            const uint64_t* node, uint8_t sc,
+            NK ik, IK prefix, int bits) noexcept {
+        constexpr int IK_BITS = sizeof(IK) * 8;
+        const bitmap256& fbm = BO::chain_bitmap(node, sc);
+        const uint64_t* children = BO::chain_children(node, sc);
+        uint8_t byte = static_cast<uint8_t>(ik >> (NK_BITS - 8));
+
+        if (fbm.has_bit(byte)) {
+            int slot = fbm.template find_slot<slot_mode::UNFILTERED>(byte);
+            IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
+
+            if constexpr (BITS > 8) {
+                NK shifted = static_cast<NK>(ik << 8);
+                iter_ops_result_t<IK, VST> r;
+                if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                    r = Narrow::template iter_prev_node_<BITS - 8, IK>(
+                        children[slot],
+                        static_cast<NNK>(shifted >> (NK_BITS / 2)),
+                        cp, bits + 8);
+                else
+                    r = iter_prev_node_<BITS - 8, IK>(
+                        children[slot], shifted, cp, bits + 8);
+                if (r.found) return r;
+            }
+        }
+
+        auto adj = fbm.prev_set_before(byte);
+        if (adj.found) {
+            IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
+            if constexpr (BITS > 8) {
+                if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                    return Narrow::template descend_max_<BITS - 8, IK>(
+                        children[adj.slot], np, bits + 8);
+                else
+                    return descend_max_<BITS - 8, IK>(
+                        children[adj.slot], np, bits + 8);
+            }
+        }
+        return {IK{}, nullptr, false};
+    }
+
+    // ==================================================================
     // NK-independent helpers (shared across all NK specializations)
     // ==================================================================
 

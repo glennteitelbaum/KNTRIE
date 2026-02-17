@@ -173,329 +173,39 @@ public:
 
     iter_result_t iter_first_() const noexcept {
         if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
-        return descend_min_(root_, IK{0}, 0);
+        auto r = Ops::template descend_min_<KEY_BITS, IK>(root_, IK{0}, 0);
+        if (!r.found) return {KEY{}, VALUE{}, false};
+        return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
     }
 
     iter_result_t iter_last_() const noexcept {
         if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
-        return descend_max_(root_, IK{0}, 0);
+        auto r = Ops::template descend_max_<KEY_BITS, IK>(root_, IK{0}, 0);
+        if (!r.found) return {KEY{}, VALUE{}, false};
+        return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
     }
 
     iter_result_t iter_next_(KEY key) const noexcept {
         if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
-        return iter_next_node_(root_, KO::to_internal(key), IK{0}, 0);
+        IK ik = KO::to_internal(key);
+        NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
+        auto r = Ops::template iter_next_node_<KEY_BITS, IK>(
+            root_, nk, IK{0}, 0);
+        if (!r.found) return {KEY{}, VALUE{}, false};
+        return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
     }
 
     iter_result_t iter_prev_(KEY key) const noexcept {
         if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
-        return iter_prev_node_(root_, KO::to_internal(key), IK{0}, 0);
+        IK ik = KO::to_internal(key);
+        NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
+        auto r = Ops::template iter_prev_node_<KEY_BITS, IK>(
+            root_, nk, IK{0}, 0);
+        if (!r.found) return {KEY{}, VALUE{}, false};
+        return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
     }
 
 private:
-    // ==================================================================
-    // Iterator helpers (private)
-    // ==================================================================
-
-    // Recursive: find smallest key > ik in subtree at ptr
-    iter_result_t iter_next_node_(uint64_t ptr, IK ik, IK prefix, int bits) const noexcept {
-        // --- LEAF ---
-        if (ptr & LEAF_BIT) {
-            const uint64_t* node = untag_leaf(ptr);
-            node_header hdr = *get_header(node);
-            if (hdr.entries() == 0) return {KEY{}, VALUE{}, false};
-
-            size_t hs = 1;
-            if (hdr.is_skip()) {
-                hs = 2;
-                const uint8_t* sb = reinterpret_cast<const uint8_t*>(&node[1]);
-                uint8_t skip = hdr.skip();
-                for (uint8_t i = 0; i < skip; ++i) {
-                    uint8_t kb = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-                    if (kb < sb[i]) {
-                        for (uint8_t j = i; j < skip; ++j) {
-                            prefix |= IK(sb[j]) << (IK_BITS - bits - 8);
-                            bits += 8;
-                        }
-                        return leaf_first_(node, hdr, prefix, bits, hs);
-                    }
-                    if (kb > sb[i]) return {KEY{}, VALUE{}, false};
-                    prefix |= IK(sb[i]) << (IK_BITS - bits - 8);
-                    bits += 8;
-                    ik <<= 8;
-                }
-            }
-            return leaf_next_dispatch_(node, hdr, ik, prefix, bits, hs);
-        }
-
-        // --- BITMASK ---
-        const auto& bitmap = BO::bitmap_ref(ptr);
-        uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-
-        if (bitmap.has_bit(byte)) {
-            int slot = bitmap.template find_slot<slot_mode::UNFILTERED>(byte);
-            IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
-            auto r = iter_next_node_(BO::child_at(ptr, slot),
-                                     static_cast<IK>(ik << 8), cp, bits + 8);
-            if (r.found) return r;
-            // Child exhausted — fall through to next sibling
-        }
-
-        auto adj = bitmap.next_set_after(byte);
-        if (adj.found) {
-            IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
-            return descend_min_(BO::child_at(ptr, adj.slot), np, bits + 8);
-        }
-        return {KEY{}, VALUE{}, false};
-    }
-
-    // Recursive: find largest key < ik in subtree at ptr
-    iter_result_t iter_prev_node_(uint64_t ptr, IK ik, IK prefix, int bits) const noexcept {
-        // --- LEAF ---
-        if (ptr & LEAF_BIT) {
-            const uint64_t* node = untag_leaf(ptr);
-            node_header hdr = *get_header(node);
-            if (hdr.entries() == 0) return {KEY{}, VALUE{}, false};
-
-            size_t hs = 1;
-            if (hdr.is_skip()) {
-                hs = 2;
-                const uint8_t* sb = reinterpret_cast<const uint8_t*>(&node[1]);
-                uint8_t skip = hdr.skip();
-                for (uint8_t i = 0; i < skip; ++i) {
-                    uint8_t kb = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-                    if (kb > sb[i]) {
-                        for (uint8_t j = i; j < skip; ++j) {
-                            prefix |= IK(sb[j]) << (IK_BITS - bits - 8);
-                            bits += 8;
-                        }
-                        return leaf_last_(node, hdr, prefix, bits, hs);
-                    }
-                    if (kb < sb[i]) return {KEY{}, VALUE{}, false};
-                    prefix |= IK(sb[i]) << (IK_BITS - bits - 8);
-                    bits += 8;
-                    ik <<= 8;
-                }
-            }
-            return leaf_prev_dispatch_(node, hdr, ik, prefix, bits, hs);
-        }
-
-        // --- BITMASK ---
-        const auto& bitmap = BO::bitmap_ref(ptr);
-        uint8_t byte = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-
-        if (bitmap.has_bit(byte)) {
-            int slot = bitmap.template find_slot<slot_mode::UNFILTERED>(byte);
-            IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
-            auto r = iter_prev_node_(BO::child_at(ptr, slot),
-                                     static_cast<IK>(ik << 8), cp, bits + 8);
-            if (r.found) return r;
-            // Child exhausted — fall through to prev sibling
-        }
-
-        auto adj = bitmap.prev_set_before(byte);
-        if (adj.found) {
-            IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
-            return descend_max_(BO::child_at(ptr, adj.slot), np, bits + 8);
-        }
-        return {KEY{}, VALUE{}, false};
-    }
-    // ==================================================================
-
-    // Reconstruct full IK from prefix + suffix
-    static IK combine_suffix_(IK prefix, int bits, uint8_t st, uint64_t suffix_val) noexcept {
-        IK suffix_ik;
-        switch (st) {
-            case 0: suffix_ik = IK(suffix_val) << (IK_BITS - 8); break;
-            case 1: suffix_ik = IK(suffix_val) << (IK_BITS - 16); break;
-            case 2: suffix_ik = IK(suffix_val) << (IK_BITS - 32); break;
-            default: suffix_ik = IK(suffix_val); break;
-        }
-        return prefix | (suffix_ik >> bits);
-    }
-
-    // Descend always-min from tagged ptr
-    iter_result_t descend_min_(uint64_t ptr, IK prefix, int bits) const noexcept {
-        while (!(ptr & LEAF_BIT)) {
-            const auto& bitmap = BO::bitmap_ref(ptr);
-            uint8_t byte = bitmap.first_set_bit();
-            prefix |= IK(byte) << (IK_BITS - bits - 8);
-            bits += 8;
-            ptr = BO::first_child(ptr);
-        }
-        const uint64_t* node = untag_leaf(ptr);
-        node_header hdr = *get_header(node);
-        if (hdr.entries() == 0) return {KEY{}, VALUE{}, false};
-        size_t hs = 1;
-        if (hdr.is_skip()) {
-            hs = 2;
-            const uint8_t* sb = reinterpret_cast<const uint8_t*>(&node[1]);
-            for (uint8_t i = 0; i < hdr.skip(); ++i) {
-                prefix |= IK(sb[i]) << (IK_BITS - bits - 8);
-                bits += 8;
-            }
-        }
-        return leaf_first_(node, hdr, prefix, bits, hs);
-    }
-
-    // Descend always-max from tagged ptr
-    iter_result_t descend_max_(uint64_t ptr, IK prefix, int bits) const noexcept {
-        while (!(ptr & LEAF_BIT)) {
-            const auto& bitmap = BO::bitmap_ref(ptr);
-            uint8_t byte = bitmap.last_set_bit();
-            int slot = bitmap.template find_slot<slot_mode::UNFILTERED>(byte);
-            prefix |= IK(byte) << (IK_BITS - bits - 8);
-            bits += 8;
-            ptr = BO::child_at(ptr, slot);
-        }
-        const uint64_t* node = untag_leaf(ptr);
-        node_header hdr = *get_header(node);
-        if (hdr.entries() == 0) return {KEY{}, VALUE{}, false};
-        size_t hs = 1;
-        if (hdr.is_skip()) {
-            hs = 2;
-            const uint8_t* sb = reinterpret_cast<const uint8_t*>(&node[1]);
-            for (uint8_t i = 0; i < hdr.skip(); ++i) {
-                prefix |= IK(sb[i]) << (IK_BITS - bits - 8);
-                bits += 8;
-            }
-        }
-        return leaf_last_(node, hdr, prefix, bits, hs);
-    }
-
-    // Leaf first/last/next/prev dispatch by suffix type
-    iter_result_t leaf_first_(const uint64_t* node, node_header hdr,
-                               IK prefix, int bits, size_t hs) const noexcept {
-        uint8_t st = hdr.suffix_type();
-        if (st == 0) {
-            auto r = BO::bitmap_iter_first(node, hs);
-            return {KO::to_key(combine_suffix_(prefix, bits, 0, r.suffix)),
-                    *VT::as_ptr(*r.value), true};
-        }
-        if (st == 1) {
-            auto r = CO16::iter_first(node, &hdr);
-            if (!r.found) return {KEY{}, VALUE{}, false};
-            return {KO::to_key(combine_suffix_(prefix, bits, 1, r.suffix)),
-                    *VT::as_ptr(*r.value), true};
-        }
-        if constexpr (KEY_BITS > 16) {
-            if (st == 2) {
-                auto r = CO32::iter_first(node, &hdr);
-                if (!r.found) return {KEY{}, VALUE{}, false};
-                return {KO::to_key(combine_suffix_(prefix, bits, 2, r.suffix)),
-                        *VT::as_ptr(*r.value), true};
-            }
-            if constexpr (KEY_BITS > 32) {
-                auto r = CO64::iter_first(node, &hdr);
-                if (!r.found) return {KEY{}, VALUE{}, false};
-                return {KO::to_key(combine_suffix_(prefix, bits, 3, r.suffix)),
-                        *VT::as_ptr(*r.value), true};
-            }
-        }
-        __builtin_unreachable();
-    }
-
-    iter_result_t leaf_last_(const uint64_t* node, node_header hdr,
-                              IK prefix, int bits, size_t hs) const noexcept {
-        uint8_t st = hdr.suffix_type();
-        if (st == 0) {
-            auto r = BO::bitmap_iter_last(node, hdr, hs);
-            return {KO::to_key(combine_suffix_(prefix, bits, 0, r.suffix)),
-                    *VT::as_ptr(*r.value), true};
-        }
-        if (st == 1) {
-            auto r = CO16::iter_last(node, &hdr);
-            if (!r.found) return {KEY{}, VALUE{}, false};
-            return {KO::to_key(combine_suffix_(prefix, bits, 1, r.suffix)),
-                    *VT::as_ptr(*r.value), true};
-        }
-        if constexpr (KEY_BITS > 16) {
-            if (st == 2) {
-                auto r = CO32::iter_last(node, &hdr);
-                if (!r.found) return {KEY{}, VALUE{}, false};
-                return {KO::to_key(combine_suffix_(prefix, bits, 2, r.suffix)),
-                        *VT::as_ptr(*r.value), true};
-            }
-            if constexpr (KEY_BITS > 32) {
-                auto r = CO64::iter_last(node, &hdr);
-                if (!r.found) return {KEY{}, VALUE{}, false};
-                return {KO::to_key(combine_suffix_(prefix, bits, 3, r.suffix)),
-                        *VT::as_ptr(*r.value), true};
-            }
-        }
-        __builtin_unreachable();
-    }
-
-    iter_result_t leaf_next_dispatch_(const uint64_t* node, node_header hdr,
-                                       IK ik, IK prefix, int bits, size_t hs) const noexcept {
-        uint8_t st = hdr.suffix_type();
-        if (st == 0) {
-            uint8_t suf = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-            auto r = BO::bitmap_iter_next(node, suf, hs);
-            if (!r.found) return {KEY{}, VALUE{}, false};
-            return {KO::to_key(combine_suffix_(prefix, bits, 0, r.suffix)),
-                    *VT::as_ptr(*r.value), true};
-        }
-        if (st == 1) {
-            auto suf = static_cast<uint16_t>(ik >> (IK_BITS - 16));
-            auto r = CO16::iter_next(node, &hdr, suf);
-            if (!r.found) return {KEY{}, VALUE{}, false};
-            return {KO::to_key(combine_suffix_(prefix, bits, 1, r.suffix)),
-                    *VT::as_ptr(*r.value), true};
-        }
-        if constexpr (KEY_BITS > 16) {
-            if (st == 2) {
-                auto suf = static_cast<uint32_t>(ik >> (IK_BITS - 32));
-                auto r = CO32::iter_next(node, &hdr, suf);
-                if (!r.found) return {KEY{}, VALUE{}, false};
-                return {KO::to_key(combine_suffix_(prefix, bits, 2, r.suffix)),
-                        *VT::as_ptr(*r.value), true};
-            }
-            if constexpr (KEY_BITS > 32) {
-                auto suf = static_cast<uint64_t>(ik);
-                auto r = CO64::iter_next(node, &hdr, suf);
-                if (!r.found) return {KEY{}, VALUE{}, false};
-                return {KO::to_key(combine_suffix_(prefix, bits, 3, r.suffix)),
-                        *VT::as_ptr(*r.value), true};
-            }
-        }
-        __builtin_unreachable();
-    }
-
-    iter_result_t leaf_prev_dispatch_(const uint64_t* node, node_header hdr,
-                                       IK ik, IK prefix, int bits, size_t hs) const noexcept {
-        uint8_t st = hdr.suffix_type();
-        if (st == 0) {
-            uint8_t suf = static_cast<uint8_t>(ik >> (IK_BITS - 8));
-            auto r = BO::bitmap_iter_prev(node, suf, hs);
-            if (!r.found) return {KEY{}, VALUE{}, false};
-            return {KO::to_key(combine_suffix_(prefix, bits, 0, r.suffix)),
-                    *VT::as_ptr(*r.value), true};
-        }
-        if (st == 1) {
-            auto suf = static_cast<uint16_t>(ik >> (IK_BITS - 16));
-            auto r = CO16::iter_prev(node, &hdr, suf);
-            if (!r.found) return {KEY{}, VALUE{}, false};
-            return {KO::to_key(combine_suffix_(prefix, bits, 1, r.suffix)),
-                    *VT::as_ptr(*r.value), true};
-        }
-        if constexpr (KEY_BITS > 16) {
-            if (st == 2) {
-                auto suf = static_cast<uint32_t>(ik >> (IK_BITS - 32));
-                auto r = CO32::iter_prev(node, &hdr, suf);
-                if (!r.found) return {KEY{}, VALUE{}, false};
-                return {KO::to_key(combine_suffix_(prefix, bits, 2, r.suffix)),
-                        *VT::as_ptr(*r.value), true};
-            }
-            if constexpr (KEY_BITS > 32) {
-                auto suf = static_cast<uint64_t>(ik);
-                auto r = CO64::iter_prev(node, &hdr, suf);
-                if (!r.found) return {KEY{}, VALUE{}, false};
-                return {KO::to_key(combine_suffix_(prefix, bits, 3, r.suffix)),
-                        *VT::as_ptr(*r.value), true};
-            }
-        }
-        __builtin_unreachable();
-    }
     // ==================================================================
     // Insert dispatch (shared by insert / insert_or_assign / assign)
     // ==================================================================
