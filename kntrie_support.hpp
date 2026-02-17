@@ -97,22 +97,16 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 // ==========================================================================
 
 struct node_header {
-    uint8_t  flags_       = 0;
-    uint8_t  suffix_type_ = 0;
+    uint8_t  skip_count_  = 0;  // max 6, bits 3-7 free
+    uint8_t  reserved_    = 0;
     uint16_t entries_     = 0;
     uint16_t alloc_u64_   = 0;
     uint16_t total_slots_ = 0;
 
-    static constexpr uint8_t BITMASK_BIT = 1 << 0;
-
-    // --- type ---
-    bool is_leaf()    const noexcept { return !(flags_ & BITMASK_BIT); }
-    void set_bitmask()      noexcept { flags_ |= BITMASK_BIT; }
-
-    // --- skip (bits 1-3 of flags_) ---
-    uint8_t skip()    const noexcept { return (flags_ >> 1) & 0x07; }
-    bool    is_skip() const noexcept { return flags_ & 0x0E; }
-    void set_skip(uint8_t s) noexcept { flags_ = (flags_ & 0x01) | ((s & 0x07) << 1); }
+    // --- skip ---
+    uint8_t skip()    const noexcept { return skip_count_ & 0x07; }
+    bool    is_skip() const noexcept { return skip_count_ & 0x07; }
+    void set_skip(uint8_t s) noexcept { skip_count_ = (s & 0x07); }
 
     // --- leaf prefix bytes (in node[1], only valid via get_header(node)->) ---
     const uint8_t* prefix_bytes() const noexcept {
@@ -126,9 +120,6 @@ struct node_header {
     }
 
     // --- entries / alloc ---
-    uint8_t suffix_type() const noexcept { return suffix_type_; }
-    void set_suffix_type(uint8_t t) noexcept { suffix_type_ = t; }
-
     unsigned entries()   const noexcept { return entries_; }
     void set_entries(unsigned n) noexcept { entries_ = static_cast<uint16_t>(n); }
 

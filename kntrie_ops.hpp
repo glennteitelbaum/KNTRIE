@@ -1682,6 +1682,7 @@ struct kntrie_ops {
     }
 
     // ==================================================================
+    // ==================================================================
     // Subtree deallocation (no value destruction)
     // ==================================================================
 
@@ -1698,6 +1699,177 @@ struct kntrie_ops {
             dealloc_bitmask_subtree_(child, alloc);
         });
         dealloc_node(alloc, node, hdr->alloc_u64());
+    }
+
+    // ==================================================================
+    // Destroy leaf: compile-time NK dispatch (replaces suffix_type switch)
+    // ==================================================================
+
+    static void destroy_leaf_(uint64_t* node, ALLOC& alloc) noexcept {
+        if constexpr (sizeof(NK) == 1)
+            BO::bitmap_destroy_and_dealloc(node, alloc);
+        else
+            CO::destroy_and_dealloc(node, alloc);
+    }
+
+    // ==================================================================
+    // Remove subtree: recursive with compile-time NK narrowing
+    // Replaces impl::remove_node_ + destroy_leaf_ (eliminates suffix_type)
+    // ==================================================================
+
+    template<int BITS> requires (BITS >= 8)
+    static void remove_subtree_(uint64_t tagged, ALLOC& alloc) noexcept {
+        if (tagged == SENTINEL_TAGGED) return;
+
+        if (tagged & LEAF_BIT) {
+            uint64_t* node = untag_leaf_mut(tagged);
+            auto* hdr = get_header(node);
+            uint8_t skip = hdr->skip();
+            if (skip)
+                remove_leaf_skip_<BITS>(node, skip, alloc);
+            else
+                destroy_leaf_(node, alloc);
+            return;
+        }
+
+        uint64_t* node = bm_to_node(tagged);
+        auto* hdr = get_header(node);
+        uint8_t sc = hdr->skip();
+        if (sc > 0)
+            remove_chain_skip_<BITS>(node, sc, 0, alloc);
+        else
+            remove_bm_final_<BITS>(node, sc, alloc);
+        BO::dealloc_bitmask(node, alloc);
+    }
+
+    // Leaf skip: consume prefix bytes, narrow NK, then destroy
+    template<int BITS> requires (BITS >= 8)
+    static void remove_leaf_skip_(uint64_t* node, uint8_t skip,
+                                   ALLOC& alloc) noexcept {
+        if (skip == 0) {
+            destroy_leaf_(node, alloc);
+            return;
+        }
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                Narrow::template remove_leaf_skip_<BITS - 8>(node, skip - 1, alloc);
+            else
+                remove_leaf_skip_<BITS - 8>(node, skip - 1, alloc);
+        }
+    }
+
+    // Chain embed: consume skip bytes, narrow, then final bitmap
+    template<int BITS> requires (BITS >= 8)
+    static void remove_chain_skip_(uint64_t* node, uint8_t sc, uint8_t pos,
+                                    ALLOC& alloc) noexcept {
+        if (pos >= sc) {
+            remove_bm_final_<BITS>(node, sc, alloc);
+            return;
+        }
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                Narrow::template remove_chain_skip_<BITS - 8>(node, sc, pos + 1, alloc);
+            else
+                remove_chain_skip_<BITS - 8>(node, sc, pos + 1, alloc);
+        }
+    }
+
+    // Final bitmap: recurse each child with narrowing
+    template<int BITS> requires (BITS >= 8)
+    static void remove_bm_final_(uint64_t* node, uint8_t sc,
+                                  ALLOC& alloc) noexcept {
+        BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
+            if constexpr (BITS > 8) {
+                if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                    Narrow::template remove_subtree_<BITS - 8>(child, alloc);
+                else
+                    remove_subtree_<BITS - 8>(child, alloc);
+            }
+        });
+    }
+
+    // ==================================================================
+    // Stats collection: compile-time NK narrowing (replaces suffix_type)
+    // ==================================================================
+
+    struct stats_t {
+        size_t total_bytes    = 0;
+        size_t total_entries  = 0;
+        size_t bitmap_leaves  = 0;
+        size_t compact_leaves = 0;
+        size_t bitmask_nodes  = 0;
+    };
+
+    template<int BITS> requires (BITS >= 8)
+    static void collect_stats_(uint64_t tagged, stats_t& s) noexcept {
+        if (tagged & LEAF_BIT) {
+            const uint64_t* node = untag_leaf(tagged);
+            auto* hdr = get_header(node);
+            s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
+            s.total_entries += hdr->entries();
+            uint8_t skip = hdr->skip();
+            if (skip)
+                stats_leaf_skip_<BITS>(node, skip, s);
+            else {
+                if constexpr (sizeof(NK) == 1) s.bitmap_leaves++;
+                else                           s.compact_leaves++;
+            }
+            return;
+        }
+
+        const uint64_t* node = bm_to_node_const(tagged);
+        auto* hdr = get_header(node);
+        s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
+        s.bitmask_nodes++;
+        uint8_t sc = hdr->skip();
+        if (sc > 0)
+            stats_chain_skip_<BITS>(node, sc, 0, s);
+        else
+            stats_bm_final_<BITS>(node, sc, s);
+    }
+
+    template<int BITS> requires (BITS >= 8)
+    static void stats_leaf_skip_(const uint64_t*, uint8_t skip,
+                                  stats_t& s) noexcept {
+        if (skip == 0) {
+            if constexpr (sizeof(NK) == 1) s.bitmap_leaves++;
+            else                           s.compact_leaves++;
+            return;
+        }
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                Narrow::template stats_leaf_skip_<BITS - 8>(nullptr, skip - 1, s);
+            else
+                stats_leaf_skip_<BITS - 8>(nullptr, skip - 1, s);
+        }
+    }
+
+    template<int BITS> requires (BITS >= 8)
+    static void stats_chain_skip_(const uint64_t* node, uint8_t sc, uint8_t pos,
+                                   stats_t& s) noexcept {
+        if (pos >= sc) {
+            stats_bm_final_<BITS>(node, sc, s);
+            return;
+        }
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                Narrow::template stats_chain_skip_<BITS - 8>(node, sc, pos + 1, s);
+            else
+                stats_chain_skip_<BITS - 8>(node, sc, pos + 1, s);
+        }
+    }
+
+    template<int BITS> requires (BITS >= 8)
+    static void stats_bm_final_(const uint64_t* node, uint8_t sc,
+                                 stats_t& s) noexcept {
+        BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
+            if constexpr (BITS > 8) {
+                if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                    Narrow::template collect_stats_<BITS - 8>(child, s);
+                else
+                    collect_stats_<BITS - 8>(child, s);
+            }
+        });
     }
 };
 

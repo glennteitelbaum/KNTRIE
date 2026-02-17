@@ -417,7 +417,6 @@ struct bitmask_ops {
         nh->set_entries(n_children);
         nh->set_alloc_u64(au64);
         nh->set_skip(0);
-        nh->set_bitmask();
 
         bm_mut_(nn, hs) = bm;
         children_mut_(nn, hs)[0] = SENTINEL_TAGGED;
@@ -461,7 +460,6 @@ struct bitmask_ops {
         nh->set_entries(final_n_children);
         nh->set_alloc_u64(au64);
         nh->set_skip(skip_count);
-        nh->set_bitmask();
 
         // Build each embed: bitmap(4) + sentinel(1) + child_ptr(1)
         for (uint8_t e = 0; e < skip_count; ++e) {
@@ -836,7 +834,6 @@ struct bitmask_ops {
         auto* h = get_header(node);
         h->set_entries(count);
         h->set_alloc_u64(sz);
-        h->set_suffix_type(0);  // bitmap256 leaf
         bitmap256& bm = bm_mut_(node, hs);
         bm = bitmap256{};
         for (unsigned i = 0; i < count; ++i) bm.set_bit(sorted_suffixes[i]);
@@ -857,7 +854,6 @@ struct bitmask_ops {
         auto* h = get_header(node);
         h->set_entries(1);
         h->set_alloc_u64(sz);
-        h->set_suffix_type(0);
         bm_mut_(node, hs).set_bit(suffix);
         VT::write_slot(&bl_vals_mut_(node, hs)[0], value);
         return node;

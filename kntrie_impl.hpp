@@ -23,9 +23,6 @@ private:
     using VT   = value_traits<VALUE, ALLOC>;
     using VST  = typename VT::slot_type;
     using BO   = bitmask_ops<VALUE, ALLOC>;
-    using CO16 = compact_ops<uint16_t, VALUE, ALLOC>;
-    using CO32 = compact_ops<uint32_t, VALUE, ALLOC>;
-    using CO64 = compact_ops<uint64_t, VALUE, ALLOC>;
 
     static constexpr int IK_BITS  = KO::IK_BITS;
     static constexpr int KEY_BITS = KO::KEY_BITS;
@@ -238,47 +235,10 @@ private:
 
     void remove_all_() noexcept {
         if (root_ != SENTINEL_TAGGED) {
-            remove_node_(root_);
+            Ops::template remove_subtree_<KEY_BITS>(root_, alloc_);
             root_ = SENTINEL_TAGGED;
         }
         size_ = 0;
-    }
-
-    void remove_node_(uint64_t tagged) noexcept {
-        if (tagged == SENTINEL_TAGGED) return;
-
-        if (tagged & LEAF_BIT) {
-            uint64_t* node = untag_leaf_mut(tagged);
-            auto* hdr = get_header(node);
-            destroy_leaf_(node, hdr);
-        } else {
-            uint64_t* node = bm_to_node(tagged);
-            auto* hdr = get_header(node);
-            uint8_t sc = hdr->skip();
-
-            // For skip chains: only recurse into final bitmask's children
-            // (embeds are internal pointers within the same allocation)
-            BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
-                remove_node_(child);
-            });
-
-            BO::dealloc_bitmask(node, alloc_);
-        }
-    }
-
-    void destroy_leaf_(uint64_t* node, node_header* hdr) noexcept {
-        switch (hdr->suffix_type()) {
-            case 0: BO::bitmap_destroy_and_dealloc(node, alloc_); break;
-            case 1: CO16::destroy_and_dealloc(node, alloc_); break;
-            case 2:
-                if constexpr (KEY_BITS > 16)
-                    CO32::destroy_and_dealloc(node, alloc_);
-                break;
-            case 3:
-                if constexpr (KEY_BITS > 32)
-                    CO64::destroy_and_dealloc(node, alloc_);
-                break;
-        }
     }
 
     // ==================================================================
@@ -286,26 +246,13 @@ private:
     // ==================================================================
 
     void collect_stats_(uint64_t tagged, debug_stats_t& s) const noexcept {
-        if (tagged & LEAF_BIT) {
-            const uint64_t* node = untag_leaf(tagged);
-            auto* hdr = get_header(node);
-            s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
-            s.total_entries += hdr->entries();
-            if (hdr->suffix_type() == 0)
-                s.bitmap_leaves++;
-            else
-                s.compact_leaves++;
-        } else {
-            const uint64_t* node = bm_to_node_const(tagged);
-            auto* hdr = get_header(node);
-            s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
-            s.bitmask_nodes++;
-
-            uint8_t sc = hdr->skip();
-            BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
-                collect_stats_(child, s);
-            });
-        }
+        typename Ops::stats_t os{};
+        Ops::template collect_stats_<KEY_BITS>(tagged, os);
+        s.total_bytes    += os.total_bytes;
+        s.total_entries  += os.total_entries;
+        s.bitmap_leaves  += os.bitmap_leaves;
+        s.compact_leaves += os.compact_leaves;
+        s.bitmask_nodes  += os.bitmask_nodes;
     }
 };
 

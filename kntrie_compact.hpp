@@ -97,7 +97,6 @@ struct compact_ops {
         h->set_entries(count);
         h->set_alloc_u64(au64);
         h->set_total_slots(ts);
-        h->set_suffix_type(STYPE);
         h->set_skip(skip);
         if (skip > 0) h->set_prefix(prefix, skip);
 
