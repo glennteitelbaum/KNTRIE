@@ -11,7 +11,7 @@ namespace gteitelbaum {
 
 enum class slot_mode { FAST_EXIT, BRANCHLESS, UNFILTERED };
 
-struct bitmap256 {
+struct bitmap_256_t {
     uint64_t words[4] = {0, 0, 0, 0};
 
     bool has_bit(uint8_t i) const noexcept { return words[i >> 6] & (1ULL << (i & 63)); }
@@ -138,14 +138,14 @@ struct bitmap256 {
         return {0, 0, false};
     }
 
-    static bitmap256 from_indices(const uint8_t* indices, unsigned count) noexcept {
-        bitmap256 bm{};
+    static bitmap_256_t from_indices(const uint8_t* indices, unsigned count) noexcept {
+        bitmap_256_t bm{};
         for (unsigned i = 0; i < count; ++i) bm.set_bit(indices[i]);
         return bm;
     }
 
     // Fill dest in bitmap order from unsorted (indices, tagged_ptrs)
-    static void arr_fill_sorted(const bitmap256& bm, uint64_t* dest,
+    static void arr_fill_sorted(const bitmap_256_t& bm, uint64_t* dest,
                                 const uint8_t* indices, const uint64_t* tagged_ptrs,
                                 unsigned count) noexcept {
         for (unsigned i = 0; i < count; ++i)
@@ -153,7 +153,7 @@ struct bitmap256 {
     }
 
     // In-place insert: memmove right, write new entry, set bit
-    static void arr_insert(bitmap256& bm, uint64_t* arr, unsigned count,
+    static void arr_insert(bitmap_256_t& bm, uint64_t* arr, unsigned count,
                            uint8_t idx, uint64_t val) noexcept {
         int isl = bm.find_slot<slot_mode::UNFILTERED>(idx);
         std::memmove(arr + isl + 1, arr + isl, (count - isl) * sizeof(uint64_t));
@@ -162,7 +162,7 @@ struct bitmap256 {
     }
 
     // In-place remove: memmove left, clear bit
-    static void arr_remove(bitmap256& bm, uint64_t* arr, unsigned count,
+    static void arr_remove(bitmap_256_t& bm, uint64_t* arr, unsigned count,
                            int slot, uint8_t idx) noexcept {
         std::memmove(arr + slot, arr + slot + 1, (count - 1 - slot) * sizeof(uint64_t));
         bm.clear_bit(idx);
@@ -187,7 +187,7 @@ struct bitmap256 {
 };
 
 // ==========================================================================
-// bitmask_ops  -- unified bitmask node + bitmap256 leaf operations
+// bitmask_ops  -- unified bitmask node + bitmap_256_t leaf operations
 //
 // Bitmask node (internal): [header(1)][bitmap(4)][sentinel(1)][children(n)][desc(n u16)]
 //   - Parent pointer targets &node[1] (bitmap), no LEAF_BIT
@@ -212,13 +212,13 @@ struct bitmask_ops {
     // ==================================================================
 
     static constexpr size_t bitmask_size_u64(size_t n_children, size_t hu = HEADER_U64) noexcept {
-        return hu + BITMAP256_U64 + 1 + n_children + desc_u64(n_children);
+        return hu + BITMAP_256_U64 + 1 + n_children + desc_u64(n_children);
     }
 
     static constexpr size_t bitmap_leaf_size_u64(size_t count, size_t hu = HEADER_U64) noexcept {
         size_t vb = count * sizeof(VST);
         vb = (vb + 7) & ~size_t{7};
-        return hu + BITMAP256_U64 + vb / 8;
+        return hu + BITMAP_256_U64 + vb / 8;
     }
 
     // ==================================================================
@@ -228,9 +228,9 @@ struct bitmask_ops {
     // ==================================================================
 
     static uint64_t branchless_find_tagged(const uint64_t* bm_ptr, uint8_t idx) noexcept {
-        const bitmap256& bm = *reinterpret_cast<const bitmap256*>(bm_ptr);
+        const bitmap_256_t& bm = *reinterpret_cast<const bitmap_256_t*>(bm_ptr);
         int slot = bm.find_slot<slot_mode::BRANCHLESS>(idx);  // 0 on miss -> sentinel
-        return bm_ptr[BITMAP256_U64 + slot];  // [0-3]=bitmap, [4]=sentinel, [5+]=children
+        return bm_ptr[BITMAP_256_U64 + slot];  // [0-3]=bitmap, [4]=sentinel, [5+]=children
     }
 
     // ==================================================================
@@ -244,7 +244,7 @@ struct bitmask_ops {
     };
 
     static child_lookup lookup(const uint64_t* node, uint8_t idx) noexcept {
-        return lookup_at_(node, 1, idx);
+        return lookup_at(node, 1, idx);
     }
 
     // ==================================================================
@@ -252,7 +252,7 @@ struct bitmask_ops {
     // ==================================================================
 
     static void set_child(uint64_t* node, int slot, uint64_t tagged_ptr) noexcept {
-        real_children_mut_(node, 1)[slot] = tagged_ptr;
+        real_children_mut(node, 1)[slot] = tagged_ptr;
     }
 
     // ==================================================================
@@ -261,7 +261,7 @@ struct bitmask_ops {
 
     // Read single skip byte at embed position e (0-based)
     static uint8_t skip_byte(const uint64_t* node, uint8_t e) noexcept {
-        const auto* embed_bm = reinterpret_cast<const bitmap256*>(node + 1 + static_cast<size_t>(e) * 6);
+        const auto* embed_bm = reinterpret_cast<const bitmap_256_t*>(node + 1 + static_cast<size_t>(e) * 6);
         return embed_bm->single_bit_index();
     }
 
@@ -273,32 +273,32 @@ struct bitmask_ops {
 
     // Lookup in the final bitmap of a skip chain
     static child_lookup chain_lookup(const uint64_t* node, uint8_t sc, uint8_t idx) noexcept {
-        return lookup_at_(node, chain_hs_(sc), idx);
+        return lookup_at(node, chain_hs(sc), idx);
     }
 
     // Read tagged child at slot in final bitmap of skip chain
     static uint64_t chain_child(const uint64_t* node, uint8_t sc, int slot) noexcept {
-        return real_children_(node, chain_hs_(sc))[slot];
+        return real_children(node, chain_hs(sc))[slot];
     }
 
     // Write tagged child at slot in final bitmap of skip chain
     static void chain_set_child(uint64_t* node, uint8_t sc, int slot, uint64_t tagged) noexcept {
-        real_children_mut_(node, chain_hs_(sc))[slot] = tagged;
+        real_children_mut(node, chain_hs(sc))[slot] = tagged;
     }
 
     // Desc array of final bitmap (const)
     static const uint16_t* chain_desc_array(const uint64_t* node, uint8_t sc, unsigned nc) noexcept {
-        return desc_array_(node, chain_hs_(sc), nc);
+        return desc_array(node, chain_hs(sc), nc);
     }
 
     // Desc array of final bitmap (mutable)
     static uint16_t* chain_desc_array_mut(uint64_t* node, uint8_t sc, unsigned nc) noexcept {
-        return desc_array_mut_(node, chain_hs_(sc), nc);
+        return desc_array_mut(node, chain_hs(sc), nc);
     }
 
     // Final bitmap reference (const)
-    static const bitmap256& chain_bitmap(const uint64_t* node, uint8_t sc) noexcept {
-        return bm_(node, chain_hs_(sc));
+    static const bitmap_256_t& chain_bitmap(const uint64_t* node, uint8_t sc) noexcept {
+        return bm(node, chain_hs(sc));
     }
 
     // Number of children in final bitmap
@@ -308,18 +308,18 @@ struct bitmask_ops {
 
     // Pointer to real children array in final bitmap
     static const uint64_t* chain_children(const uint64_t* node, uint8_t sc) noexcept {
-        return real_children_(node, chain_hs_(sc));
+        return real_children(node, chain_hs(sc));
     }
     static uint64_t* chain_children_mut(uint64_t* node, uint8_t sc) noexcept {
-        return real_children_mut_(node, chain_hs_(sc));
+        return real_children_mut(node, chain_hs(sc));
     }
 
     // Iterate final bitmap children: cb(slot, tagged_child)
     template<typename Fn>
     static void chain_for_each_child(const uint64_t* node, uint8_t sc, Fn&& cb) noexcept {
-        size_t hs = chain_hs_(sc);
-        unsigned nc = static_cast<unsigned>(bm_(node, hs).popcount());
-        const uint64_t* ch = real_children_(node, hs);
+        size_t hs = chain_hs(sc);
+        unsigned nc = static_cast<unsigned>(bm(node, hs).popcount());
+        const uint64_t* ch = real_children(node, hs);
         for (unsigned i = 0; i < nc; ++i)
             cb(i, ch[i]);
     }
@@ -337,43 +337,43 @@ struct bitmask_ops {
     // ==================================================================
 
     // Bitmap256 ref from a bitmask tagged pointer (ptr points at bitmap)
-    static const bitmap256& bitmap_ref(uint64_t bm_tagged) noexcept {
-        return *reinterpret_cast<const bitmap256*>(bm_tagged);
+    static const bitmap_256_t& bitmap_ref(uint64_t bm_tagged) noexcept {
+        return *reinterpret_cast<const bitmap_256_t*>(bm_tagged);
     }
 
     // Read tagged child at slot from a bitmask tagged pointer
     static uint64_t child_at(uint64_t bm_tagged, int slot) noexcept {
         const uint64_t* bm = reinterpret_cast<const uint64_t*>(bm_tagged);
-        return bm[BITMAP256_U64 + 1 + slot];
+        return bm[BITMAP_256_U64 + 1 + slot];
     }
 
     // First child (slot 0) from a bitmask tagged pointer
     static uint64_t first_child(uint64_t bm_tagged) noexcept {
         const uint64_t* bm = reinterpret_cast<const uint64_t*>(bm_tagged);
-        return bm[BITMAP256_U64 + 1];
+        return bm[BITMAP_256_U64 + 1];
     }
 
     // ==================================================================
     // Bitmask node: add child (tagged) — standalone
     // ==================================================================
 
-    static uint64_t* add_child(uint64_t* node, node_header* h,
+    static uint64_t* add_child(uint64_t* node, node_header_t* h,
                                 uint8_t idx, uint64_t child_tagged,
                                 uint16_t child_desc, ALLOC& alloc) {
-        return add_child_at_(node, h, 1, idx, child_tagged, child_desc, alloc);
+        return add_child_at(node, h, 1, idx, child_tagged, child_desc, alloc);
     }
 
     // ==================================================================
     // Skip chain: add child to final bitmask
     // ==================================================================
 
-    static uint64_t* chain_add_child(uint64_t* node, node_header* h,
+    static uint64_t* chain_add_child(uint64_t* node, node_header_t* h,
                                       uint8_t sc, uint8_t idx,
                                       uint64_t child_tagged,
                                       uint16_t child_desc, ALLOC& alloc) {
-        uint64_t* nn = add_child_at_(node, h, chain_hs_(sc), idx,
+        uint64_t* nn = add_child_at(node, h, chain_hs(sc), idx,
                                       child_tagged, child_desc, alloc);
-        if (nn != node && sc > 0) fix_embeds_(nn, sc);
+        if (nn != node && sc > 0) fix_embeds(nn, sc);
         return nn;
     }
 
@@ -382,20 +382,20 @@ struct bitmask_ops {
     // Returns nullptr if node becomes empty.
     // ==================================================================
 
-    static uint64_t* remove_child(uint64_t* node, node_header* h,
+    static uint64_t* remove_child(uint64_t* node, node_header_t* h,
                                    int slot, uint8_t idx, ALLOC& alloc) {
-        return remove_child_at_(node, h, 1, slot, idx, alloc);
+        return remove_child_at(node, h, 1, slot, idx, alloc);
     }
 
     // ==================================================================
     // Skip chain: remove child from final bitmask
     // ==================================================================
 
-    static uint64_t* chain_remove_child(uint64_t* node, node_header* h,
+    static uint64_t* chain_remove_child(uint64_t* node, node_header_t* h,
                                          uint8_t sc, int slot, uint8_t idx,
                                          ALLOC& alloc) {
-        uint64_t* nn = remove_child_at_(node, h, chain_hs_(sc), slot, idx, alloc);
-        if (nn && nn != node && sc > 0) fix_embeds_(nn, sc);
+        uint64_t* nn = remove_child_at(node, h, chain_hs(sc), slot, idx, alloc);
+        if (nn && nn != node && sc > 0) fix_embeds(nn, sc);
         return nn;
     }
 
@@ -407,7 +407,7 @@ struct bitmask_ops {
                                    const uint64_t* child_tagged_ptrs,
                                    unsigned n_children, ALLOC& alloc,
                                    const uint16_t* descs = nullptr) {
-        bitmap256 bm = bitmap256::from_indices(indices, n_children);
+        bitmap_256_t bm = bitmap_256_t::from_indices(indices, n_children);
 
         constexpr size_t hs = 1;
         size_t needed = bitmask_size_u64(n_children, hs);
@@ -418,14 +418,14 @@ struct bitmask_ops {
         nh->set_alloc_u64(au64);
         nh->set_skip(0);
 
-        bm_mut_(nn, hs) = bm;
-        children_mut_(nn, hs)[0] = SENTINEL_TAGGED;
+        bm_mut(nn, hs) = bm;
+        children_mut(nn, hs)[0] = SENTINEL_TAGGED;
 
-        bitmap256::arr_fill_sorted(bm, real_children_mut_(nn, hs),
+        bitmap_256_t::arr_fill_sorted(bm, real_children_mut(nn, hs),
                                     indices, child_tagged_ptrs, n_children);
 
         // Fill desc array
-        uint16_t* nd = desc_array_mut_(nn, hs, n_children);
+        uint16_t* nd = desc_array_mut(nn, hs, n_children);
         if (descs) {
             std::memcpy(nd, descs, n_children * sizeof(uint16_t));
         } else {
@@ -438,7 +438,7 @@ struct bitmask_ops {
     // Bitmask node: make skip chain (one allocation)
     //
     // Layout: [header(1)][embed_0(6)]...[embed_{S-1}(6)][final_bm(4)][sent(1)][children(N)]
-    // Each embed = bitmap256(4) + sentinel(1) + child_ptr(1)
+    // Each embed = bitmap_256_t(4) + sentinel(1) + child_ptr(1)
     // child_ptr points to next embed's bitmap (or final bitmap).
     // Total: 1 + S*6 + 4 + 1 + 1 + N = 7 + S*6 + N  (but we use 6 + S*6 + N since
     //        final_bm(4)+sent(1)+first_child_slot = 6, and remaining N-1 children follow,
@@ -465,8 +465,8 @@ struct bitmask_ops {
         for (uint8_t e = 0; e < skip_count; ++e) {
             uint64_t* embed = nn + 1 + e * 6;
             // bitmap with single bit
-            bitmap256& bm = *reinterpret_cast<bitmap256*>(embed);
-            bm = bitmap256{};
+            bitmap_256_t& bm = *reinterpret_cast<bitmap_256_t*>(embed);
+            bm = bitmap_256_t{};
             bm.set_bit(skip_bytes[e]);
             // sentinel
             embed[4] = SENTINEL_TAGGED;
@@ -477,10 +477,10 @@ struct bitmask_ops {
 
         // Final bitmask
         size_t final_offset = 1 + static_cast<size_t>(skip_count) * 6;
-        bitmap256 fbm = bitmap256::from_indices(final_indices, final_n_children);
-        *reinterpret_cast<bitmap256*>(nn + final_offset) = fbm;
+        bitmap_256_t fbm = bitmap_256_t::from_indices(final_indices, final_n_children);
+        *reinterpret_cast<bitmap_256_t*>(nn + final_offset) = fbm;
         nn[final_offset + 4] = SENTINEL_TAGGED;
-        bitmap256::arr_fill_sorted(fbm, nn + final_offset + 5,
+        bitmap_256_t::arr_fill_sorted(fbm, nn + final_offset + 5,
                                     final_indices, final_children_tagged,
                                     final_n_children);
 
@@ -508,7 +508,7 @@ struct bitmask_ops {
         unsigned final_nc = get_header(old_node)->entries();
 
         // Extract final bitmask indices + children + descs
-        const bitmap256& fbm = chain_bitmap(old_node, old_sc);
+        const bitmap_256_t& fbm = chain_bitmap(old_node, old_sc);
         const uint64_t* old_ch = chain_children(old_node, old_sc);
         const uint16_t* old_desc = chain_desc_array(old_node, old_sc, final_nc);
 
@@ -559,7 +559,7 @@ struct bitmask_ops {
         uint8_t total_skip = count + child_sc;
 
         // Extract final bitmask indices + children + descs
-        const bitmap256& fbm = chain_bitmap(child, child_sc);
+        const bitmap_256_t& fbm = chain_bitmap(child, child_sc);
         const uint64_t* cch = chain_children(child, child_sc);
         const uint16_t* old_desc = chain_desc_array(child, child_sc, nc);
 
@@ -603,10 +603,10 @@ struct bitmask_ops {
     // Extract collapse info from a standalone bitmask (sc == 0, entries() == 1)
     static collapse_info standalone_collapse_info(const uint64_t* node) noexcept {
         collapse_info ci;
-        const bitmap256& bm = bm_(node, 1);
-        ci.bytes[0] = bm.first_set_bit();
+        const bitmap_256_t& bmp = bm(node, 1);
+        ci.bytes[0] = bmp.first_set_bit();
         ci.total_skip = 1;
-        ci.sole_child = real_children_(node, 1)[0];
+        ci.sole_child = real_children(node, 1)[0];
         ci.sole_entries = tagged_count(ci.sole_child);
         return ci;
     }
@@ -618,9 +618,9 @@ struct bitmask_ops {
     template<typename Fn>
     static void for_each_child(const uint64_t* node, Fn&& cb) {
         constexpr size_t hs = 1;
-        const bitmap256& bm = bm_(node, hs);
-        const uint64_t* rch = real_children_(node, hs);
-        bm.for_each_set([&](uint8_t idx, int slot) {
+        const bitmap_256_t& bmp = bm(node, hs);
+        const uint64_t* rch = real_children(node, hs);
+        bmp.for_each_set([&](uint8_t idx, int slot) {
             cb(idx, slot, rch[slot]);
         });
     }
@@ -637,12 +637,12 @@ struct bitmask_ops {
     static uint16_t* child_desc_array(uint64_t* node) noexcept {
         constexpr size_t hs = 1;
         unsigned nc = get_header(node)->entries();
-        return desc_array_mut_(node, hs, nc);
+        return desc_array_mut(node, hs, nc);
     }
     static const uint16_t* child_desc_array(const uint64_t* node) noexcept {
         constexpr size_t hs = 1;
         unsigned nc = get_header(node)->entries();
-        return desc_array_(node, hs, nc);
+        return desc_array(node, hs, nc);
     }
 
     static size_t node_alloc_u64(const uint64_t* node) noexcept {
@@ -661,12 +661,12 @@ struct bitmask_ops {
     // Bitmap256 leaf: find
     // ==================================================================
 
-    static const VALUE* bitmap_find(const uint64_t* node, node_header h,
+    static const VALUE* bitmap_find(const uint64_t* node, node_header_t h,
                                      uint8_t suffix, size_t header_size) noexcept {
-        const bitmap256& bm = bm_(node, header_size);
-        int slot = bm.find_slot<slot_mode::FAST_EXIT>(suffix);
+        const bitmap_256_t& bmp = bm(node, header_size);
+        int slot = bmp.find_slot<slot_mode::FAST_EXIT>(suffix);
         if (slot < 0) [[unlikely]] return nullptr;
-        return VT::as_ptr(bl_vals_(node, header_size)[slot]);
+        return VT::as_ptr(bl_vals(node, header_size)[slot]);
     }
 
     // ==================================================================
@@ -677,37 +677,37 @@ struct bitmask_ops {
 
     static iter_bm_result bitmap_iter_first(const uint64_t* node,
                                              size_t header_size) noexcept {
-        const bitmap256& bm = bm_(node, header_size);
-        const VST* vd = bl_vals_(node, header_size);
-        return {bm.first_set_bit(), &vd[0], true};
+        const bitmap_256_t& bmp = bm(node, header_size);
+        const VST* vd = bl_vals(node, header_size);
+        return {bmp.first_set_bit(), &vd[0], true};
     }
 
     static iter_bm_result bitmap_iter_last(const uint64_t* node,
-                                            node_header h,
+                                            node_header_t h,
                                             size_t header_size) noexcept {
-        const bitmap256& bm = bm_(node, header_size);
-        const VST* vd = bl_vals_(node, header_size);
+        const bitmap_256_t& bmp = bm(node, header_size);
+        const VST* vd = bl_vals(node, header_size);
         unsigned count = h.entries();
-        return {bm.last_set_bit(), &vd[count - 1], true};
+        return {bmp.last_set_bit(), &vd[count - 1], true};
     }
 
     static iter_bm_result bitmap_iter_next(const uint64_t* node,
                                             uint8_t suffix,
                                             size_t header_size) noexcept {
-        const bitmap256& bm = bm_(node, header_size);
-        auto r = bm.next_set_after(suffix);
+        const bitmap_256_t& bmp = bm(node, header_size);
+        auto r = bmp.next_set_after(suffix);
         if (!r.found) return {0, nullptr, false};
-        const VST* vd = bl_vals_(node, header_size);
+        const VST* vd = bl_vals(node, header_size);
         return {r.idx, &vd[r.slot], true};
     }
 
     static iter_bm_result bitmap_iter_prev(const uint64_t* node,
                                             uint8_t suffix,
                                             size_t header_size) noexcept {
-        const bitmap256& bm = bm_(node, header_size);
-        auto r = bm.prev_set_before(suffix);
+        const bitmap_256_t& bmp = bm(node, header_size);
+        auto r = bmp.prev_set_before(suffix);
         if (!r.found) return {0, nullptr, false};
-        const VST* vd = bl_vals_(node, header_size);
+        const VST* vd = bl_vals(node, header_size);
         return {r.idx, &vd[r.slot], true};
     }
 
@@ -721,9 +721,9 @@ struct bitmask_ops {
                                           VST value, ALLOC& alloc) {
         auto* h = get_header(node);
         size_t hs = hdr_u64(node);
-        bitmap256& bm = bm_mut_(node, hs);
+        bitmap_256_t& bm = bm_mut(node, hs);
         unsigned count = h->entries();
-        VST* vd = bl_vals_mut_(node, hs);
+        VST* vd = bl_vals_mut(node, hs);
 
         if (bm.has_bit(suffix)) {
             if constexpr (ASSIGN) {
@@ -757,10 +757,10 @@ struct bitmask_ops {
         if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(nc);
         nh->set_alloc_u64(au64);
-        bitmap256& nbm = bm_mut_(nn, hs);
+        bitmap_256_t& nbm = bm_mut(nn, hs);
         nbm = bm;
         nbm.set_bit(suffix);
-        VST* nvd = bl_vals_mut_(nn, hs);
+        VST* nvd = bl_vals_mut(nn, hs);
         int isl = nbm.find_slot<slot_mode::UNFILTERED>(suffix);
         std::memcpy(nvd, vd, isl * sizeof(VST));
         VT::write_slot(&nvd[isl], value);
@@ -778,12 +778,12 @@ struct bitmask_ops {
                                         ALLOC& alloc) {
         auto* h = get_header(node);
         size_t hs = hdr_u64(node);
-        bitmap256& bm = bm_mut_(node, hs);
+        bitmap_256_t& bm = bm_mut(node, hs);
         if (!bm.has_bit(suffix)) return {tag_leaf(node), false, 0};
 
         unsigned count = h->entries();
         int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
-        VT::destroy(bl_vals_mut_(node, hs)[slot], alloc);
+        VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
 
         unsigned nc = count - 1;
         if (nc == 0) {
@@ -795,7 +795,7 @@ struct bitmask_ops {
 
         // In-place
         if (!should_shrink_u64(h->alloc_u64(), new_sz)) {
-            VST* vd = bl_vals_mut_(node, hs);
+            VST* vd = bl_vals_mut(node, hs);
             bm.clear_bit(suffix);
             std::memmove(vd + slot, vd + slot + 1, (nc - slot) * sizeof(VST));
             h->set_entries(nc);
@@ -810,10 +810,10 @@ struct bitmask_ops {
         if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
         nh->set_entries(nc);
         nh->set_alloc_u64(au64);
-        bm_mut_(nn, hs) = bm;
-        bm_mut_(nn, hs).clear_bit(suffix);
-        const VST* ov = bl_vals_(node, hs);
-        VST*       nv = bl_vals_mut_(nn, hs);
+        bm_mut(nn, hs) = bm;
+        bm_mut(nn, hs).clear_bit(suffix);
+        const VST* ov = bl_vals(node, hs);
+        VST*       nv = bl_vals_mut(nn, hs);
         std::memcpy(nv, ov, slot * sizeof(VST));
         std::memcpy(nv + slot, ov + slot + 1, (nc - slot) * sizeof(VST));
 
@@ -834,10 +834,10 @@ struct bitmask_ops {
         auto* h = get_header(node);
         h->set_entries(count);
         h->set_alloc_u64(sz);
-        bitmap256& bm = bm_mut_(node, hs);
-        bm = bitmap256{};
+        bitmap_256_t& bm = bm_mut(node, hs);
+        bm = bitmap_256_t{};
         for (unsigned i = 0; i < count; ++i) bm.set_bit(sorted_suffixes[i]);
-        VST* vd = bl_vals_mut_(node, hs);
+        VST* vd = bl_vals_mut(node, hs);
         for (unsigned i = 0; i < count; ++i)
             vd[bm.find_slot<slot_mode::UNFILTERED>(sorted_suffixes[i])] = values[i];
         return node;
@@ -854,8 +854,8 @@ struct bitmask_ops {
         auto* h = get_header(node);
         h->set_entries(1);
         h->set_alloc_u64(sz);
-        bm_mut_(node, hs).set_bit(suffix);
-        VT::write_slot(&bl_vals_mut_(node, hs)[0], value);
+        bm_mut(node, hs).set_bit(suffix);
+        VT::write_slot(&bl_vals_mut(node, hs)[0], value);
         return node;
     }
 
@@ -866,9 +866,9 @@ struct bitmask_ops {
     template<typename Fn>
     static void for_each_bitmap(const uint64_t* node, Fn&& cb) {
         size_t hs = hdr_u64(node);
-        const bitmap256& bm = bm_(node, hs);
-        const VST* vd = bl_vals_(node, hs);
-        bm.for_each_set([&](uint8_t idx, int slot) {
+        const bitmap_256_t& bmp = bm(node, hs);
+        const VST* vd = bl_vals(node, hs);
+        bmp.for_each_set([&](uint8_t idx, int slot) {
             cb(idx, vd[slot]);
         });
     }
@@ -889,7 +889,7 @@ struct bitmask_ops {
         auto* h = get_header(node);
         if constexpr (!VT::IS_INLINE) {
             uint16_t count = h->entries();
-            VST* vd = bl_vals_mut_(node, hdr_u64(node));
+            VST* vd = bl_vals_mut(node, hdr_u64(node));
             for (uint16_t i = 0; i < count; ++i)
                 VT::destroy(vd[i], alloc);
         }
@@ -897,27 +897,27 @@ struct bitmask_ops {
     }
 
     // --- Chain header size: 1 (base header) + sc * 6 (embed slots) ---
-    static constexpr size_t chain_hs_(uint8_t sc) noexcept {
+    static constexpr size_t chain_hs(uint8_t sc) noexcept {
         return 1 + static_cast<size_t>(sc) * 6;
     }
 
 private:
     // --- Fix embed internal pointers after reallocation ---
-    static void fix_embeds_(uint64_t* nn, uint8_t sc) noexcept {
+    static void fix_embeds(uint64_t* nn, uint8_t sc) noexcept {
         for (uint8_t e = 0; e < sc; ++e) {
             uint64_t* next_bm = nn + 1 + static_cast<size_t>(e + 1) * 6;
             nn[1 + static_cast<size_t>(e) * 6 + 5] = reinterpret_cast<uint64_t>(next_bm);
         }
         // Fix sentinel of final bitmap
-        size_t fo = chain_hs_(sc);
-        nn[fo + BITMAP256_U64] = SENTINEL_TAGGED;
+        size_t fo = chain_hs(sc);
+        nn[fo + BITMAP_256_U64] = SENTINEL_TAGGED;
     }
 
     // --- Shared add child core: works for any header size ---
-    static uint64_t* add_child_at_(uint64_t* node, node_header* h, size_t hs,
+    static uint64_t* add_child_at(uint64_t* node, node_header_t* h, size_t hs,
                                     uint8_t idx, uint64_t child_tagged,
                                     uint16_t child_desc, ALLOC& alloc) {
-        bitmap256& bm = bm_mut_(node, hs);
+        bitmap_256_t& bm = bm_mut(node, hs);
         unsigned oc = h->entries();
         unsigned nc = oc + 1;
         int isl = bm.find_slot<slot_mode::UNFILTERED>(idx);
@@ -927,18 +927,18 @@ private:
         if (needed <= h->alloc_u64()) {
             // Save desc array (children shift will overwrite it)
             uint16_t saved_desc[256];
-            const uint16_t* od = desc_array_(node, hs, oc);
+            const uint16_t* od = desc_array(node, hs, oc);
             std::memcpy(saved_desc, od, oc * sizeof(uint16_t));
 
             // Insert child
-            uint64_t* rch = real_children_mut_(node, hs);
+            uint64_t* rch = real_children_mut(node, hs);
             std::memmove(rch + isl + 1, rch + isl, (oc - isl) * sizeof(uint64_t));
             rch[isl] = child_tagged;
             bm.set_bit(idx);
             h->set_entries(nc);
 
             // Write desc with insertion
-            uint16_t* nd = desc_array_mut_(node, hs, nc);
+            uint16_t* nd = desc_array_mut(node, hs, nc);
             std::memcpy(nd, saved_desc, isl * sizeof(uint16_t));
             nd[isl] = child_desc;
             std::memcpy(nd + isl + 1, saved_desc + isl, (oc - isl) * sizeof(uint16_t));
@@ -950,22 +950,22 @@ private:
         uint64_t* nn = alloc_node(alloc, au64);
 
         // Copy header + embeds/bitmap + sentinel (everything before children)
-        size_t prefix_u64 = hs + BITMAP256_U64 + 1;
+        size_t prefix_u64 = hs + BITMAP_256_U64 + 1;
         std::memcpy(nn, node, prefix_u64 * 8);
 
         auto* nh = get_header(nn);
         nh->set_entries(nc);
         nh->set_alloc_u64(au64);
 
-        bm_mut_(nn, hs).set_bit(idx);
-        children_mut_(nn, hs)[0] = SENTINEL_TAGGED;
+        bm_mut(nn, hs).set_bit(idx);
+        children_mut(nn, hs)[0] = SENTINEL_TAGGED;
 
-        bitmap256::arr_copy_insert(real_children_(node, hs), real_children_mut_(nn, hs),
+        bitmap_256_t::arr_copy_insert(real_children(node, hs), real_children_mut(nn, hs),
                                     oc, isl, child_tagged);
 
         // Copy desc with insertion
-        const uint16_t* od = desc_array_(node, hs, oc);
-        uint16_t* nd = desc_array_mut_(nn, hs, nc);
+        const uint16_t* od = desc_array(node, hs, oc);
+        uint16_t* nd = desc_array_mut(nn, hs, nc);
         std::memcpy(nd, od, isl * sizeof(uint16_t));
         nd[isl] = child_desc;
         std::memcpy(nd + isl + 1, od + isl, (oc - isl) * sizeof(uint16_t));
@@ -975,7 +975,7 @@ private:
     }
 
     // --- Shared remove child core: works for any header size ---
-    static uint64_t* remove_child_at_(uint64_t* node, node_header* h, size_t hs,
+    static uint64_t* remove_child_at(uint64_t* node, node_header_t* h, size_t hs,
                                        int slot, uint8_t idx, ALLOC& alloc) {
         unsigned oc = h->entries();
         unsigned nc = oc - 1;
@@ -990,17 +990,17 @@ private:
         if (!should_shrink_u64(h->alloc_u64(), needed)) {
             // Save desc excluding slot
             uint16_t saved_desc[256];
-            const uint16_t* od = desc_array_(node, hs, oc);
+            const uint16_t* od = desc_array(node, hs, oc);
             std::memcpy(saved_desc, od, slot * sizeof(uint16_t));
             std::memcpy(saved_desc + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
 
             // Remove child
-            bitmap256::arr_remove(bm_mut_(node, hs), real_children_mut_(node, hs),
+            bitmap_256_t::arr_remove(bm_mut(node, hs), real_children_mut(node, hs),
                                   oc, slot, idx);
             h->set_entries(nc);
 
             // Write back desc at new position
-            uint16_t* nd = desc_array_mut_(node, hs, nc);
+            uint16_t* nd = desc_array_mut(node, hs, nc);
             std::memcpy(nd, saved_desc, nc * sizeof(uint16_t));
             return node;
         }
@@ -1010,22 +1010,22 @@ private:
         uint64_t* nn = alloc_node(alloc, au64);
 
         // Copy header + embeds/bitmap + sentinel
-        size_t prefix_u64 = hs + BITMAP256_U64 + 1;
+        size_t prefix_u64 = hs + BITMAP_256_U64 + 1;
         std::memcpy(nn, node, prefix_u64 * 8);
 
         auto* nh = get_header(nn);
         nh->set_entries(nc);
         nh->set_alloc_u64(au64);
 
-        bm_mut_(nn, hs).clear_bit(idx);
-        children_mut_(nn, hs)[0] = SENTINEL_TAGGED;
+        bm_mut(nn, hs).clear_bit(idx);
+        children_mut(nn, hs)[0] = SENTINEL_TAGGED;
 
-        bitmap256::arr_copy_remove(real_children_(node, hs), real_children_mut_(nn, hs),
+        bitmap_256_t::arr_copy_remove(real_children(node, hs), real_children_mut(nn, hs),
                                     oc, slot);
 
         // Copy desc excluding slot
-        const uint16_t* od = desc_array_(node, hs, oc);
-        uint16_t* nd = desc_array_mut_(nn, hs, nc);
+        const uint16_t* od = desc_array(node, hs, oc);
+        uint16_t* nd = desc_array_mut(nn, hs, nc);
         std::memcpy(nd, od, slot * sizeof(uint16_t));
         std::memcpy(nd + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
 
@@ -1034,52 +1034,52 @@ private:
     }
 
     // --- Shared lookup core: works for any header size ---
-    static child_lookup lookup_at_(const uint64_t* node, size_t hs, uint8_t idx) noexcept {
-        const bitmap256& bm = bm_(node, hs);
-        int slot = bm.find_slot<slot_mode::FAST_EXIT>(idx);
+    static child_lookup lookup_at(const uint64_t* node, size_t hs, uint8_t idx) noexcept {
+        const bitmap_256_t& bmp = bm(node, hs);
+        int slot = bmp.find_slot<slot_mode::FAST_EXIT>(idx);
         if (slot < 0) return {0, -1, false};
-        uint64_t child = real_children_(node, hs)[slot];
+        uint64_t child = real_children(node, hs)[slot];
         return {child, slot, true};
     }
 
     // --- Shared: bitmap starts after header (1 or 2 u64s) ---
-    static const bitmap256& bm_(const uint64_t* n, size_t header_size) noexcept {
-        return *reinterpret_cast<const bitmap256*>(n + header_size);
+    static const bitmap_256_t& bm(const uint64_t* n, size_t header_size) noexcept {
+        return *reinterpret_cast<const bitmap_256_t*>(n + header_size);
     }
-    static bitmap256& bm_mut_(uint64_t* n, size_t header_size) noexcept {
-        return *reinterpret_cast<bitmap256*>(n + header_size);
+    static bitmap_256_t& bm_mut(uint64_t* n, size_t header_size) noexcept {
+        return *reinterpret_cast<bitmap_256_t*>(n + header_size);
     }
 
     // --- Bitmask node: children array (includes sentinel at [0]) ---
-    static const uint64_t* children_(const uint64_t* n, size_t header_size) noexcept {
-        return n + header_size + BITMAP256_U64;
+    static const uint64_t* children(const uint64_t* n, size_t header_size) noexcept {
+        return n + header_size + BITMAP_256_U64;
     }
-    static uint64_t* children_mut_(uint64_t* n, size_t header_size) noexcept {
-        return n + header_size + BITMAP256_U64;
+    static uint64_t* children_mut(uint64_t* n, size_t header_size) noexcept {
+        return n + header_size + BITMAP_256_U64;
     }
 
     // --- Bitmask node: real children (past sentinel) ---
-    static const uint64_t* real_children_(const uint64_t* n, size_t header_size) noexcept {
-        return n + header_size + BITMAP256_U64 + 1;
+    static const uint64_t* real_children(const uint64_t* n, size_t header_size) noexcept {
+        return n + header_size + BITMAP_256_U64 + 1;
     }
-    static uint64_t* real_children_mut_(uint64_t* n, size_t header_size) noexcept {
-        return n + header_size + BITMAP256_U64 + 1;
+    static uint64_t* real_children_mut(uint64_t* n, size_t header_size) noexcept {
+        return n + header_size + BITMAP_256_U64 + 1;
     }
 
     // --- Bitmap256 leaf: values after bitmap ---
-    static const VST* bl_vals_(const uint64_t* n, size_t header_size) noexcept {
-        return reinterpret_cast<const VST*>(n + header_size + BITMAP256_U64);
+    static const VST* bl_vals(const uint64_t* n, size_t header_size) noexcept {
+        return reinterpret_cast<const VST*>(n + header_size + BITMAP_256_U64);
     }
-    static VST* bl_vals_mut_(uint64_t* n, size_t header_size) noexcept {
-        return reinterpret_cast<VST*>(n + header_size + BITMAP256_U64);
+    static VST* bl_vals_mut(uint64_t* n, size_t header_size) noexcept {
+        return reinterpret_cast<VST*>(n + header_size + BITMAP_256_U64);
     }
 
     // --- Bitmask node: desc array (after real children) ---
-    static const uint16_t* desc_array_(const uint64_t* n, size_t header_size, unsigned nc) noexcept {
-        return reinterpret_cast<const uint16_t*>(n + header_size + BITMAP256_U64 + 1 + nc);
+    static const uint16_t* desc_array(const uint64_t* n, size_t header_size, unsigned nc) noexcept {
+        return reinterpret_cast<const uint16_t*>(n + header_size + BITMAP_256_U64 + 1 + nc);
     }
-    static uint16_t* desc_array_mut_(uint64_t* n, size_t header_size, unsigned nc) noexcept {
-        return reinterpret_cast<uint16_t*>(n + header_size + BITMAP256_U64 + 1 + nc);
+    static uint16_t* desc_array_mut(uint64_t* n, size_t header_size, unsigned nc) noexcept {
+        return reinterpret_cast<uint16_t*>(n + header_size + BITMAP_256_U64 + 1 + nc);
     }
 };
 

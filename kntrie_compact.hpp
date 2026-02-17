@@ -73,13 +73,13 @@ struct compact_ops {
     // Find
     // ==================================================================
 
-    static const VALUE* find(const uint64_t* node, node_header h,
+    static const VALUE* find(const uint64_t* node, node_header_t h,
                              K suffix, size_t header_size) noexcept {
         unsigned ts = h.total_slots();
-        const K* keys = keys_(node, header_size);
-        const K* base = adaptive_search<K>::find_base(keys, ts, suffix);
+        const K* kd = keys(node, header_size);
+        const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
         if (*base != suffix) [[unlikely]] return nullptr;
-        return VT::as_ptr(vals_(node, ts, header_size)[base - keys]);
+        return VT::as_ptr(vals(node, ts, header_size)[base - kd]);
     }
 
     // ==================================================================
@@ -101,7 +101,7 @@ struct compact_ops {
         if (skip > 0) h->set_prefix(prefix, skip);
 
         if (count > 0)
-            seed_from_real_(node, sorted_keys, values, count, ts, hu);
+            seed_from_real(node, sorted_keys, values, count, ts, hu);
         return node;
     }
 
@@ -110,12 +110,12 @@ struct compact_ops {
     // ==================================================================
 
     template<typename Fn>
-    static void for_each(const uint64_t* node, const node_header* h, Fn&& cb) {
+    static void for_each(const uint64_t* node, const node_header_t* h, Fn&& cb) {
         unsigned ts = h->total_slots();
         if (ts == 0) return;
         size_t hs = hdr_u64(node);
-        const K*   kd = keys_(node, hs);
-        const VST* vd = vals_(node, ts, hs);
+        const K*   kd = keys(node, hs);
+        const VST* vd = vals(node, ts, hs);
         for (unsigned i = 0; i < ts; ++i) {
             if (i > 0 && kd[i] == kd[i - 1]) continue;
             cb(kd[i], vd[i]);
@@ -129,34 +129,34 @@ struct compact_ops {
     struct iter_leaf_result { K suffix; const VST* value; bool found; };
 
     static iter_leaf_result iter_first(const uint64_t* node,
-                                        const node_header* h) noexcept {
+                                        const node_header_t* h) noexcept {
         unsigned ts = h->total_slots();
         if (ts == 0) return {0, nullptr, false};
         size_t hs = hdr_u64(node);
-        const K*   kd = keys_(node, hs);
-        const VST* vd = vals_(node, ts, hs);
+        const K*   kd = keys(node, hs);
+        const VST* vd = vals(node, ts, hs);
         return {kd[0], &vd[0], true};
     }
 
     static iter_leaf_result iter_last(const uint64_t* node,
-                                       const node_header* h) noexcept {
+                                       const node_header_t* h) noexcept {
         unsigned ts = h->total_slots();
         if (ts == 0) return {0, nullptr, false};
         size_t hs = hdr_u64(node);
-        const K*   kd = keys_(node, hs);
-        const VST* vd = vals_(node, ts, hs);
+        const K*   kd = keys(node, hs);
+        const VST* vd = vals(node, ts, hs);
         return {kd[ts - 1], &vd[ts - 1], true};
     }
 
     // Smallest suffix > key
     static iter_leaf_result iter_next(const uint64_t* node,
-                                       const node_header* h,
+                                       const node_header_t* h,
                                        K suffix) noexcept {
         unsigned ts = h->total_slots();
         if (ts == 0) return {0, nullptr, false};
         size_t hs = hdr_u64(node);
-        const K*   kd = keys_(node, hs);
-        const VST* vd = vals_(node, ts, hs);
+        const K*   kd = keys(node, hs);
+        const VST* vd = vals(node, ts, hs);
         const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
         unsigned pos = static_cast<unsigned>(base - kd) + (*base <= suffix);
         if (pos < ts) return {kd[pos], &vd[pos], true};
@@ -165,13 +165,13 @@ struct compact_ops {
 
     // Largest suffix < key
     static iter_leaf_result iter_prev(const uint64_t* node,
-                                       const node_header* h,
+                                       const node_header_t* h,
                                        K suffix) noexcept {
         unsigned ts = h->total_slots();
         if (ts == 0 || suffix == 0) return {0, nullptr, false};
         size_t hs = hdr_u64(node);
-        const K*   kd = keys_(node, hs);
-        const VST* vd = vals_(node, ts, hs);
+        const K*   kd = keys(node, hs);
+        const VST* vd = vals(node, ts, hs);
         const K* base = adaptive_search<K>::find_base(kd, ts, K(suffix - 1));
         // find_base: last position where kd[p] <= suffix-1, i.e. < suffix
         if (*base < suffix) return {*base, &vd[base - kd], true};
@@ -188,8 +188,8 @@ struct compact_ops {
             unsigned ts = h->total_slots();
             if (ts > 0) {
                 size_t hs = hdr_u64(node);
-                const K* kd = keys_(node, hs);
-                VST* vd = vals_mut_(node, ts, hs);
+                const K* kd = keys(node, hs);
+                VST* vd = vals_mut(node, ts, hs);
                 for (unsigned i = 0; i < ts; ++i) {
                     if (i > 0 && kd[i] == kd[i - 1]) continue;
                     VT::destroy(vd[i], alloc);
@@ -208,13 +208,13 @@ struct compact_ops {
 
     template<bool INSERT = true, bool ASSIGN = true>
     requires (INSERT || ASSIGN)
-    static insert_result_t insert(uint64_t* node, node_header* h,
+    static insert_result_t insert(uint64_t* node, node_header_t* h,
                                   K suffix, VST value, ALLOC& alloc) {
         unsigned entries = h->entries();
         unsigned ts = h->total_slots();
         size_t hs = hdr_u64(node);
-        K*   kd = keys_(node, hs);
-        VST* vd = vals_mut_(node, ts, hs);
+        K*   kd = keys(node, hs);
+        VST* vd = vals_mut(node, ts, hs);
 
         const K* base = adaptive_search<K>::find_base(
             kd, ts, suffix);
@@ -241,7 +241,7 @@ struct compact_ops {
 
         // Dups available: consume one in-place
         if (dups > 0) {
-            insert_consume_dup_(kd, vd, ts,
+            insert_consume_dup(kd, vd, ts,
                                 ins, entries, suffix, value);
             h->set_entries(entries + 1);
             return {tag_leaf(node), true, false};
@@ -260,7 +260,7 @@ struct compact_ops {
         nh->set_total_slots(new_ts);
 
         // Single-pass: dedup old + inject new key + seed dups
-        seed_with_insert_(nn, kd, vd, ts, entries,
+        seed_with_insert(nn, kd, vd, ts, entries,
                           suffix, value, new_entries, new_ts, hs);
 
         dealloc_node(alloc, node, h->alloc_u64());
@@ -271,13 +271,13 @@ struct compact_ops {
     // Erase
     // ==================================================================
 
-    static erase_result_t erase(uint64_t* node, node_header* h,
+    static erase_result_t erase(uint64_t* node, node_header_t* h,
                                 K suffix, ALLOC& alloc) {
         unsigned entries = h->entries();
         unsigned ts = h->total_slots();
         size_t hs = hdr_u64(node);
-        K*   kd = keys_(node, hs);
-        VST* vd = vals_mut_(node, ts, hs);
+        K*   kd = keys(node, hs);
+        VST* vd = vals_mut(node, ts, hs);
 
         const K* base = adaptive_search<K>::find_base(
             kd, ts, suffix);
@@ -310,15 +310,15 @@ struct compact_ops {
             // Dedup old, skip erased key, seed into new
             auto tmp_k = std::make_unique<K[]>(nc);
             auto tmp_v = std::make_unique<VST[]>(nc);
-            dedup_skip_into_(kd, vd, ts, suffix, tmp_k.get(), tmp_v.get(), alloc);
-            seed_from_real_(nn, tmp_k.get(), tmp_v.get(), nc, new_ts, hs);
+            dedup_skip_into(kd, vd, ts, suffix, tmp_k.get(), tmp_v.get(), alloc);
+            seed_from_real(nn, tmp_k.get(), tmp_v.get(), nc, new_ts, hs);
 
             dealloc_node(alloc, node, h->alloc_u64());
             return {tag_leaf(nn), true, static_cast<uint16_t>(nc)};
         }
 
         // In-place: convert erased entry's run to neighbor dups
-        erase_create_dup_(kd, vd, ts, idx, suffix, alloc);
+        erase_create_dup(kd, vd, ts, idx, suffix, alloc);
         h->set_entries(nc);
         return {tag_leaf(node), true, static_cast<uint16_t>(nc)};
     }
@@ -328,20 +328,20 @@ private:
     // Layout helpers
     // ==================================================================
 
-    static K* keys_(uint64_t* node, size_t header_size) noexcept {
+    static K* keys(uint64_t* node, size_t header_size) noexcept {
         return reinterpret_cast<K*>(node + header_size);
     }
-    static const K* keys_(const uint64_t* node, size_t header_size) noexcept {
+    static const K* keys(const uint64_t* node, size_t header_size) noexcept {
         return reinterpret_cast<const K*>(node + header_size);
     }
 
-    static VST* vals_mut_(uint64_t* node, size_t total, size_t header_size) noexcept {
+    static VST* vals_mut(uint64_t* node, size_t total, size_t header_size) noexcept {
         size_t kb = total * sizeof(K);
         kb = (kb + 7) & ~size_t{7};
         return reinterpret_cast<VST*>(
             reinterpret_cast<char*>(node + header_size) + kb);
     }
-    static const VST* vals_(const uint64_t* node, size_t total, size_t header_size) noexcept {
+    static const VST* vals(const uint64_t* node, size_t total, size_t header_size) noexcept {
         size_t kb = total * sizeof(K);
         kb = (kb + 7) & ~size_t{7};
         return reinterpret_cast<const VST*>(
@@ -352,7 +352,7 @@ private:
     // Dedup + skip one key, writing into output arrays
     // ==================================================================
 
-    static void dedup_skip_into_(const K* kd, const VST* vd, uint16_t ts,
+    static void dedup_skip_into(const K* kd, const VST* vd, uint16_t ts,
                                   K skip_suffix,
                                   K* out_k, VST* out_v, ALLOC& alloc) {
         bool skipped = false;
@@ -376,14 +376,14 @@ private:
     // No temp arrays. One read pass, one write pass.
     // ==================================================================
 
-    static void seed_with_insert_(uint64_t* dst,
+    static void seed_with_insert(uint64_t* dst,
                                    const K* old_k, const VST* old_v,
                                    uint16_t old_ts, uint16_t old_entries,
                                    K new_suffix, VST new_val,
                                    uint16_t new_entries, uint16_t new_ts,
                                    size_t header_size) {
-        K*   dk = keys_(dst, header_size);
-        VST* dv = vals_mut_(dst, new_ts, header_size);
+        K*   dk = keys(dst, header_size);
+        VST* dv = vals_mut(dst, new_ts, header_size);
 
         if (new_entries == new_ts) {
             // No dups needed — straight copy with insert
@@ -482,7 +482,7 @@ private:
     // Dup helpers
     // ==================================================================
 
-    static void insert_consume_dup_(
+    static void insert_consume_dup(
             K* kd, VST* vd, int total, int ins, unsigned entries,
             K suffix, VST value) {
         int dup_pos = -1;
@@ -540,7 +540,7 @@ private:
         VT::write_slot(&vd[write_pos], value);
     }
 
-    static void erase_create_dup_(
+    static void erase_create_dup(
             K* kd, VST* vd, int total, int idx,
             K suffix, ALLOC& alloc) {
         int first = idx;
@@ -568,12 +568,12 @@ private:
     // Seed: distribute dups evenly among real entries
     // ==================================================================
 
-    static void seed_from_real_(uint64_t* node,
+    static void seed_from_real(uint64_t* node,
                                 const K* real_keys, const VST* real_vals,
                                 uint16_t n_entries, uint16_t total,
                                 size_t header_size) {
-        K*   kd = keys_(node, header_size);
-        VST* vd = vals_mut_(node, total, header_size);
+        K*   kd = keys(node, header_size);
+        VST* vd = vals_mut(node, total, header_size);
 
         if (n_entries == total) {
             std::memcpy(kd, real_keys, n_entries * sizeof(K));

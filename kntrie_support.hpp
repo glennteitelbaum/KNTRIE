@@ -16,7 +16,7 @@ namespace gteitelbaum {
 // Constants
 // ==========================================================================
 
-inline constexpr size_t BITMAP256_U64 = 4;   // 32 bytes
+inline constexpr size_t BITMAP_256_U64 = 4;   // 32 bytes
 inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
 inline constexpr uint16_t COALESCE_CAP = static_cast<uint16_t>(COMPACT_MAX + 1);
@@ -80,7 +80,7 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 //
 // Struct layout (little-endian):
 //   [0]      flags       (bit 0: is_bitmask, bits 1-3: skip count 0-7)
-//   [1]      suffix_type (leaf only: 0=bitmap256, 1=u16, 2=u32, 3=u64)
+//   [1]      suffix_type (leaf only: 0=bitmap_256_t, 1=u16, 2=u32, 3=u64)
 //   [2..3]   entries     (uint16_t)
 //   [4..5]   alloc_u64   (uint16_t)
 //   [6..7]   total_slots (uint16_t, compact leaf slot count)
@@ -96,17 +96,17 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 //                  entries=0. Sentinel-safe.
 // ==========================================================================
 
-struct node_header {
-    uint8_t  skip_count_  = 0;  // max 6, bits 3-7 free
-    uint8_t  reserved_    = 0;
-    uint16_t entries_     = 0;
-    uint16_t alloc_u64_   = 0;
-    uint16_t total_slots_ = 0;
+struct node_header_t {
+    uint8_t  skip_count_v  = 0;  // max 6, bits 3-7 free
+    uint8_t  reserved_v    = 0;
+    uint16_t entries_v     = 0;
+    uint16_t alloc_u64_v   = 0;
+    uint16_t total_slots_v = 0;
 
     // --- skip ---
-    uint8_t skip()    const noexcept { return skip_count_ & 0x07; }
-    bool    is_skip() const noexcept { return skip_count_ & 0x07; }
-    void set_skip(uint8_t s) noexcept { skip_count_ = (s & 0x07); }
+    uint8_t skip()    const noexcept { return skip_count_v & 0x07; }
+    bool    is_skip() const noexcept { return skip_count_v & 0x07; }
+    void set_skip(uint8_t s) noexcept { skip_count_v = (s & 0x07); }
 
     // --- leaf prefix bytes (in node[1], only valid via get_header(node)->) ---
     const uint8_t* prefix_bytes() const noexcept {
@@ -120,23 +120,23 @@ struct node_header {
     }
 
     // --- entries / alloc ---
-    unsigned entries()   const noexcept { return entries_; }
-    void set_entries(unsigned n) noexcept { entries_ = static_cast<uint16_t>(n); }
+    unsigned entries()   const noexcept { return entries_v; }
+    void set_entries(unsigned n) noexcept { entries_v = static_cast<uint16_t>(n); }
 
-    unsigned alloc_u64() const noexcept { return alloc_u64_; }
-    void set_alloc_u64(unsigned n) noexcept { alloc_u64_ = static_cast<uint16_t>(n); }
+    unsigned alloc_u64() const noexcept { return alloc_u64_v; }
+    void set_alloc_u64(unsigned n) noexcept { alloc_u64_v = static_cast<uint16_t>(n); }
 
-    unsigned total_slots() const noexcept { return total_slots_; }
-    void set_total_slots(unsigned n) noexcept { total_slots_ = static_cast<uint16_t>(n); }
+    unsigned total_slots() const noexcept { return total_slots_v; }
+    void set_total_slots(unsigned n) noexcept { total_slots_v = static_cast<uint16_t>(n); }
 
-    // Bitmask-only: total_slots_ repurposed as descendant count (saturating at 0xFFFF)
-    uint16_t descendants() const noexcept { return total_slots_; }
-    void set_descendants(uint16_t n) noexcept { total_slots_ = n; }
+    // Bitmask-only: total_slots_v repurposed as descendant count (saturating at 0xFFFF)
+    uint16_t descendants() const noexcept { return total_slots_v; }
+    void set_descendants(uint16_t n) noexcept { total_slots_v = n; }
 };
-static_assert(sizeof(node_header) == 8);
+static_assert(sizeof(node_header_t) == 8);
 
-inline node_header*       get_header(uint64_t* n)       noexcept { return reinterpret_cast<node_header*>(n); }
-inline const node_header* get_header(const uint64_t* n) noexcept { return reinterpret_cast<const node_header*>(n); }
+inline node_header_t*       get_header(uint64_t* n)       noexcept { return reinterpret_cast<node_header_t*>(n); }
+inline const node_header_t* get_header(const uint64_t* n) noexcept { return reinterpret_cast<const node_header_t*>(n); }
 
 // --- Tagged pointer helpers ---
 // Bitmask ptr: points to bitmap (node+1), no LEAF_BIT. Use directly.

@@ -38,13 +38,13 @@ public:
 
     class const_iterator {
         friend class kntrie;
-        const impl_t* parent_ = nullptr;
-        UK    ukey_{};
-        VALUE value_{};
-        bool  valid_ = false;
+        const impl_t* parent_v = nullptr;
+        UK    ukey_v{};
+        VALUE value_v{};
+        bool  is_valid_v = false;
 
         const_iterator(const impl_t* p, UK uk, VALUE v, bool valid)
-            : parent_(p), ukey_(uk), value_(v), valid_(valid) {}
+            : parent_v(p), ukey_v(uk), value_v(v), is_valid_v(valid) {}
 
         static const_iterator from_result(const impl_t* p,
                                            const typename impl_t::iter_result_t& r) {
@@ -60,18 +60,18 @@ public:
 
         const_iterator() = default;
 
-        KEY          key()   const noexcept { return from_unsigned(ukey_); }
-        const VALUE& value() const noexcept { return value_; }
+        KEY          key()   const noexcept { return from_unsigned(ukey_v); }
+        const VALUE& value() const noexcept { return value_v; }
 
         std::pair<const KEY, const VALUE&> operator*() const noexcept {
-            return {from_unsigned(ukey_), value_};
+            return {from_unsigned(ukey_v), value_v};
         }
 
         const_iterator& operator++() {
-            auto r = parent_->iter_next_(ukey_);
-            ukey_  = r.key;
-            value_ = r.value;
-            valid_ = r.found;
+            auto r = parent_v->iter_next(ukey_v);
+            ukey_v  = r.key;
+            value_v = r.value;
+            is_valid_v = r.found;
             return *this;
         }
 
@@ -82,10 +82,10 @@ public:
         }
 
         const_iterator& operator--() {
-            auto r = parent_->iter_prev_(ukey_);
-            ukey_  = r.key;
-            value_ = r.value;
-            valid_ = r.found;
+            auto r = parent_v->iter_prev(ukey_v);
+            ukey_v  = r.key;
+            value_v = r.value;
+            is_valid_v = r.found;
             return *this;
         }
 
@@ -96,9 +96,9 @@ public:
         }
 
         bool operator==(const const_iterator& o) const noexcept {
-            if (!valid_ && !o.valid_) return true;
-            if (valid_ != o.valid_) return false;
-            return ukey_ == o.ukey_;
+            if (!is_valid_v && !o.is_valid_v) return true;
+            if (is_valid_v != o.is_valid_v) return false;
+            return ukey_v == o.ukey_v;
         }
 
         bool operator!=(const const_iterator& o) const noexcept {
@@ -181,7 +181,7 @@ public:
     // ==================================================================
 
     const_iterator begin() const noexcept {
-        return const_iterator::from_result(&impl_, impl_.iter_first_());
+        return const_iterator::from_result(&impl_, impl_.iter_first());
     }
     const_iterator end() const noexcept {
         return const_iterator{};
@@ -190,7 +190,7 @@ public:
     const_iterator cend()   const noexcept { return end(); }
 
     const_iterator rbegin() const noexcept {
-        return const_iterator::from_result(&impl_, impl_.iter_last_());
+        return const_iterator::from_result(&impl_, impl_.iter_last());
     }
     const_iterator rend() const noexcept {
         return const_iterator{};
@@ -207,12 +207,12 @@ public:
         UK uk = to_unsigned(k);
         const VALUE* v = impl_.find_value(uk);
         if (v) return const_iterator(&impl_, uk, *v, true);
-        auto r = impl_.iter_next_(uk);
+        auto r = impl_.iter_next(uk);
         return const_iterator::from_result(&impl_, r);
     }
 
     const_iterator upper_bound(const KEY& k) const noexcept {
-        auto r = impl_.iter_next_(to_unsigned(k));
+        auto r = impl_.iter_next(to_unsigned(k));
         return const_iterator::from_result(&impl_, r);
     }
 
