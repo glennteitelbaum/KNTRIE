@@ -2,6 +2,7 @@
 #define KNTRIE_IMPL_HPP
 
 #include "kntrie_ops.hpp"
+#include "kntrie_iter_ops.hpp"
 #include <memory>
 
 namespace gteitelbaum {
@@ -31,7 +32,8 @@ private:
     using NK0 = std::conditional_t<KEY_BITS <= 8,  uint8_t,
                 std::conditional_t<KEY_BITS <= 16, uint16_t,
                 std::conditional_t<KEY_BITS <= 32, uint32_t, uint64_t>>>;
-    using Ops = kntrie_ops<NK0, VALUE, ALLOC>;
+    using Ops     = kntrie_ops<NK0, VALUE, ALLOC>;
+    using IterOps = kntrie_iter_ops<NK0, VALUE, ALLOC>;
 
     uint64_t  root_;      // tagged pointer (LEAF_BIT for leaf, raw for bitmask)
     size_t    size_;
@@ -170,14 +172,14 @@ public:
 
     iter_result_t iter_first_() const noexcept {
         if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
-        auto r = Ops::template descend_min_<KEY_BITS, IK>(root_, IK{0}, 0);
+        auto r = IterOps::template descend_min_<KEY_BITS, IK>(root_, IK{0}, 0);
         if (!r.found) return {KEY{}, VALUE{}, false};
         return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
     }
 
     iter_result_t iter_last_() const noexcept {
         if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
-        auto r = Ops::template descend_max_<KEY_BITS, IK>(root_, IK{0}, 0);
+        auto r = IterOps::template descend_max_<KEY_BITS, IK>(root_, IK{0}, 0);
         if (!r.found) return {KEY{}, VALUE{}, false};
         return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
     }
@@ -186,7 +188,7 @@ public:
         if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
         IK ik = KO::to_internal(key);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        auto r = Ops::template iter_next_node_<KEY_BITS, IK>(
+        auto r = IterOps::template iter_next_node_<KEY_BITS, IK>(
             root_, nk, IK{0}, 0);
         if (!r.found) return {KEY{}, VALUE{}, false};
         return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
@@ -196,7 +198,7 @@ public:
         if (root_ == SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
         IK ik = KO::to_internal(key);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        auto r = Ops::template iter_prev_node_<KEY_BITS, IK>(
+        auto r = IterOps::template iter_prev_node_<KEY_BITS, IK>(
             root_, nk, IK{0}, 0);
         if (!r.found) return {KEY{}, VALUE{}, false};
         return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
@@ -235,7 +237,7 @@ private:
 
     void remove_all_() noexcept {
         if (root_ != SENTINEL_TAGGED) {
-            Ops::template remove_subtree_<KEY_BITS>(root_, alloc_);
+            IterOps::template remove_subtree_<KEY_BITS>(root_, alloc_);
             root_ = SENTINEL_TAGGED;
         }
         size_ = 0;
@@ -246,8 +248,8 @@ private:
     // ==================================================================
 
     void collect_stats_(uint64_t tagged, debug_stats_t& s) const noexcept {
-        typename Ops::stats_t os{};
-        Ops::template collect_stats_<KEY_BITS>(tagged, os);
+        typename IterOps::stats_t os{};
+        IterOps::template collect_stats_<KEY_BITS>(tagged, os);
         s.total_bytes    += os.total_bytes;
         s.total_entries  += os.total_entries;
         s.bitmap_leaves  += os.bitmap_leaves;
