@@ -363,6 +363,24 @@ for (auto [k, v] : trie) { ... }          // works — copies the snapshot
 
 ---
 
+### COMPLEXITY
+
+All kntrie operations are O(M) where M is the key width in bytes (1-8), independent of N (number of entries). This is the fundamental trie property — depth is fixed by the key, not the data. Since M ≤ 8 for all supported key types, every operation is effectively constant time, but the distinction matters: doubling N does not change any operation's cost.
+
+**read O(M)** — at most M bitmask levels of bitmap dispatch, each a fixed-cost popcount + indexed load. The terminal leaf search is O(log COMPACT_MAX) but COMPACT_MAX is a compile-time constant (512 or 4096), so it contributes a fixed cost independent of both M and N.
+
+**iterate O(M)** — each `++`/`--` re-traverses from root to leaf. The traversal depth is bounded by M. Sequential entries within the same compact leaf benefit from cache locality, but the algorithmic cost per step is still O(M).
+
+**insert O(M)** — descent is O(M). The typical insert consumes one dup slot in the compact leaf — a single memmove of a few entries to close the gap. Only when all dups are exhausted does the leaf reallocate to the next power-of-2. When a leaf exceeds COMPACT_MAX entries, it splits into an internal node with up to 256 children — a rare spike amortized across thousands of inserts. Allocation dominates real-world cost.
+
+**erase O(M)** — descent is O(M). The typical erase overwrites the target slot with its neighbor's key and value — O(1), no memmove. The leaf only shrinks when entries drop below half the slot count. When an internal node's subtree drops below COMPACT_MAX, a coalesce collects all remaining entries and rebuilds a single compact leaf — a rare spike amortized across many erases. Deallocation dominates real-world cost.
+
+**memory O(N × M)** — each entry contributes its suffix (up to M bytes) plus value storage, and internal nodes add structural overhead along the M-deep path. In practice, prefix sharing and compact leaf packing compress this significantly below the theoretical N × M bound. Per-entry memory exhibits a sawtooth pattern as compact leaves fill and split — a leaf at 50% capacity wastes dup slots, while one at 100% is maximally packed. But total memory scales linearly with N and the sawtooth amplitude is bounded. Unlike hash tables, there is no sudden 2× rehash spike.
+
+**at theoretical max** — when the keyspace is fully or near-fully populated, compact leaves are eliminated entirely. The tree becomes pure bitmask nodes all the way down to depth M, with bitmap leaves at the terminal level. Reads traverse exactly M levels of bitmap dispatch. Writes simply set or clear a bit in the terminal bitmap leaf — no splits, no coalesces, no dup management. At this point the kntrie resembles a pure trie.
+
+---
+
 ### PERFORMANCE
 
 #### vs std::map
