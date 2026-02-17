@@ -28,7 +28,9 @@ The KTRIE adapts its structure to the data. Dense prefix ranges collapse into si
 
 ## kntrie IMPLEMENTATION
 
-The kntrie is a concrete implementation of the KTRIE for integer keys (`uint16_t` through `int64_t`).
+The kntrie is a concrete implementation of the KTRIE for integer keys (`uint16_t` through `int64_t`). It's what would happen if an array-of-arrays had a child with a trie — the trie gives you O(key-width) depth and prefix sharing, the nested arrays give you dense packed leaves with sequential access and branchless search. The trie routes you through 2-3 levels of bitmap dispatch, then hands you off to a fat sorted array where hundreds of entries sit contiguous in memory.
+
+The worst parts of each parent cancel out — tries waste space on sparse branching (solved by bitmap compression), and nested arrays waste time on deep indexing (solved by the trie collapsing shared prefixes). What survives is the trie's logarithmic-in-key-width routing and the array's cache-line-friendly density.
 
 ---
 
