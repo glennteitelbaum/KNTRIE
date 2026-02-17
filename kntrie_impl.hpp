@@ -50,8 +50,33 @@ public:
     kntrie_impl(const kntrie_impl&) = delete;
     kntrie_impl& operator=(const kntrie_impl&) = delete;
 
+    kntrie_impl(kntrie_impl&& o) noexcept
+        : root_v(o.root_v), size_v(o.size_v), alloc_v(std::move(o.alloc_v)) {
+        o.root_v = SENTINEL_TAGGED;
+        o.size_v = 0;
+    }
+
+    kntrie_impl& operator=(kntrie_impl&& o) noexcept {
+        if (this != &o) {
+            remove_all();
+            root_v  = o.root_v;
+            size_v  = o.size_v;
+            alloc_v = std::move(o.alloc_v);
+            o.root_v = SENTINEL_TAGGED;
+            o.size_v = 0;
+        }
+        return *this;
+    }
+
+    void swap(kntrie_impl& o) noexcept {
+        std::swap(root_v, o.root_v);
+        std::swap(size_v, o.size_v);
+        std::swap(alloc_v, o.alloc_v);
+    }
+
     [[nodiscard]] bool      empty() const noexcept { return root_v == SENTINEL_TAGGED; }
     [[nodiscard]] size_type size()  const noexcept { return size_v; }
+    [[nodiscard]] const ALLOC& get_allocator() const noexcept { return alloc_v; }
 
     void clear() noexcept {
         remove_all();

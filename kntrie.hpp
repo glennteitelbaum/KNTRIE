@@ -4,6 +4,7 @@
 #include "kntrie_impl.hpp"
 #include <stdexcept>
 #include <iterator>
+#include <vector>
 
 namespace gteitelbaum {
 
@@ -63,7 +64,7 @@ public:
         KEY          key()   const noexcept { return from_unsigned(ukey_v); }
         const VALUE& value() const noexcept { return value_v; }
 
-        std::pair<const KEY, const VALUE&> operator*() const noexcept {
+        std::pair<const KEY, VALUE> operator*() const noexcept {
             return {from_unsigned(ukey_v), value_v};
         }
 
@@ -82,9 +83,10 @@ public:
         }
 
         const_iterator& operator--() {
-            auto r = parent_v->iter_prev(ukey_v);
-            ukey_v  = r.key;
-            value_v = r.value;
+            auto r = is_valid_v ? parent_v->iter_prev(ukey_v)
+                                : parent_v->iter_last();
+            ukey_v     = r.key;
+            value_v    = r.value;
             is_valid_v = r.found;
             return *this;
         }
@@ -106,7 +108,9 @@ public:
         }
     };
 
-    using iterator = const_iterator;
+    using iterator               = const_iterator;
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+    using reverse_iterator       = const_reverse_iterator;
 
     // ==================================================================
     // Construction / Destruction
@@ -114,8 +118,30 @@ public:
 
     kntrie() = default;
     ~kntrie() = default;
-    kntrie(const kntrie&) = delete;
-    kntrie& operator=(const kntrie&) = delete;
+
+    kntrie(kntrie&& o) noexcept : impl_(std::move(o.impl_)) {}
+
+    kntrie& operator=(kntrie&& o) noexcept {
+        impl_ = std::move(o.impl_);
+        return *this;
+    }
+
+    kntrie(const kntrie& o) {
+        for (auto [k, v] : o)
+            impl_.insert(to_unsigned(k), v);
+    }
+
+    kntrie& operator=(const kntrie& o) {
+        if (this != &o) {
+            impl_.clear();
+            for (auto [k, v] : o)
+                impl_.insert(to_unsigned(k), v);
+        }
+        return *this;
+    }
+
+    void swap(kntrie& o) noexcept { impl_.swap(o.impl_); }
+    friend void swap(kntrie& a, kntrie& b) noexcept { a.swap(b); }
 
     // ==================================================================
     // Size
@@ -123,6 +149,12 @@ public:
 
     [[nodiscard]] bool      empty() const noexcept { return impl_.empty(); }
     [[nodiscard]] size_type size()  const noexcept { return impl_.size(); }
+    [[nodiscard]] size_type max_size() const noexcept {
+        return std::allocator_traits<ALLOC>::max_size(impl_.get_allocator());
+    }
+    [[nodiscard]] allocator_type get_allocator() const noexcept {
+        return impl_.get_allocator();
+    }
 
     // ==================================================================
     // Modifiers
@@ -147,8 +179,41 @@ public:
         return insert(kv);
     }
 
+    template<typename... Args>
+    std::pair<iterator, bool> try_emplace(const KEY& key, Args&&... args) {
+        if (contains(key)) return {find(key), false};
+        VALUE v(std::forward<Args>(args)...);
+        auto [ok, ins] = impl_.insert(to_unsigned(key), v);
+        return {find(key), ins};
+    }
+
+    iterator insert(const_iterator, const value_type& kv) { return insert(kv).first; }
+
+    template<typename InputIt>
+    requires (!std::is_integral_v<InputIt>)
+    void insert(InputIt first, InputIt last) {
+        for (; first != last; ++first) insert(*first);
+    }
+
     void clear() noexcept { impl_.clear(); }
     size_type erase(const KEY& key) { return impl_.erase(to_unsigned(key)) ? 1 : 0; }
+
+    iterator erase(const_iterator pos) {
+        KEY k = pos.key();
+        auto next = pos;
+        ++next;
+        impl_.erase(to_unsigned(k));
+        return next;
+    }
+
+    iterator erase(const_iterator first, const_iterator last) {
+        std::vector<KEY> keys;
+        for (auto it = first; it != last; ++it)
+            keys.push_back(it.key());
+        for (auto k : keys)
+            impl_.erase(to_unsigned(k));
+        return last;
+    }
 
     // ==================================================================
     // Lookup
@@ -184,17 +249,17 @@ public:
         return const_iterator::from_result(&impl_, impl_.iter_first());
     }
     const_iterator end() const noexcept {
-        return const_iterator{};
+        const_iterator it;
+        it.parent_v = &impl_;
+        return it;
     }
     const_iterator cbegin() const noexcept { return begin(); }
     const_iterator cend()   const noexcept { return end(); }
 
-    const_iterator rbegin() const noexcept {
-        return const_iterator::from_result(&impl_, impl_.iter_last());
-    }
-    const_iterator rend() const noexcept {
-        return const_iterator{};
-    }
+    const_reverse_iterator rbegin()  const noexcept { return const_reverse_iterator(end()); }
+    const_reverse_iterator rend()    const noexcept { return const_reverse_iterator(begin()); }
+    const_reverse_iterator crbegin() const noexcept { return rbegin(); }
+    const_reverse_iterator crend()   const noexcept { return rend(); }
 
     const_iterator find(const KEY& key) const noexcept {
         UK uk = to_unsigned(key);
