@@ -10,7 +10,6 @@ namespace gteitelbaum {
 template<typename KEY, typename VALUE, typename ALLOC = std::allocator<uint64_t>>
 class kntrie_impl {
     static_assert(std::is_integral_v<KEY>, "KEY must be integral");
-    static_assert(sizeof(KEY) >= 2, "KEY must be at least 16 bits");
 
 public:
     using key_type       = KEY;
