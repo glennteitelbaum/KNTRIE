@@ -12,7 +12,6 @@ Not hungarian notation. Not type encoding. Just origin and role.
 | `_r` | Reference | Alias to something else |
 | `_m` | Moved-from (rvalue ref) | Consumed after use |
 | `_l` | Lambda | Captures state, watch lifetime |
-| `_` | Function argument | Came from caller, don't own it |
 | *(none)* | Local variable | Defined nearby, easy to find |
 
 Suffixes **stack** right-to-left (innermost type first):
@@ -71,12 +70,12 @@ struct kntrie_ops {                             // lower_snake struct (stateless
     uint64_t root_v;                            // data member
     size_t   size_v;                            // data member
 
-    static void find_node(uint64_t ptr_,        // function: no trailing _
-                          NK ik_) {             // args: trailing _
+    static void find_node(uint64_t ptr,          // function: no trailing _
+                          NK ik) {               // args: no suffix
         auto* hdr_p = get_header(node);         // local pointer
         uint8_t skip = hdr_p->skip();           // local value
-        bool is_leaf = ptr_ & LEAF_BIT;         // local bool
-        auto visit_l = [&](uint64_t c_) {};     // lambda
+        bool is_leaf = ptr & LEAF_BIT;           // local bool
+        auto visit_l = [&](uint64_t c) {};       // lambda
     }
 };
 ```
