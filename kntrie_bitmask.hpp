@@ -25,9 +25,9 @@ struct bitmap_256_t {
 
     // Extract the index of the single set bit (for embed chain walking)
     uint8_t single_bit_index() const noexcept {
-        for (int i = 0; i < 4; ++i)
-            if (words[i]) return static_cast<uint8_t>(i * 64 + std::countr_zero(words[i]));
-        __builtin_unreachable();
+        uint64_t w0 = words[0], w1 = words[1], w2 = words[2];
+        int idx = !w0 + (!w0 & !w1) + (!w0 & !w1 & !w2);
+        return static_cast<uint8_t>((idx << 6) + std::countr_zero(words[idx]));
     }
 
     // FAST_EXIT:   returns slot (>=0) if bit set, -1 if not set
@@ -87,16 +87,18 @@ struct bitmap_256_t {
 
     struct adj_result { uint8_t idx; uint16_t slot; bool found; };
 
-    // Find smallest set bit > idx, with its slot. Single pass.
+    // Find smallest set bit > idx, with its slot.
     adj_result next_set_after(uint8_t idx) const noexcept {
         if (idx == 255) return {0, 0, false};
         int start = idx + 1;
         int w = start >> 6, b = start & 63;
 
-        int slot = 0;
-        for (int i = 0; i < w; ++i)
-            slot += std::popcount(words[i]);
+        // Branchless prefix popcount (same pattern as find_slot)
+        int slot = std::popcount(words[0]) & -int(w > 0);
+        slot += std::popcount(words[1]) & -int(w > 1);
+        slot += std::popcount(words[2]) & -int(w > 2);
 
+        // Mask out bits below start in starting word
         uint64_t m = words[w] & (~0ULL << b);
         if (m) {
             int bit = (w << 6) + std::countr_zero(m);
@@ -105,6 +107,7 @@ struct bitmap_256_t {
         }
         slot += std::popcount(words[w]);
 
+        // Search remaining words (at most 3 iterations, typically 0-1)
         for (int ww = w + 1; ww < 4; ++ww) {
             if (words[ww]) {
                 int bit = (ww << 6) + std::countr_zero(words[ww]);
@@ -117,36 +120,43 @@ struct bitmap_256_t {
     }
 
     // Return the index of the n-th set bit (0-indexed).
-    // Only called on rare subtree-boundary path.
     uint8_t nth_set(int n) const noexcept {
-        for (int w = 0; w < 4; ++w) {
-            int pc = std::popcount(words[w]);
-            if (n < pc) {
-                uint64_t bits = words[w];
-                for (int i = 0; i < n; ++i)
-                    bits &= bits - 1;  // clear lowest set bit
-                return static_cast<uint8_t>((w << 6) + std::countr_zero(bits));
-            }
-            n -= pc;
-        }
-        __builtin_unreachable();
+        int p0 = std::popcount(words[0]);
+        int p1 = std::popcount(words[1]);
+        int p2 = std::popcount(words[2]);
+        int idx = (n >= p0) + (n >= p0 + p1) + (n >= p0 + p1 + p2);
+        n -= (idx > 0 ? p0 : 0) + (idx > 1 ? p1 : 0) + (idx > 2 ? p2 : 0);
+        uint64_t bits = words[idx];
+        for (int i = 0; i < n; ++i)
+            bits &= bits - 1;  // blsr
+        return static_cast<uint8_t>((idx << 6) + std::countr_zero(bits));
     }
 
-    // Find largest set bit < idx, with its slot. Single pass backward.
+    // Find largest set bit < idx, with its slot.
     adj_result prev_set_before(uint8_t idx) const noexcept {
         if (idx == 0) return {0, 0, false};
         int last = idx - 1;
         int w = last >> 6, b = last & 63;
 
+        // Mask off bits above 'last' in starting word
         uint64_t m = words[w] & ((2ULL << b) - 1);
+        if (m) {
+            int bit = (w << 6) + 63 - std::countl_zero(m);
+            // Branchless prefix popcount
+            int slot = std::popcount(words[0]) & -int(w > 0);
+            slot += std::popcount(words[1]) & -int(w > 1);
+            slot += std::popcount(words[2]) & -int(w > 2);
+            slot += std::popcount(m & ((1ULL << (bit & 63)) - 1));
+            return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
+        }
 
-        for (int ww = w; ww >= 0; --ww) {
-            uint64_t bits = (ww == w) ? m : words[ww];
-            if (bits) {
-                int bit = (ww << 6) + 63 - std::countl_zero(bits);
-                int slot = 0;
-                for (int i = 0; i < ww; ++i)
-                    slot += std::popcount(words[i]);
+        // Search lower words
+        for (int ww = w - 1; ww >= 0; --ww) {
+            if (words[ww]) {
+                int bit = (ww << 6) + 63 - std::countl_zero(words[ww]);
+                int slot = std::popcount(words[0]) & -int(ww > 0);
+                slot += std::popcount(words[1]) & -int(ww > 1);
+                slot += std::popcount(words[2]) & -int(ww > 2);
                 slot += std::popcount(words[ww] & ((1ULL << (bit & 63)) - 1));
                 return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
             }
@@ -711,22 +721,20 @@ struct bitmask_ops {
                                             uint8_t suffix,
                                             size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
-        int slot = bmp.template find_slot<slot_mode::FAST_EXIT>(suffix);
-        if (slot < 0 || slot + 1 >= bmp.popcount()) return {0, nullptr, false};
+        auto r = bmp.next_set_after(suffix);
+        if (!r.found) return {0, nullptr, false};
         const VST* vd = bl_vals(node, header_size);
-        uint8_t next_idx = bmp.nth_set(slot + 1);
-        return {next_idx, &vd[slot + 1], true};
+        return {r.idx, &vd[r.slot], true};
     }
 
     static iter_bm_result bitmap_iter_prev(const uint64_t* node,
                                             uint8_t suffix,
                                             size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
-        int slot = bmp.template find_slot<slot_mode::FAST_EXIT>(suffix);
-        if (slot <= 0) return {0, nullptr, false};
+        auto r = bmp.prev_set_before(suffix);
+        if (!r.found) return {0, nullptr, false};
         const VST* vd = bl_vals(node, header_size);
-        uint8_t prev_idx = bmp.nth_set(slot - 1);
-        return {prev_idx, &vd[slot - 1], true};
+        return {r.idx, &vd[r.slot], true};
     }
 
     // ==================================================================
