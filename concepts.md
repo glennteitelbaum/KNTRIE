@@ -141,7 +141,7 @@ byte 0:    skip_count (bits 0-2: skip count 0-6, bits 3-7: reserved)
 byte 1:    reserved
 bytes 2-3: entries (uint16)
 bytes 4-5: alloc_u64 (uint16)
-bytes 6-7: total_slots (compact leaf) / descendants (internal) (uint16)
+bytes 6-7: total_slots (compact leaf only) (uint16)
 ```
 
 If skip > 0, `node[1]` stores up to 6 prefix bytes (outer byte first). Header size is 1 u64 (no skip) or 2 u64 (with skip).
@@ -252,12 +252,12 @@ The `& -int(cond)` trick: when `cond` is true, `-int(true)` is all-ones in two's
 node[0]:     header
 node[1..4]:  256-bit bitmap
 node[5]:     sentinel (tagged pointer to the global zeroed leaf)
-node[6..]:   N children (tagged pointers), followed by N × uint16 descriptors
+node[6..]:   N children (tagged pointers), followed by 1 x uint64 descendants count
 ```
 
 The sentinel at a fixed offset after the bitmap is the miss target for branchless lookups — when the popcount returns 0, it reads this slot, which leads find into the global empty leaf.
 
-The **descriptor array** following the children stores one `uint16_t` per child: that child's subtree entry count (saturating at 0xFFFF). This enables erase to update ancestor counts by reading a sequential array rather than chasing child pointers into scattered nodes.
+The **descendants count** following the children is a single exact `uint64_t` storing the total number of entries reachable from this node. Insert increments it, erase decrements it. When erase brings the count to COMPACT_MAX or below, the subtree coalesces into a single compact leaf.
 
 Tagged pointer convention: an internal node's pointer targets `node[1]` (the bitmap start), not `node[0]`. The find loop receives this and indexes forward into sentinel/children with no header offset. Insert and erase back up one u64 when they need the header.
 
@@ -276,7 +276,7 @@ When a bitmask node has only one child, the kntrie compresses it. Rather than a 
 
 This is how the kntrie implements the KTRIE's PREFIX for bitmask levels. Where a compact leaf stores prefix bytes in `node[1]`, a bitmask encodes them as a chain of embedded single-child bitmaps.
 
-Each embedded level is a minimal bitmap: 4 u64 of bitmap (one bit set) + 1 u64 sentinel + 1 u64 child pointer to the next level. The final level is a full internal node with its own bitmap, sentinel, children, and descriptors.
+Each embedded level is a minimal bitmap: 4 u64 of bitmap (one bit set) + 1 u64 sentinel + 1 u64 child pointer to the next level. The final level is a full internal node with its own bitmap, sentinel, children, and descendants count.
 
 The header's skip count stores how many embedded levels exist. The find loop processes these identically to standalone internal nodes — it just encounters single-child bitmaps that resolve in one popcount.
 
