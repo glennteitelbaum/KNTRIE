@@ -6,6 +6,16 @@
 
 namespace gteitelbaum {
 
+// Standalone stats accumulator — shared across all NK instantiations.
+struct kntrie_stats_t {
+    size_t total_bytes    = 0;
+    size_t total_entries  = 0;
+    size_t bitmap_leaves  = 0;
+    size_t compact_leaves = 0;
+    size_t bitmask_nodes  = 0;
+    size_t bm_children    = 0;
+};
+
 // ======================================================================
 // kntrie_iter_ops<NK, VALUE, ALLOC> — iteration, destroy, stats.
 //
@@ -654,13 +664,7 @@ struct kntrie_iter_ops {
     // Stats collection: compile-time NK narrowing (replaces suffix_type)
     // ==================================================================
 
-    struct stats_t {
-        size_t total_bytes    = 0;
-        size_t total_entries  = 0;
-        size_t bitmap_leaves  = 0;
-        size_t compact_leaves = 0;
-        size_t bitmask_nodes  = 0;
-    };
+    using stats_t = kntrie_stats_t;
 
     template<int BITS> requires (BITS >= 8)
     static void collect_stats(uint64_t tagged, stats_t& s) noexcept {
@@ -683,6 +687,7 @@ struct kntrie_iter_ops {
         auto* hdr = get_header(node);
         s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
         s.bitmask_nodes++;
+        s.bm_children += hdr->entries();
         uint8_t sc = hdr->skip();
         if (sc > 0)
             stats_chain_skip<BITS>(node, sc, 0, s);

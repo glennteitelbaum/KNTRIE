@@ -320,13 +320,13 @@ struct compact_ops {
             seed_from_real(nn, tmp_k.get(), tmp_v.get(), nc, new_ts, hs);
 
             dealloc_node(alloc, node, h->alloc_u64());
-            return {tag_leaf(nn), true, static_cast<uint16_t>(nc)};
+            return {tag_leaf(nn), true, nc};
         }
 
         // In-place: convert erased entry's run to neighbor dups
         erase_create_dup(kd, vd, ts, idx, suffix, alloc);
         h->set_entries(nc);
-        return {tag_leaf(node), true, static_cast<uint16_t>(nc)};
+        return {tag_leaf(node), true, nc};
     }
 
 private:

@@ -23,7 +23,7 @@ inline constexpr uint16_t COALESCE_CAP = static_cast<uint16_t>(COMPACT_MAX + 1);
 inline constexpr size_t HEADER_U64    = 1;   // base header is 1 u64 (8 bytes), +1 if skip
 
 // u64s needed for N child descriptor entries (uint16_t each)
-inline constexpr size_t desc_u64(size_t n) noexcept { return (n + 3) / 4; }
+inline constexpr size_t desc_u64(size_t n) noexcept { return n; }
 
 // Tagged pointer: bit 63 = leaf (sign bit for fast test)
 static constexpr uint64_t LEAF_BIT = uint64_t(1) << 63;
@@ -183,24 +183,6 @@ inline const uint64_t SENTINEL_TAGGED =
 // Tagged pointer entry counting (NK-independent)
 // ==========================================================================
 
-// Count entries reachable from a tagged pointer.
-// Leaf: entries in header. Bitmask: descendants in header.
-inline uint16_t tagged_count(uint64_t tagged) noexcept {
-    if (tagged & LEAF_BIT)
-        return get_header(untag_leaf(tagged))->entries();
-    return get_header(bm_to_node_const(tagged))->descendants();
-}
-
-// Sum entry counts across an array of tagged children (capped).
-inline uint16_t sum_tagged_array(const uint64_t* children, unsigned nc) noexcept {
-    uint32_t total = 0;
-    for (unsigned i = 0; i < nc; ++i) {
-        total += tagged_count(children[i]);
-        if (total > COMPACT_MAX) return COALESCE_CAP;
-    }
-    return static_cast<uint16_t>(total);
-}
-
 // ==========================================================================
 // key_ops<KEY> -- internal key representation
 //
@@ -318,7 +300,7 @@ struct insert_result_t {
 struct erase_result_t {
     uint64_t tagged_ptr;    // tagged pointer, or 0 if fully erased
     bool erased;
-    uint16_t subtree_entries;  // remaining entries in subtree (capped at COMPACT_MAX+1)
+    uint64_t subtree_entries;  // remaining entries in subtree (exact)
 };
 
 } // namespace gteitelbaum

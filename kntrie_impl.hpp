@@ -149,6 +149,7 @@ public:
         size_t compact_leaves = 0;
         size_t bitmap_leaves  = 0;
         size_t bitmask_nodes  = 0;
+        size_t bm_children    = 0;
         size_t total_entries  = 0;
         size_t total_bytes    = 0;
     };
@@ -279,6 +280,7 @@ private:
         s.bitmap_leaves  += os.bitmap_leaves;
         s.compact_leaves += os.compact_leaves;
         s.bitmask_nodes  += os.bitmask_nodes;
+        s.bm_children    += os.bm_children;
     }
 };
 

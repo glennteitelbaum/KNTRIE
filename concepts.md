@@ -38,15 +38,15 @@ The worst parts of each parent cancel out — tries waste space on sparse branch
 
 The implementation spans 7 header files:
 
-| File | Lines | Role |
-|------|-------|------|
-| `kntrie_support.hpp` | ~330 | `node_header_t`, `key_ops`, tagged pointers, `value_traits`, allocator helpers |
-| `kntrie_compact.hpp` | ~610 | Compact leaf operations: `adaptive_search`, `compact_ops` |
-| `kntrie_bitmask.hpp` | ~1090 | `bitmap_256_t`, `bitmask_ops`: bitmap arithmetic, internal node layout/accessors |
-| `kntrie_ops.hpp` | ~1060 | `kntrie_ops`: find, insert, erase, coalesce — compile-time NK recursion |
-| `kntrie_iter_ops.hpp` | ~740 | `kntrie_iter_ops`: iteration, destroy, stats — compile-time NK recursion |
-| `kntrie_impl.hpp` | ~260 | `kntrie_impl`: thin wrapper dispatching public API to ops |
-| `kntrie.hpp` | ~240 | `kntrie`: STL-compatible interface, `const_iterator` |
+| File | Role |
+|------|------|
+| `kntrie_support.hpp` | `node_header_t`, `key_ops`, tagged pointers, `value_traits`, allocator helpers |
+| `kntrie_compact.hpp` | Compact leaf operations: `adaptive_search`, `compact_ops` |
+| `kntrie_bitmask.hpp` | `bitmap_256_t`, `bitmask_ops`: bitmap arithmetic, internal node layout/accessors |
+| `kntrie_ops.hpp` | `kntrie_ops`: find, insert, erase, coalesce — compile-time NK recursion |
+| `kntrie_iter_ops.hpp` | `kntrie_iter_ops`: iteration, destroy, stats — compile-time NK recursion |
+| `kntrie_impl.hpp` | `kntrie_impl`: thin wrapper dispatching public API to ops |
+| `kntrie.hpp` | `kntrie`: STL-compatible interface, `const_iterator` |
 
 Each `.hpp` is self-contained (verified by corresponding `.cpp` compilation units). Dependencies flow downward: `kntrie.hpp` → `kntrie_impl.hpp` → `kntrie_ops.hpp` / `kntrie_iter_ops.hpp` → `kntrie_bitmask.hpp` / `kntrie_compact.hpp` → `kntrie_support.hpp`.
 
@@ -240,6 +240,8 @@ The `& -int(cond)` trick: when `cond` is true, `-int(true)` is all-ones in two's
 
 **Fast-exit** (insert/erase, bitmap leaves): Check whether the target bit is set. If not, return -1 immediately. If set, subtract 1 from the count to get a 0-based dense index.
 
+**Branchless bit scanning.** All `bitmap_256_t` word-scanning operations avoid branchy loops over the four words. `first_set_bit` and `last_set_bit` compute the target word index arithmetically — `!w0 + (!w0 & !w1) + (!w0 & !w1 & !w2)` compiles to `sete`/`or`/`adc` chains, then a single indexed load + `tzcnt`/`lzcnt`. `next_set_after` and `prev_set_before` use branchless prefix popcount accumulation (`popcnt & -int(w > N)`) matching the `find_slot` pattern.
+
 **Unfiltered** (insertion position): Count of set bits strictly before the target — subtract 1 if the target bit itself is set.
 
 ##### Internal Nodes
@@ -336,6 +338,10 @@ The kntrie provides bidirectional sorted iteration via `begin()`/`end()`. Iterat
 
 Each family has three sub-functions for the three traversal phases: `*_leaf_skip` (consume leaf prefix bytes), `*_chain_skip` (consume bitmask chain bytes), `*_bm_final` (dispatch at the final bitmap). All narrow NK at compile-time boundaries.
 
+**Bitmask dispatch.** At `*_bm_final`, the current byte is looked up via a single `find_slot<BRANCHLESS>` — the same zero-branch bitmap scan used by the find path. If the byte is present (common case: the key exists in this subtree), it recurses into the child. Only when recursion exhausts the subtree (rare: subtree boundary crossing) does it fall through to `next_set_after` / `prev_set_before` to find the adjacent sibling.
+
+**`descend_min` / `descend_max`** use branchless arithmetic to locate the first or last set bit in the 256-bit bitmap — no word-by-word loop. `first_set_bit` computes the index of the first nonzero word via `!w0 + (!w0 & !w1) + (!w0 & !w1 & !w2)`, which compiles to `sete`/`or`/`adc` chains with zero branches. `last_set_bit` mirrors this from the high end.
+
 **Key reconstruction.** The iteration accumulates a prefix (`IK prefix, int bits`) as it descends, then combines the leaf suffix using:
 
 ```cpp
@@ -395,15 +401,11 @@ The kntrie's advantage is structural:
 
 **Depth.** Lookup depth is bounded by key width (≤8 levels for u64), not log₂(N). In practice, compact leaf absorption means most lookups traverse 2-3 internal levels + one leaf search, regardless of N.
 
-**Find speed.** At 100K entries: kntrie ~32ns/op vs map ~411ns/op (random u64). The 12× advantage comes from fewer cache misses and branchless search.
-
 #### vs std::unordered_map
 
 `std::unordered_map` is O(1) amortized with ~32 bytes/entry. The hash is cheap but the pointer chase after it hits DRAM at scale.
 
-The kntrie is ordered (unlike unordered_map) while achieving comparable find performance through cache-friendly layout and branchless search. At 100K entries: kntrie ~32ns/op vs umap ~26ns/op (random u64). For misses, kntrie wins: ~19ns vs ~32ns.
-
-Memory advantage is significant: 21 bytes/entry vs 32 bytes/entry (random), and 12 bytes/entry vs 32 bytes/entry (sequential).
+The kntrie is ordered (unlike unordered_map) while achieving comparable find performance through cache-friendly layout and branchless search. Memory advantage is significant — roughly half the per-entry cost for random keys, and better still for sequential patterns.
 
 #### The Real Cost: O(N) × O(miss_cost(M))
 

@@ -119,19 +119,6 @@ struct bitmap_256_t {
         return {0, 0, false};
     }
 
-    // Return the index of the n-th set bit (0-indexed).
-    uint8_t nth_set(int n) const noexcept {
-        int p0 = std::popcount(words[0]);
-        int p1 = std::popcount(words[1]);
-        int p2 = std::popcount(words[2]);
-        int idx = (n >= p0) + (n >= p0 + p1) + (n >= p0 + p1 + p2);
-        n -= (idx > 0 ? p0 : 0) + (idx > 1 ? p1 : 0) + (idx > 2 ? p2 : 0);
-        uint64_t bits = words[idx];
-        for (int i = 0; i < n; ++i)
-            bits &= bits - 1;  // blsr
-        return static_cast<uint8_t>((idx << 6) + std::countr_zero(bits));
-    }
-
     // Find largest set bit < idx, with its slot.
     adj_result prev_set_before(uint8_t idx) const noexcept {
         if (idx == 0) return {0, 0, false};
@@ -220,7 +207,7 @@ struct bitmap_256_t {
 //   - sentinel at offset 5 from bitmap = SENTINEL_TAGGED for branchless miss
 //   - real children at offset 5 from bitmap (after sentinel)
 //   - All children are tagged uint64_t values
-//   - desc array: uint16_t per child, stores child descendant count (capped)
+//   - desc array: uint64_t per child, stores exact child descendant count
 //
 // Bitmap256 leaf (suffix_type=0): [header(1 or 2)][bitmap(4)][values(n)]
 //   - Parent pointer targets &node[0] | LEAF_BIT
@@ -313,12 +300,12 @@ struct bitmask_ops {
     }
 
     // Desc array of final bitmap (const)
-    static const uint16_t* chain_desc_array(const uint64_t* node, uint8_t sc, unsigned nc) noexcept {
+    static const uint64_t* chain_desc_array(const uint64_t* node, uint8_t sc, unsigned nc) noexcept {
         return desc_array(node, chain_hs(sc), nc);
     }
 
     // Desc array of final bitmap (mutable)
-    static uint16_t* chain_desc_array_mut(uint64_t* node, uint8_t sc, unsigned nc) noexcept {
+    static uint64_t* chain_desc_array_mut(uint64_t* node, uint8_t sc, unsigned nc) noexcept {
         return desc_array_mut(node, chain_hs(sc), nc);
     }
 
@@ -385,7 +372,7 @@ struct bitmask_ops {
 
     static uint64_t* add_child(uint64_t* node, node_header_t* h,
                                 uint8_t idx, uint64_t child_tagged,
-                                uint16_t child_desc, ALLOC& alloc) {
+                                uint64_t child_desc, ALLOC& alloc) {
         return add_child_at(node, h, 1, idx, child_tagged, child_desc, alloc);
     }
 
@@ -396,7 +383,7 @@ struct bitmask_ops {
     static uint64_t* chain_add_child(uint64_t* node, node_header_t* h,
                                       uint8_t sc, uint8_t idx,
                                       uint64_t child_tagged,
-                                      uint16_t child_desc, ALLOC& alloc) {
+                                      uint64_t child_desc, ALLOC& alloc) {
         uint64_t* nn = add_child_at(node, h, chain_hs(sc), idx,
                                       child_tagged, child_desc, alloc);
         if (nn != node && sc > 0) fix_embeds(nn, sc);
@@ -432,7 +419,7 @@ struct bitmask_ops {
     static uint64_t* make_bitmask(const uint8_t* indices,
                                    const uint64_t* child_tagged_ptrs,
                                    unsigned n_children, ALLOC& alloc,
-                                   const uint16_t* descs = nullptr) {
+                                   const uint64_t* descs = nullptr) {
         bitmap_256_t bm = bitmap_256_t::from_indices(indices, n_children);
 
         constexpr size_t hs = 1;
@@ -451,11 +438,11 @@ struct bitmask_ops {
                                     indices, child_tagged_ptrs, n_children);
 
         // Fill desc array
-        uint16_t* nd = desc_array_mut(nn, hs, n_children);
+        uint64_t* nd = desc_array_mut(nn, hs, n_children);
         if (descs) {
-            std::memcpy(nd, descs, n_children * sizeof(uint16_t));
+            std::memcpy(nd, descs, n_children * sizeof(uint64_t));
         } else {
-            std::memset(nd, 0, n_children * sizeof(uint16_t));
+            std::memset(nd, 0, n_children * sizeof(uint64_t));
         }
         return nn;
     }
@@ -475,7 +462,7 @@ struct bitmask_ops {
                                       const uint8_t* final_indices,
                                       const uint64_t* final_children_tagged,
                                       unsigned final_n_children, ALLOC& alloc,
-                                      const uint16_t* descs = nullptr) {
+                                      const uint64_t* descs = nullptr) {
         // Allocation: header(1) + skip_count*6 + bitmap(4) + sentinel(1) + children(N) + desc(N)
         size_t needed = 1 + static_cast<size_t>(skip_count) * 6 + 5 + final_n_children
                        + desc_u64(final_n_children);
@@ -511,11 +498,11 @@ struct bitmask_ops {
                                     final_n_children);
 
         // Fill desc array (after children)
-        uint16_t* nd = reinterpret_cast<uint16_t*>(nn + final_offset + 5 + final_n_children);
+        uint64_t* nd = nn + final_offset + 5 + final_n_children;
         if (descs) {
-            std::memcpy(nd, descs, final_n_children * sizeof(uint16_t));
+            std::memcpy(nd, descs, final_n_children * sizeof(uint64_t));
         } else {
-            std::memset(nd, 0, final_n_children * sizeof(uint16_t));
+            std::memset(nd, 0, final_n_children * sizeof(uint64_t));
         }
 
         return nn;
@@ -536,21 +523,26 @@ struct bitmask_ops {
         // Extract final bitmask indices + children + descs
         const bitmap_256_t& fbm = chain_bitmap(old_node, old_sc);
         const uint64_t* old_ch = chain_children(old_node, old_sc);
-        const uint16_t* old_desc = chain_desc_array(old_node, old_sc, final_nc);
+        const uint64_t* old_desc = chain_desc_array(old_node, old_sc, final_nc);
 
         uint8_t indices[256];
         uint64_t children[256];
-        uint16_t descs[256];
+        uint64_t descs[256];
         fbm.for_each_set([&](uint8_t idx, int slot) {
             indices[slot] = idx;
             children[slot] = old_ch[slot];
             descs[slot] = old_desc[slot];
         });
 
+        // Sum exact child descs for header (capped)
+        uint64_t total = 0;
+        for (unsigned i = 0; i < final_nc; ++i) total += descs[i];
+        uint16_t hdr_desc = total > COMPACT_MAX ? COALESCE_CAP
+                                                : static_cast<uint16_t>(total);
+
         if (rem_skip == 0) {
             auto* bm_node = make_bitmask(indices, children, final_nc, alloc, descs);
-            get_header(bm_node)->set_descendants(
-                sum_tagged_array(children, final_nc));
+            get_header(bm_node)->set_descendants(hdr_desc);
             return tag_bitmask(bm_node);
         }
 
@@ -560,8 +552,7 @@ struct bitmask_ops {
             sb[i] = skip_byte(old_node, from_pos + i);
 
         auto* chain = make_skip_chain(sb, rem_skip, indices, children, final_nc, alloc, descs);
-        get_header(chain)->set_descendants(
-            sum_tagged_array(children, final_nc));
+        get_header(chain)->set_descendants(hdr_desc);
         return tag_bitmask(chain);
     }
 
@@ -587,11 +578,11 @@ struct bitmask_ops {
         // Extract final bitmask indices + children + descs
         const bitmap_256_t& fbm = chain_bitmap(child, child_sc);
         const uint64_t* cch = chain_children(child, child_sc);
-        const uint16_t* old_desc = chain_desc_array(child, child_sc, nc);
+        const uint64_t* old_desc = chain_desc_array(child, child_sc, nc);
 
         uint8_t indices[256];
         uint64_t children[256];
-        uint16_t descs[256];
+        uint64_t descs[256];
         fbm.for_each_set([&](uint8_t idx, int slot) {
             indices[slot] = idx;
             children[slot] = cch[slot];
@@ -612,7 +603,7 @@ struct bitmask_ops {
         uint64_t sole_child;       // tagged child pointer
         uint8_t  bytes[7];         // skip bytes to prepend (skip_bytes[0..sc-1] + sole_idx)
         uint8_t  total_skip;       // sc + 1
-        uint16_t sole_entries;     // tagged_count of sole_child
+        uint64_t sole_entries;     // exact subtree count of sole_child
     };
 
     // Extract collapse info from a skip chain (sc > 0, entries() == 1)
@@ -622,7 +613,7 @@ struct bitmask_ops {
         ci.bytes[sc] = chain_bitmap(node, sc).first_set_bit();
         ci.total_skip = sc + 1;
         ci.sole_child = chain_children(node, sc)[0];
-        ci.sole_entries = tagged_count(ci.sole_child);
+        ci.sole_entries = chain_desc_array(node, sc, 1)[0];
         return ci;
     }
 
@@ -633,12 +624,29 @@ struct bitmask_ops {
         ci.bytes[0] = bmp.first_set_bit();
         ci.total_skip = 1;
         ci.sole_child = real_children(node, 1)[0];
-        ci.sole_entries = tagged_count(ci.sole_child);
+        ci.sole_entries = desc_array(node, 1, 1)[0];
         return ci;
     }
 
     // ==================================================================
     // Bitmask node: iterate  cb(uint8_t idx, int slot, uint64_t tagged_child)
+    // ==================================================================
+
+    // Exact subtree count from a tagged pointer.
+    // Leaf: entries (exact). Bitmask: sum of child desc array (exact).
+    static uint64_t exact_subtree_count(uint64_t tagged) noexcept {
+        if (tagged & LEAF_BIT)
+            return get_header(untag_leaf(tagged))->entries();
+        const uint64_t* node = bm_to_node_const(tagged);
+        auto* hdr = get_header(node);
+        uint8_t sc = hdr->skip();
+        unsigned nc = hdr->entries();
+        const uint64_t* da = chain_desc_array(node, sc, nc);
+        uint64_t total = 0;
+        for (unsigned i = 0; i < nc; ++i) total += da[i];
+        return total;
+    }
+
     // ==================================================================
 
     template<typename Fn>
@@ -660,12 +668,12 @@ struct bitmask_ops {
     }
 
     // --- Desc array accessors (standalone bitmask, hs=1) ---
-    static uint16_t* child_desc_array(uint64_t* node) noexcept {
+    static uint64_t* child_desc_array(uint64_t* node) noexcept {
         constexpr size_t hs = 1;
         unsigned nc = get_header(node)->entries();
         return desc_array_mut(node, hs, nc);
     }
-    static const uint16_t* child_desc_array(const uint64_t* node) noexcept {
+    static const uint64_t* child_desc_array(const uint64_t* node) noexcept {
         constexpr size_t hs = 1;
         unsigned nc = get_header(node)->entries();
         return desc_array(node, hs, nc);
@@ -825,7 +833,7 @@ struct bitmask_ops {
             bm.clear_bit(suffix);
             std::memmove(vd + slot, vd + slot + 1, (nc - slot) * sizeof(VST));
             h->set_entries(nc);
-            return {tag_leaf(node), true, static_cast<uint16_t>(nc)};
+            return {tag_leaf(node), true, nc};
         }
 
         // Realloc
@@ -844,7 +852,7 @@ struct bitmask_ops {
         std::memcpy(nv + slot, ov + slot + 1, (nc - slot) * sizeof(VST));
 
         dealloc_node(alloc, node, h->alloc_u64());
-        return {tag_leaf(nn), true, static_cast<uint16_t>(nc)};
+        return {tag_leaf(nn), true, nc};
     }
 
     // ==================================================================
@@ -942,7 +950,7 @@ private:
     // --- Shared add child core: works for any header size ---
     static uint64_t* add_child_at(uint64_t* node, node_header_t* h, size_t hs,
                                     uint8_t idx, uint64_t child_tagged,
-                                    uint16_t child_desc, ALLOC& alloc) {
+                                    uint64_t child_desc, ALLOC& alloc) {
         bitmap_256_t& bm = bm_mut(node, hs);
         unsigned oc = h->entries();
         unsigned nc = oc + 1;
@@ -952,9 +960,9 @@ private:
         // In-place
         if (needed <= h->alloc_u64()) {
             // Save desc array (children shift will overwrite it)
-            uint16_t saved_desc[256];
-            const uint16_t* od = desc_array(node, hs, oc);
-            std::memcpy(saved_desc, od, oc * sizeof(uint16_t));
+            uint64_t saved_desc[256];
+            const uint64_t* od = desc_array(node, hs, oc);
+            std::memcpy(saved_desc, od, oc * sizeof(uint64_t));
 
             // Insert child
             uint64_t* rch = real_children_mut(node, hs);
@@ -964,10 +972,10 @@ private:
             h->set_entries(nc);
 
             // Write desc with insertion
-            uint16_t* nd = desc_array_mut(node, hs, nc);
-            std::memcpy(nd, saved_desc, isl * sizeof(uint16_t));
+            uint64_t* nd = desc_array_mut(node, hs, nc);
+            std::memcpy(nd, saved_desc, isl * sizeof(uint64_t));
             nd[isl] = child_desc;
-            std::memcpy(nd + isl + 1, saved_desc + isl, (oc - isl) * sizeof(uint16_t));
+            std::memcpy(nd + isl + 1, saved_desc + isl, (oc - isl) * sizeof(uint64_t));
             return node;
         }
 
@@ -990,11 +998,11 @@ private:
                                     oc, isl, child_tagged);
 
         // Copy desc with insertion
-        const uint16_t* od = desc_array(node, hs, oc);
-        uint16_t* nd = desc_array_mut(nn, hs, nc);
-        std::memcpy(nd, od, isl * sizeof(uint16_t));
+        const uint64_t* od = desc_array(node, hs, oc);
+        uint64_t* nd = desc_array_mut(nn, hs, nc);
+        std::memcpy(nd, od, isl * sizeof(uint64_t));
         nd[isl] = child_desc;
-        std::memcpy(nd + isl + 1, od + isl, (oc - isl) * sizeof(uint16_t));
+        std::memcpy(nd + isl + 1, od + isl, (oc - isl) * sizeof(uint64_t));
 
         dealloc_node(alloc, node, h->alloc_u64());
         return nn;
@@ -1015,10 +1023,10 @@ private:
         // In-place
         if (!should_shrink_u64(h->alloc_u64(), needed)) {
             // Save desc excluding slot
-            uint16_t saved_desc[256];
-            const uint16_t* od = desc_array(node, hs, oc);
-            std::memcpy(saved_desc, od, slot * sizeof(uint16_t));
-            std::memcpy(saved_desc + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
+            uint64_t saved_desc[256];
+            const uint64_t* od = desc_array(node, hs, oc);
+            std::memcpy(saved_desc, od, slot * sizeof(uint64_t));
+            std::memcpy(saved_desc + slot, od + slot + 1, (nc - slot) * sizeof(uint64_t));
 
             // Remove child
             bitmap_256_t::arr_remove(bm_mut(node, hs), real_children_mut(node, hs),
@@ -1026,8 +1034,8 @@ private:
             h->set_entries(nc);
 
             // Write back desc at new position
-            uint16_t* nd = desc_array_mut(node, hs, nc);
-            std::memcpy(nd, saved_desc, nc * sizeof(uint16_t));
+            uint64_t* nd = desc_array_mut(node, hs, nc);
+            std::memcpy(nd, saved_desc, nc * sizeof(uint64_t));
             return node;
         }
 
@@ -1050,10 +1058,10 @@ private:
                                     oc, slot);
 
         // Copy desc excluding slot
-        const uint16_t* od = desc_array(node, hs, oc);
-        uint16_t* nd = desc_array_mut(nn, hs, nc);
-        std::memcpy(nd, od, slot * sizeof(uint16_t));
-        std::memcpy(nd + slot, od + slot + 1, (nc - slot) * sizeof(uint16_t));
+        const uint64_t* od = desc_array(node, hs, oc);
+        uint64_t* nd = desc_array_mut(nn, hs, nc);
+        std::memcpy(nd, od, slot * sizeof(uint64_t));
+        std::memcpy(nd + slot, od + slot + 1, (nc - slot) * sizeof(uint64_t));
 
         dealloc_node(alloc, node, h->alloc_u64());
         return nn;
@@ -1101,11 +1109,11 @@ private:
     }
 
     // --- Bitmask node: desc array (after real children) ---
-    static const uint16_t* desc_array(const uint64_t* n, size_t header_size, unsigned nc) noexcept {
-        return reinterpret_cast<const uint16_t*>(n + header_size + BITMAP_256_U64 + 1 + nc);
+    static const uint64_t* desc_array(const uint64_t* n, size_t header_size, unsigned nc) noexcept {
+        return n + header_size + BITMAP_256_U64 + 1 + nc;
     }
-    static uint16_t* desc_array_mut(uint64_t* n, size_t header_size, unsigned nc) noexcept {
-        return reinterpret_cast<uint16_t*>(n + header_size + BITMAP_256_U64 + 1 + nc);
+    static uint64_t* desc_array_mut(uint64_t* n, size_t header_size, unsigned nc) noexcept {
+        return n + header_size + BITMAP_256_U64 + 1 + nc;
     }
 };
 
