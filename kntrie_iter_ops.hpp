@@ -306,7 +306,7 @@ struct kntrie_iter_ops {
     static iter_ops_result_t<IK, VST> iter_next_node(uint64_t ptr, NK ik,
                                                         IK prefix, int bits) noexcept {
         // --- LEAF ---
-        if (ptr & LEAF_BIT) [[likely]] {
+        if (ptr & LEAF_BIT) [[unlikely]] {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             uint8_t skip = hdr->skip();
@@ -444,7 +444,7 @@ struct kntrie_iter_ops {
     template<int BITS, typename IK> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> iter_prev_node(uint64_t ptr, NK ik,
                                                         IK prefix, int bits) noexcept {
-        if (ptr & LEAF_BIT) [[likely]] {
+        if (ptr & LEAF_BIT) [[unlikely]] {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             uint8_t skip = hdr->skip();
