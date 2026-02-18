@@ -11,40 +11,7 @@ template<typename KEY, typename VALUE, typename ALLOC = std::allocator<uint64_t>
 class kntrie {
     static_assert(std::is_integral_v<KEY>, "KEY must be integral");
 
-    // --- Normalization: A types → normalized slot, deduplicates templates ---
-    using VT_orig = value_traits<VALUE, ALLOC>;
-    static constexpr bool NORMALIZE = VT_orig::IS_TRIVIAL;
-    using IMPL_V = std::conditional_t<NORMALIZE, typename VT_orig::slot_type, VALUE>;
-    using impl_t = kntrie_impl<KEY, IMPL_V, ALLOC>;
-
-    // --- Boundary conversion helpers ---
-
-    static IMPL_V to_impl(const VALUE& v) noexcept {
-        if constexpr (NORMALIZE) {
-            IMPL_V iv{};
-            std::memcpy(&iv, &v, sizeof(VALUE));
-            return iv;
-        } else {
-            return v;
-        }
-    }
-
-    static VALUE to_value(const IMPL_V& iv) noexcept {
-        if constexpr (NORMALIZE) {
-            VALUE v{};
-            std::memcpy(&v, &iv, sizeof(VALUE));
-            return v;
-        } else {
-            return iv;
-        }
-    }
-
-    static const VALUE* to_value_ptr(const IMPL_V* p) noexcept {
-        if constexpr (NORMALIZE)
-            return std::launder(reinterpret_cast<const VALUE*>(p));
-        else
-            return p;
-    }
+    using impl_t = kntrie_impl<KEY, VALUE, ALLOC>;
 
 public:
     using key_type        = KEY;
@@ -68,9 +35,9 @@ public:
         const_iterator(const impl_t* p, KEY k, VALUE v, bool valid)
             : parent_(p), key_(k), value_(v), valid_(valid) {}
 
-        static const_iterator from_impl_result(const impl_t* p,
-                                               const typename impl_t::iter_result_t& r) {
-            return const_iterator(p, r.key, to_value(r.value), r.found);
+        static const_iterator from_result(const impl_t* p,
+                                           const typename impl_t::iter_result_t& r) {
+            return const_iterator(p, r.key, r.value, r.found);
         }
 
     public:
@@ -92,7 +59,7 @@ public:
         const_iterator& operator++() {
             auto r = parent_->iter_next_(key_);
             key_   = r.key;
-            value_ = to_value(r.value);
+            value_ = r.value;
             valid_ = r.found;
             return *this;
         }
@@ -106,7 +73,7 @@ public:
         const_iterator& operator--() {
             auto r = parent_->iter_prev_(key_);
             key_   = r.key;
-            value_ = to_value(r.value);
+            value_ = r.value;
             valid_ = r.found;
             return *this;
         }
@@ -151,17 +118,17 @@ public:
     // ==================================================================
 
     std::pair<iterator, bool> insert(const value_type& kv) {
-        auto [ok, ins] = impl_.insert(kv.first, to_impl(kv.second));
+        auto [ok, ins] = impl_.insert(kv.first, kv.second);
         return {iterator{}, ins};
     }
     std::pair<bool, bool> insert(const KEY& key, const VALUE& value) {
-        return impl_.insert(key, to_impl(value));
+        return impl_.insert(key, value);
     }
     std::pair<bool, bool> insert_or_assign(const KEY& key, const VALUE& value) {
-        return impl_.insert_or_assign(key, to_impl(value));
+        return impl_.insert_or_assign(key, value);
     }
     std::pair<bool, bool> assign(const KEY& key, const VALUE& value) {
-        return impl_.assign(key, to_impl(value));
+        return impl_.assign(key, value);
     }
     template<typename... Args>
     std::pair<iterator, bool> emplace(Args&&... args) {
@@ -176,27 +143,25 @@ public:
     // Lookup
     // ==================================================================
 
-    const VALUE* find_value(const KEY& key) const noexcept {
-        return to_value_ptr(impl_.find_value(key));
-    }
+    const VALUE* find_value(const KEY& key) const noexcept { return impl_.find_value(key); }
     bool contains(const KEY& key) const noexcept { return impl_.contains(key); }
     size_type count(const KEY& key) const noexcept { return contains(key) ? 1 : 0; }
 
     VALUE& operator[](const KEY& key) {
-        auto* v = impl_.find_value(key);
-        if (v) return const_cast<VALUE&>(*to_value_ptr(v));
-        impl_.insert(key, to_impl(VALUE{}));
-        return const_cast<VALUE&>(*to_value_ptr(impl_.find_value(key)));
+        const VALUE* v = impl_.find_value(key);
+        if (v) return const_cast<VALUE&>(*v);
+        impl_.insert(key, VALUE{});
+        return const_cast<VALUE&>(*impl_.find_value(key));
     }
     const VALUE& at(const KEY& key) const {
-        auto* v = impl_.find_value(key);
+        const VALUE* v = impl_.find_value(key);
         if (!v) throw std::out_of_range("kntrie::at: key not found");
-        return *to_value_ptr(v);
+        return *v;
     }
     VALUE& at(const KEY& key) {
-        auto* v = impl_.find_value(key);
+        const VALUE* v = impl_.find_value(key);
         if (!v) throw std::out_of_range("kntrie::at: key not found");
-        return const_cast<VALUE&>(*to_value_ptr(v));
+        return const_cast<VALUE&>(*v);
     }
 
     // ==================================================================
@@ -204,7 +169,7 @@ public:
     // ==================================================================
 
     const_iterator begin() const noexcept {
-        return const_iterator::from_impl_result(&impl_, impl_.iter_first_());
+        return const_iterator::from_result(&impl_, impl_.iter_first_());
     }
     const_iterator end() const noexcept {
         return const_iterator{};
@@ -213,28 +178,28 @@ public:
     const_iterator cend()   const noexcept { return end(); }
 
     const_iterator rbegin() const noexcept {
-        return const_iterator::from_impl_result(&impl_, impl_.iter_last_());
+        return const_iterator::from_result(&impl_, impl_.iter_last_());
     }
     const_iterator rend() const noexcept {
         return const_iterator{};
     }
 
     const_iterator find(const KEY& key) const noexcept {
-        auto* v = impl_.find_value(key);
+        const VALUE* v = impl_.find_value(key);
         if (!v) return end();
-        return const_iterator(&impl_, key, to_value(*v), true);
+        return const_iterator(&impl_, key, *v, true);
     }
 
     const_iterator lower_bound(const KEY& k) const noexcept {
-        auto* v = impl_.find_value(k);
-        if (v) return const_iterator(&impl_, k, to_value(*v), true);
+        const VALUE* v = impl_.find_value(k);
+        if (v) return const_iterator(&impl_, k, *v, true);
         auto r = impl_.iter_next_(k);
-        return const_iterator::from_impl_result(&impl_, r);
+        return const_iterator::from_result(&impl_, r);
     }
 
     const_iterator upper_bound(const KEY& k) const noexcept {
         auto r = impl_.iter_next_(k);
-        return const_iterator::from_impl_result(&impl_, r);
+        return const_iterator::from_result(&impl_, r);
     }
 
     std::pair<const_iterator, const_iterator> equal_range(const KEY& k) const noexcept {
