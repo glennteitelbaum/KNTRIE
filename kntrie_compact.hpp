@@ -232,14 +232,14 @@ struct compact_ops {
         }
         if constexpr (!INSERT) return {tag_leaf(node), false, false};
 
-        if (entries >= COMPACT_MAX)
+        if (entries >= COMPACT_MAX) [[unlikely]]
             return {tag_leaf(node), false, true};  // needs_split
 
         int ins = (base - kd) + (*base < suffix);
         unsigned dups = ts - entries;
 
         // Dups available: consume one in-place
-        if (dups > 0) {
+        if (dups > 0) [[likely]] {
             insert_consume_dup(kd, vd, ts,
                                 ins, entries, suffix, value);
             h->set_entries(entries + 1);
@@ -280,13 +280,13 @@ struct compact_ops {
 
         const K* base = adaptive_search<K>::find_base(
             kd, ts, suffix);
-        if (*base != suffix) return {tag_leaf(node), false, 0};
+        if (*base != suffix) [[unlikely]] return {tag_leaf(node), false, 0};
         unsigned idx = static_cast<unsigned>(base - kd);
 
         unsigned nc = entries - 1;
 
         // Last entry
-        if (nc == 0) {
+        if (nc == 0) [[unlikely]] {
             if constexpr (VT::HAS_DESTRUCTOR)
                 VT::destroy(vd[idx], alloc);
             dealloc_node(alloc, node, h->alloc_u64());
@@ -295,7 +295,7 @@ struct compact_ops {
 
         // Shrink check: if entries-1 fits in half the slots, realloc
         uint16_t new_ts = slots_for(nc);
-        if (new_ts < ts) {
+        if (new_ts < ts) [[unlikely]] {
             // Realloc + re-seed at smaller slot count
             size_t au64 = size_u64(new_ts, hs);
             uint64_t* nn = alloc_node(alloc, au64);

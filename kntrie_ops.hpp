@@ -444,13 +444,13 @@ struct kntrie_ops {
     static insert_result_t insert_node(uint64_t ptr, NK ik, VST value,
                                          ALLOC& alloc) {
         // SENTINEL
-        if (ptr == SENTINEL_TAGGED) {
+        if (ptr == SENTINEL_TAGGED) [[unlikely]] {
             if constexpr (!INSERT) return {ptr, false, false};
             return {tag_leaf(make_single_leaf(ik, value, alloc)), true, false};
         }
 
         // LEAF
-        if (ptr & LEAF_BIT) {
+        if (ptr & LEAF_BIT) [[unlikely]] {
             uint64_t* node = untag_leaf_mut(ptr);
             auto* hdr = get_header(node);
 
@@ -469,7 +469,7 @@ struct kntrie_ops {
         auto* hdr = get_header(node);
         uint8_t sc = hdr->skip();
 
-        if (sc > 0)
+        if (sc > 0) [[unlikely]]
             return insert_chain_skip<BITS, INSERT, ASSIGN>(
                 node, hdr, sc, ik, value, 0, alloc);
 
@@ -488,7 +488,7 @@ struct kntrie_ops {
             return leaf_insert<BITS, INSERT, ASSIGN>(node, hdr, ik, value, alloc);
 
         uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
-        if (expected != actual[pos]) {
+        if (expected != actual[pos]) [[unlikely]] {
             if constexpr (!INSERT) return {tag_leaf(node), false, false};
             return {split_on_prefix<BITS>(node, hdr, ik, value,
                                             actual, skip, pos, alloc), true, false};
@@ -522,7 +522,7 @@ struct kntrie_ops {
             result = CO::template insert<INSERT, ASSIGN>(
                 node, hdr, ik, value, alloc);
         }
-        if (result.needs_split) {
+        if (result.needs_split) [[unlikely]] {
             if constexpr (!INSERT) return {tag_leaf(node), false, false};
             return {convert_to_bitmask_tagged(node, hdr, ik, value, BITS, alloc),
                     true, false};
@@ -543,7 +543,7 @@ struct kntrie_ops {
         uint8_t actual_byte = BO::skip_byte(node, pos);
         uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
 
-        if (expected != actual_byte) {
+        if (expected != actual_byte) [[unlikely]] {
             if constexpr (!INSERT) return {tag_bitmask(node), false, false};
             return {split_skip_at<BITS>(node, hdr, sc, pos, ik, value, alloc),
                     true, false};
@@ -641,7 +641,7 @@ struct kntrie_ops {
     static erase_result_t erase_node(uint64_t ptr, NK ik, ALLOC& alloc) {
         if (ptr == SENTINEL_TAGGED) return {ptr, false, 0};
 
-        if (ptr & LEAF_BIT) {
+        if (ptr & LEAF_BIT) [[unlikely]] {
             uint64_t* node = untag_leaf_mut(ptr);
             auto* hdr = get_header(node);
 
@@ -659,7 +659,7 @@ struct kntrie_ops {
         auto* hdr = get_header(node);
         uint8_t sc = hdr->skip();
 
-        if (sc > 0)
+        if (sc > 0) [[unlikely]]
             return erase_chain_skip<BITS>(
                 node, hdr, sc, ik, 0, alloc);
 
@@ -677,7 +677,7 @@ struct kntrie_ops {
             return leaf_erase(node, hdr, ik, alloc);
 
         uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
-        if (expected != actual[pos])
+        if (expected != actual[pos]) [[unlikely]]
             return {tag_leaf(node), false, 0};
 
         if constexpr (BITS > 8) {
@@ -718,7 +718,7 @@ struct kntrie_ops {
         uint8_t actual_byte = BO::skip_byte(node, pos);
         uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
 
-        if (expected != actual_byte)
+        if (expected != actual_byte) [[unlikely]]
             return {tag_bitmask(node), false, 0};
 
         if constexpr (BITS > 8) {
@@ -749,7 +749,7 @@ struct kntrie_ops {
         else
             cl = BO::lookup(node, ti);
 
-        if (!cl.found) return {tag_bitmask(node), false, 0};
+        if (!cl.found) [[unlikely]] return {tag_bitmask(node), false, 0};
 
         // Recurse into child
         erase_result_t cr;
@@ -768,9 +768,9 @@ struct kntrie_ops {
             __builtin_unreachable();
         }
 
-        if (!cr.erased) return {tag_bitmask(node), false, 0};
+        if (!cr.erased) [[unlikely]] return {tag_bitmask(node), false, 0};
 
-        if (cr.tagged_ptr) {
+        if (cr.tagged_ptr) [[likely]] {
             // Child survived
             if (cr.tagged_ptr != cl.child) {
                 if (sc > 0)
@@ -780,7 +780,7 @@ struct kntrie_ops {
             }
             // Decrement descendants and check coalesce
             uint64_t exact = dec_descendants(node, hdr);
-            if (exact <= COMPACT_MAX)
+            if (exact <= COMPACT_MAX) [[unlikely]]
                 return do_coalesce<BITS>(node, hdr, alloc);
             return {tag_bitmask(node), true, exact};
         }
@@ -791,7 +791,7 @@ struct kntrie_ops {
             nn = BO::chain_remove_child(node, hdr, sc, cl.slot, ti, alloc);
         else
             nn = BO::remove_child(node, hdr, cl.slot, ti, alloc);
-        if (!nn) return {0, true, 0};
+        if (!nn) [[unlikely]] return {0, true, 0};
 
         hdr = get_header(nn);
         unsigned nc = hdr->entries();
@@ -800,7 +800,7 @@ struct kntrie_ops {
         uint64_t exact = dec_descendants(nn, hdr);
 
         // Collapse when final bitmask drops to 1 child
-        if (nc == 1) {
+        if (nc == 1) [[unlikely]] {
             typename BO::collapse_info ci;
             if (sc > 0)
                 ci = BO::chain_collapse_info(nn, sc);
@@ -821,7 +821,7 @@ struct kntrie_ops {
         }
 
         // Multi-child: check coalesce
-        if (exact <= COMPACT_MAX)
+        if (exact <= COMPACT_MAX) [[unlikely]]
             return do_coalesce<BITS>(nn, get_header(nn), alloc);
         return {tag_bitmask(nn), true, exact};
     }

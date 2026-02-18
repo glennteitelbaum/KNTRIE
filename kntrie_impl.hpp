@@ -241,7 +241,7 @@ private:
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
 
         // Empty trie: create single-entry leaf
-        if (root_v == SENTINEL_TAGGED) {
+        if (root_v == SENTINEL_TAGGED) [[unlikely]] {
             // C: dealloc heap object. B: stack dtor handles it. A: noop.
             if constexpr (!INSERT) {
                 if constexpr (!VT::IS_INLINE) VT::destroy(sv, alloc_v);

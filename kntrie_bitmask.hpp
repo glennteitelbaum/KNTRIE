@@ -746,7 +746,7 @@ struct bitmask_ops {
         size_t new_sz = bitmap_leaf_size_u64(nc, hs);
 
         // In-place
-        if (new_sz <= h->alloc_u64()) {
+        if (new_sz <= h->alloc_u64()) [[likely]] {
             int isl = bm.find_slot<slot_mode::UNFILTERED>(suffix);
             bm.set_bit(suffix);
             VT::open_gap(vd, count, isl);
@@ -785,13 +785,13 @@ struct bitmask_ops {
         auto* h = get_header(node);
         size_t hs = hdr_u64(node);
         bitmap_256_t& bm = bm_mut(node, hs);
-        if (!bm.has_bit(suffix)) return {tag_leaf(node), false, 0};
+        if (!bm.has_bit(suffix)) [[unlikely]] return {tag_leaf(node), false, 0};
 
         unsigned count = h->entries();
         int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
 
         unsigned nc = count - 1;
-        if (nc == 0) {
+        if (nc == 0) [[unlikely]] {
             if constexpr (VT::HAS_DESTRUCTOR)
                 VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
             dealloc_node(alloc, node, h->alloc_u64());
@@ -801,7 +801,7 @@ struct bitmask_ops {
         size_t new_sz = bitmap_leaf_size_u64(nc, hs);
 
         // In-place
-        if (!should_shrink_u64(h->alloc_u64(), new_sz)) {
+        if (!should_shrink_u64(h->alloc_u64(), new_sz)) [[likely]] {
             VST* vd = bl_vals_mut(node, hs);
             bm.clear_bit(suffix);
             // C: destroy (dealloc pointer) before shift. B: move-assign handles it.
@@ -935,7 +935,7 @@ private:
         size_t needed = bitmask_size_u64(nc, hs);
 
         // In-place
-        if (needed <= h->alloc_u64()) {
+        if (needed <= h->alloc_u64()) [[likely]] {
             // Save descendants (children shift will overwrite it)
             uint64_t saved = *descendants_ptr(node, hs, oc);
 
@@ -981,7 +981,7 @@ private:
                                        int slot, uint8_t idx, ALLOC& alloc) {
         unsigned oc = h->entries();
         unsigned nc = oc - 1;
-        if (nc == 0) {
+        if (nc == 0) [[unlikely]] {
             dealloc_node(alloc, node, h->alloc_u64());
             return nullptr;
         }
@@ -989,7 +989,7 @@ private:
         size_t needed = bitmask_size_u64(nc, hs);
 
         // In-place
-        if (!should_shrink_u64(h->alloc_u64(), needed)) {
+        if (!should_shrink_u64(h->alloc_u64(), needed)) [[likely]] {
             uint64_t saved = *descendants_ptr(node, hs, oc);
 
             bitmap_256_t::arr_remove(bm_mut(node, hs), real_children_mut(node, hs),
