@@ -63,7 +63,6 @@ struct kntrie_iter_ops {
             return {prefix | contrib, r.value, true};
         } else {
             auto r = CO::iter_first(node, hdr);
-            if (!r.found) return {IK{}, nullptr, false};
             IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
             return {prefix | contrib, r.value, true};
         }
@@ -81,7 +80,6 @@ struct kntrie_iter_ops {
             return {prefix | contrib, r.value, true};
         } else {
             auto r = CO::iter_last(node, hdr);
-            if (!r.found) return {IK{}, nullptr, false};
             IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
             return {prefix | contrib, r.value, true};
         }
@@ -95,12 +93,12 @@ struct kntrie_iter_ops {
         if constexpr (sizeof(NK) == 1) {
             size_t hs = 1 + (hdr->is_skip() ? 1 : 0);
             auto r = BO::bitmap_iter_next(node, static_cast<uint8_t>(suf), hs);
-            if (!r.found) return {IK{}, nullptr, false};
+            if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
             IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
             return {prefix | contrib, r.value, true};
         } else {
             auto r = CO::iter_next(node, hdr, suf);
-            if (!r.found) return {IK{}, nullptr, false};
+            if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
             IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
             return {prefix | contrib, r.value, true};
         }
@@ -114,12 +112,12 @@ struct kntrie_iter_ops {
         if constexpr (sizeof(NK) == 1) {
             size_t hs = 1 + (hdr->is_skip() ? 1 : 0);
             auto r = BO::bitmap_iter_prev(node, static_cast<uint8_t>(suf), hs);
-            if (!r.found) return {IK{}, nullptr, false};
+            if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
             IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
             return {prefix | contrib, r.value, true};
         } else {
             auto r = CO::iter_prev(node, hdr, suf);
-            if (!r.found) return {IK{}, nullptr, false};
+            if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
             IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
             return {prefix | contrib, r.value, true};
         }
@@ -308,12 +306,11 @@ struct kntrie_iter_ops {
     static iter_ops_result_t<IK, VST> iter_next_node(uint64_t ptr, NK ik,
                                                         IK prefix, int bits) noexcept {
         // --- LEAF ---
-        if (ptr & LEAF_BIT) {
+        if (ptr & LEAF_BIT) [[likely]] {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
-            if (hdr->entries() == 0) return {IK{}, nullptr, false};
             uint8_t skip = hdr->skip();
-            if (skip)
+            if (skip) [[unlikely]]
                 return iter_next_leaf_skip<BITS, IK>(
                     node, hdr, ik, hdr->prefix_bytes(), skip, 0, prefix, bits);
             return leaf_next<IK>(node, hdr, ik, prefix, bits);
@@ -338,12 +335,12 @@ struct kntrie_iter_ops {
             return leaf_next<IK>(node, hdr, ik, prefix, bits);
 
         uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
-        if (kb < pb[pos]) {
+        if (kb < pb[pos]) [[unlikely]] {
             // Prefix > key: descend min through remaining prefix
             return descend_min_leaf_skip<BITS, IK>(
                 node, hdr, pb, skip, pos, prefix, bits);
         }
-        if (kb > pb[pos]) return {IK{}, nullptr, false};
+        if (kb > pb[pos]) [[unlikely]] return {IK{}, nullptr, false};
 
         prefix |= IK(pb[pos]) << (IK_BITS - bits - 8);
         if constexpr (BITS > 8) {
@@ -372,11 +369,11 @@ struct kntrie_iter_ops {
 
         uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
         uint8_t sb = BO::skip_byte(node, pos);
-        if (kb < sb) {
+        if (kb < sb) [[unlikely]] {
             // Chain byte > key: descend min from here
             return descend_min_chain_skip<BITS, IK>(node, sc, pos, prefix, bits);
         }
-        if (kb > sb) return {IK{}, nullptr, false};
+        if (kb > sb) [[unlikely]] return {IK{}, nullptr, false};
 
         prefix |= IK(sb) << (IK_BITS - bits - 8);
         if constexpr (BITS > 8) {
@@ -406,7 +403,7 @@ struct kntrie_iter_ops {
 
         // Single branchless scan: 1-based slot, 0 = not found
         int slot = fbm.template find_slot<slot_mode::BRANCHLESS>(byte);
-        if (slot) {
+        if (slot) [[likely]] {
             IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
 
             if constexpr (BITS > 8) {
@@ -420,13 +417,13 @@ struct kntrie_iter_ops {
                 else
                     r = iter_next_node<BITS - 8, IK>(
                         children[slot - 1], shifted, cp, bits + 8);
-                if (r.found) return r;
+                if (r.found) [[likely]] return r;
             }
         }
 
         // Rare: byte not set or exhausted subtree, find next sibling
         auto adj = fbm.next_set_after(byte);
-        if (adj.found) {
+        if (adj.found) [[unlikely]] {
             IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
             if constexpr (BITS > 8) {
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
@@ -447,12 +444,11 @@ struct kntrie_iter_ops {
     template<int BITS, typename IK> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> iter_prev_node(uint64_t ptr, NK ik,
                                                         IK prefix, int bits) noexcept {
-        if (ptr & LEAF_BIT) {
+        if (ptr & LEAF_BIT) [[likely]] {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
-            if (hdr->entries() == 0) return {IK{}, nullptr, false};
             uint8_t skip = hdr->skip();
-            if (skip)
+            if (skip) [[unlikely]]
                 return iter_prev_leaf_skip<BITS, IK>(
                     node, hdr, ik, hdr->prefix_bytes(), skip, 0, prefix, bits);
             return leaf_prev<IK>(node, hdr, ik, prefix, bits);
@@ -475,11 +471,11 @@ struct kntrie_iter_ops {
             return leaf_prev<IK>(node, hdr, ik, prefix, bits);
 
         uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
-        if (kb > pb[pos]) {
+        if (kb > pb[pos]) [[unlikely]] {
             return descend_max_leaf_skip<BITS, IK>(
                 node, hdr, pb, skip, pos, prefix, bits);
         }
-        if (kb < pb[pos]) return {IK{}, nullptr, false};
+        if (kb < pb[pos]) [[unlikely]] return {IK{}, nullptr, false};
 
         prefix |= IK(pb[pos]) << (IK_BITS - bits - 8);
         if constexpr (BITS > 8) {
@@ -507,10 +503,10 @@ struct kntrie_iter_ops {
 
         uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
         uint8_t sb = BO::skip_byte(node, pos);
-        if (kb > sb) {
+        if (kb > sb) [[unlikely]] {
             return descend_max_chain_skip<BITS, IK>(node, sc, pos, prefix, bits);
         }
-        if (kb < sb) return {IK{}, nullptr, false};
+        if (kb < sb) [[unlikely]] return {IK{}, nullptr, false};
 
         prefix |= IK(sb) << (IK_BITS - bits - 8);
         if constexpr (BITS > 8) {
@@ -538,7 +534,7 @@ struct kntrie_iter_ops {
 
         // Single branchless scan: 1-based slot, 0 = not found
         int slot = fbm.template find_slot<slot_mode::BRANCHLESS>(byte);
-        if (slot) {
+        if (slot) [[likely]] {
             IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
 
             if constexpr (BITS > 8) {
@@ -552,13 +548,13 @@ struct kntrie_iter_ops {
                 else
                     r = iter_prev_node<BITS - 8, IK>(
                         children[slot - 1], shifted, cp, bits + 8);
-                if (r.found) return r;
+                if (r.found) [[likely]] return r;
             }
         }
 
         // Rare: byte not set or exhausted subtree, find previous sibling
         auto adj = fbm.prev_set_before(byte);
-        if (adj.found) {
+        if (adj.found) [[unlikely]] {
             IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
             if constexpr (BITS > 8) {
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
