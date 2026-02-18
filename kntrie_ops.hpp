@@ -193,10 +193,9 @@ struct kntrie_ops {
             bi[1] = new_idx; cp[1] = tag_leaf(new_leaf);
         }
 
-        uint64_t ds[2] = {BO::exact_subtree_count(cp[0]),
-                          BO::exact_subtree_count(cp[1])};
-        auto* bm_node = BO::make_bitmask(bi, cp, 2, alloc, ds);
-        set_desc_capped(bm_node, ds[0] + ds[1]);
+        uint64_t total = BO::exact_subtree_count(cp[0]) +
+                         BO::exact_subtree_count(cp[1]);
+        auto* bm_node = BO::make_bitmask(bi, cp, 2, alloc, total);
         if (common > 0)
             return BO::wrap_in_chain(bm_node, saved_prefix, common, alloc);
         return tag_bitmask(bm_node);
@@ -250,10 +249,9 @@ struct kntrie_ops {
             bi[0] = actual_byte; cp[0] = remainder;
             bi[1] = expected;    cp[1] = new_leaf_tagged;
         }
-        uint64_t ds[2] = {BO::exact_subtree_count(cp[0]),
-                          BO::exact_subtree_count(cp[1])};
-        auto* split_node = BO::make_bitmask(bi, cp, 2, alloc, ds);
-        set_desc_capped(split_node, ds[0] + ds[1]);
+        uint64_t total = BO::exact_subtree_count(cp[0]) +
+                         BO::exact_subtree_count(cp[1]);
+        auto* split_node = BO::make_bitmask(bi, cp, 2, alloc, total);
 
         // Wrap in skip chain for prefix bytes [0..split_pos-1]
         uint64_t result;
@@ -352,7 +350,6 @@ struct kntrie_ops {
                                                        ALLOC& alloc) {
         uint8_t  indices[256];
         uint64_t child_tagged[256];
-        uint64_t descs[256];
         int      n_children = 0;
 
         size_t i = 0;
@@ -386,13 +383,11 @@ struct kntrie_ops {
                     cs.get(), vals + start, cc, bits - 8, alloc);
             }
             indices[n_children] = ti;
-            descs[n_children] = static_cast<uint64_t>(cc);
             n_children++;
         }
 
-        auto* node = BO::make_bitmask(indices, child_tagged, n_children, alloc, descs);
-        set_desc_capped(node, count);
-        return tag_bitmask(node);
+        return tag_bitmask(
+            BO::make_bitmask(indices, child_tagged, n_children, alloc, count));
     }
 
     // Convert overflowing compact leaf to bitmask tree.
@@ -602,10 +597,10 @@ struct kntrie_ops {
 
             uint64_t* nn;
             if (sc > 0)
-                nn = BO::chain_add_child(node, hdr, sc, ti, tag_leaf(leaf), 1, alloc);
+                nn = BO::chain_add_child(node, hdr, sc, ti, tag_leaf(leaf), alloc);
             else
-                nn = BO::add_child(node, hdr, ti, tag_leaf(leaf), 1, alloc);
-            inc_descendants(get_header(nn));
+                nn = BO::add_child(node, hdr, ti, tag_leaf(leaf), alloc);
+            inc_descendants(nn, get_header(nn));
             return {tag_bitmask(nn), true, false};
         }
 
@@ -629,15 +624,8 @@ struct kntrie_ops {
                 else
                     BO::set_child(node, cl.slot, cr.tagged_ptr);
             }
-            if (cr.inserted) {
-                inc_descendants(hdr);
-                uint64_t* da;
-                if (sc > 0)
-                    da = BO::chain_desc_array_mut(node, sc, hdr->entries());
-                else
-                    da = BO::child_desc_array(node);
-                da[cl.slot]++;
-            }
+            if (cr.inserted)
+                inc_descendants(node, hdr);
             return {tag_bitmask(node), cr.inserted, false};
         }
         __builtin_unreachable();
@@ -790,29 +778,11 @@ struct kntrie_ops {
                 else
                     BO::set_child(node, cl.slot, cr.tagged_ptr);
             }
-            // Store exact child count
-            uint64_t* da;
-            if (sc > 0)
-                da = BO::chain_desc_array_mut(node, sc, hdr->entries());
-            else
-                da = BO::child_desc_array(node);
-            da[cl.slot] = cr.subtree_entries;
-
-            // Update header descendants (capped) and compute exact total
-            uint16_t d = hdr->descendants();
-            uint64_t exact_total;
-            if (d == COALESCE_CAP) {
-                // Header was capped — sum exact child_descendants
-                exact_total = sum_child_desc_exact(node, sc);
-                hdr->set_descendants(exact_total > COMPACT_MAX ? COALESCE_CAP
-                                     : static_cast<uint16_t>(exact_total));
-            } else {
-                exact_total = d - 1;
-                hdr->set_descendants(static_cast<uint16_t>(exact_total));
-            }
-            if (exact_total <= COMPACT_MAX)
+            // Decrement descendants and check coalesce
+            uint64_t exact = dec_descendants(node, hdr);
+            if (exact <= COMPACT_MAX)
                 return do_coalesce<BITS>(node, hdr, alloc);
-            return {tag_bitmask(node), true, exact_total};
+            return {tag_bitmask(node), true, exact};
         }
 
         // Child fully erased — remove from bitmask
@@ -825,6 +795,9 @@ struct kntrie_ops {
 
         hdr = get_header(nn);
         unsigned nc = hdr->entries();
+
+        // Decrement the preserved descendants count
+        uint64_t exact = dec_descendants(nn, hdr);
 
         // Collapse when final bitmask drops to 1 child
         if (nc == 1) {
@@ -839,16 +812,15 @@ struct kntrie_ops {
                 uint64_t* leaf = untag_leaf_mut(ci.sole_child);
                 leaf = prepend_skip(leaf, ci.total_skip, ci.bytes, alloc);
                 dealloc_node(alloc, nn, nn_au64);
-                return {tag_leaf(leaf), true, ci.sole_entries};
+                return {tag_leaf(leaf), true, exact};
             }
             uint64_t* child_node = bm_to_node(ci.sole_child);
             dealloc_node(alloc, nn, nn_au64);
             return {BO::wrap_in_chain(child_node, ci.bytes, ci.total_skip, alloc),
-                    true, ci.sole_entries};
+                    true, exact};
         }
 
-        // Multi-child: update descendants, check coalesce
-        uint64_t exact = dec_or_recompute_desc(nn, sc);
+        // Multi-child: check coalesce
         if (exact <= COMPACT_MAX)
             return do_coalesce<BITS>(nn, get_header(nn), alloc);
         return {tag_bitmask(nn), true, exact};
@@ -948,7 +920,7 @@ struct kntrie_ops {
     template<int BITS> requires (BITS >= 8)
     static collected_t collect_bm_final(const uint64_t* node, uint8_t sc) {
         auto* hdr = get_header(node);
-        uint16_t total = hdr->descendants();
+        uint64_t total = BO::chain_descendants(node, sc, hdr->entries());
 
         auto wk = std::make_unique<NK[]>(total);
         auto wv = std::make_unique<VST[]>(total);
@@ -1063,40 +1035,15 @@ struct kntrie_ops {
     // NK-independent helpers (shared across all NK specializations)
     // ==================================================================
 
-    // Sum exact child descriptors (no capping)
-    static uint64_t sum_child_desc_exact(const uint64_t* node, uint8_t sc) noexcept {
-        unsigned nc = get_header(node)->entries();
-        const uint64_t* da = BO::chain_desc_array(node, sc, nc);
-        uint64_t total = 0;
-        for (unsigned i = 0; i < nc; ++i) total += da[i];
-        return total;
+    // Increment descendants count (for insert path)
+    static void inc_descendants(uint64_t* node, node_header_t* hdr) noexcept {
+        BO::chain_descendants_mut(node, hdr->skip(), hdr->entries())++;
     }
 
-    // Set descendants from known count (capped)
-    static void set_desc_capped(uint64_t* node, size_t count) noexcept {
-        get_header(node)->set_descendants(
-            count > COMPACT_MAX ? COALESCE_CAP : static_cast<uint16_t>(count));
-    }
-
-    // Capping increment (for insert path)
-    static void inc_descendants(node_header_t* h) noexcept {
-        uint16_t d = h->descendants();
-        if (d < COALESCE_CAP) h->set_descendants(d + 1);
-    }
-
-    // Decrement or recompute from exact child descs. Returns exact total.
-    static uint64_t dec_or_recompute_desc(uint64_t* node, uint8_t sc) noexcept {
-        auto* h = get_header(node);
-        uint16_t d = h->descendants();
-        if (d <= COMPACT_MAX) {
-            --d;
-            h->set_descendants(d);
-            return d;
-        }
-        uint64_t exact = sum_child_desc_exact(node, sc);
-        h->set_descendants(exact > COMPACT_MAX ? COALESCE_CAP
-                                               : static_cast<uint16_t>(exact));
-        return exact;
+    // Decrement descendants count, return new value (for erase path)
+    static uint64_t dec_descendants(uint64_t* node, node_header_t* hdr) noexcept {
+        uint64_t& d = BO::chain_descendants_mut(node, hdr->skip(), hdr->entries());
+        return --d;
     }
 
     // ==================================================================

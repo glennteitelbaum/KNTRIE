@@ -19,11 +19,10 @@ namespace gteitelbaum {
 inline constexpr size_t BITMAP_256_U64 = 4;   // 32 bytes
 inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
-inline constexpr uint16_t COALESCE_CAP = static_cast<uint16_t>(COMPACT_MAX + 1);
 inline constexpr size_t HEADER_U64    = 1;   // base header is 1 u64 (8 bytes), +1 if skip
 
-// u64s needed for N child descriptor entries (uint16_t each)
-inline constexpr size_t desc_u64(size_t n) noexcept { return n; }
+// u64s needed for descendants count (single u64 at end of bitmask node)
+inline constexpr size_t desc_u64(size_t) noexcept { return 1; }
 
 // Tagged pointer: bit 63 = leaf (sign bit for fast test)
 static constexpr uint64_t LEAF_BIT = uint64_t(1) << 63;
@@ -128,10 +127,6 @@ struct node_header_t {
 
     unsigned total_slots() const noexcept { return total_slots_v; }
     void set_total_slots(unsigned n) noexcept { total_slots_v = static_cast<uint16_t>(n); }
-
-    // Bitmask-only: total_slots_v repurposed as descendant count (saturating at 0xFFFF)
-    uint16_t descendants() const noexcept { return total_slots_v; }
-    void set_descendants(uint16_t n) noexcept { total_slots_v = n; }
 };
 static_assert(sizeof(node_header_t) == 8);
 
