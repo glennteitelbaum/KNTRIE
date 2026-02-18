@@ -230,10 +230,20 @@ struct iter_ops_result_t {
 
 template<typename VALUE, typename ALLOC>
 struct value_traits {
+    // Three categories:
+    //   A: trivially_copyable && sizeof <= 8  → inline, no dtor
+    //   B: nothrow_move && sizeof <= 8        → inline, has dtor
+    //   C: else                               → pointer, has dtor+dealloc
+    static constexpr bool IS_TRIVIAL =
+        std::is_trivially_copyable_v<VALUE> && sizeof(VALUE) <= 8;
     static constexpr bool IS_INLINE =
-        sizeof(VALUE) <= 8 && std::is_trivially_copyable_v<VALUE>;
+        (std::is_trivially_copyable_v<VALUE> ||
+         std::is_nothrow_move_constructible_v<VALUE>) && sizeof(VALUE) <= 8;
+    static constexpr bool HAS_DESTRUCTOR = !IS_TRIVIAL;
 
     using slot_type = std::conditional_t<IS_INLINE, VALUE, VALUE*>;
+
+    // --- store: VALUE → slot_type (for insert) ---
 
     static slot_type store(const VALUE& val, ALLOC& alloc) {
         if constexpr (IS_INLINE) {
@@ -247,22 +257,118 @@ struct value_traits {
         }
     }
 
+    // --- as_ptr: slot_type → const VALUE* ---
+
     static const VALUE* as_ptr(const slot_type& s) noexcept {
         if constexpr (IS_INLINE) return reinterpret_cast<const VALUE*>(&s);
         else                     return s;
     }
 
-    static void destroy(slot_type s, ALLOC& alloc) noexcept {
+    // --- destroy: release resources held by slot ---
+    //   A: noop.  B: call destructor.  C: call destructor + deallocate.
+
+    static void destroy(slot_type& s, ALLOC& alloc) noexcept {
         if constexpr (!IS_INLINE) {
             using VA = typename std::allocator_traits<ALLOC>::template rebind_alloc<VALUE>;
             VA va(alloc);
             std::allocator_traits<VA>::destroy(va, s);
             std::allocator_traits<VA>::deallocate(va, s, 1);
+        } else if constexpr (HAS_DESTRUCTOR) {
+            s.~slot_type();
         }
     }
 
-    static void write_slot(slot_type* dest, const slot_type& src) noexcept {
-        std::memcpy(dest, &src, sizeof(slot_type));
+    // --- init_slot: write into UNINITIALIZED destination ---
+
+    static void init_slot(slot_type* dst, const slot_type& val) {
+        if constexpr (IS_TRIVIAL || !IS_INLINE)
+            std::memcpy(dst, &val, sizeof(slot_type));
+        else
+            ::new (dst) slot_type(val);
+    }
+
+    static void init_slot(slot_type* dst, slot_type&& val) {
+        if constexpr (IS_TRIVIAL || !IS_INLINE)
+            std::memcpy(dst, &val, sizeof(slot_type));
+        else
+            ::new (dst) slot_type(std::move(val));
+    }
+
+    // --- write_slot: write into INITIALIZED (live or moved-from) destination ---
+
+    static void write_slot(slot_type* dst, const slot_type& src) noexcept {
+        if constexpr (IS_TRIVIAL || !IS_INLINE)
+            std::memcpy(dst, &src, sizeof(slot_type));
+        else
+            *dst = src;
+    }
+
+    static void write_slot(slot_type* dst, slot_type&& src) noexcept {
+        if constexpr (IS_TRIVIAL || !IS_INLINE)
+            std::memcpy(dst, &src, sizeof(slot_type));
+        else
+            *dst = std::move(src);
+    }
+
+    // --- open_gap: shift right, create uninit hole at pos ---
+    // vd has count LIVE elements, vd[count] is UNINIT.
+    // After: vd[pos] is UNINIT (ready for init_slot).
+
+    static void open_gap(slot_type* vd, size_t count, size_t pos) {
+        if constexpr (IS_TRIVIAL || !IS_INLINE) {
+            std::memmove(vd + pos + 1, vd + pos,
+                         (count - pos) * sizeof(slot_type));
+        } else {
+            if (count > pos) {
+                ::new (&vd[count]) slot_type(std::move(vd[count - 1]));
+                if (count - 1 > pos)
+                    std::move_backward(vd + pos, vd + count - 1, vd + count);
+                vd[pos].~slot_type();
+            }
+        }
+    }
+
+    // --- close_gap: remove element at pos, shift left, destroy tail ---
+    // For C: caller MUST VT::destroy(vd[pos]) first (dealloc pointer).
+    // For B: vd[pos] is live, move-assign handles cleanup.
+    // After: count-1 live elements, vd[count-1] destroyed.
+
+    static void close_gap(slot_type* vd, size_t count, size_t pos) {
+        if constexpr (IS_TRIVIAL || !IS_INLINE) {
+            std::memmove(vd + pos, vd + pos + 1,
+                         (count - 1 - pos) * sizeof(slot_type));
+        } else {
+            std::move(vd + pos + 1, vd + count, vd + pos);
+            vd[count - 1].~slot_type();
+        }
+    }
+
+    // --- copy_uninit: copy n slots to UNINIT destination, no overlap ---
+
+    static void copy_uninit(const slot_type* src, size_t n, slot_type* dst) {
+        if constexpr (IS_TRIVIAL || !IS_INLINE)
+            std::memcpy(dst, src, n * sizeof(slot_type));
+        else
+            std::uninitialized_copy(src, src + n, dst);
+    }
+
+    // --- move_uninit: move n slots to UNINIT destination, no overlap ---
+
+    static void move_uninit(slot_type* src, size_t n, slot_type* dst) {
+        if constexpr (IS_TRIVIAL || !IS_INLINE)
+            std::memcpy(dst, src, n * sizeof(slot_type));
+        else
+            std::uninitialized_move(src, src + n, dst);
+    }
+
+    // --- destroy_all: destroy n live slots (for node dealloc) ---
+
+    static void destroy_all(slot_type* vd, size_t n, ALLOC& alloc) noexcept {
+        if constexpr (!IS_INLINE) {
+            for (size_t i = 0; i < n; ++i) destroy(vd[i], alloc);
+        } else if constexpr (HAS_DESTRUCTOR) {
+            for (size_t i = 0; i < n; ++i) vd[i].~slot_type();
+        }
     }
 };
 

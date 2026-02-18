@@ -735,7 +735,7 @@ struct bitmask_ops {
             if constexpr (ASSIGN) {
                 int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
                 VT::destroy(vd[slot], alloc);
-                VT::write_slot(&vd[slot], value);
+                VT::init_slot(&vd[slot], value);
             }
             return {tag_leaf(node), false, false};
         }
@@ -749,8 +749,8 @@ struct bitmask_ops {
         if (new_sz <= h->alloc_u64()) {
             int isl = bm.find_slot<slot_mode::UNFILTERED>(suffix);
             bm.set_bit(suffix);
-            std::memmove(vd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
-            VT::write_slot(&vd[isl], value);
+            VT::open_gap(vd, count, isl);
+            VT::init_slot(&vd[isl], value);
             h->set_entries(nc);
             return {tag_leaf(node), true, false};
         }
@@ -768,9 +768,9 @@ struct bitmask_ops {
         nbm.set_bit(suffix);
         VST* nvd = bl_vals_mut(nn, hs);
         int isl = nbm.find_slot<slot_mode::UNFILTERED>(suffix);
-        std::memcpy(nvd, vd, isl * sizeof(VST));
-        VT::write_slot(&nvd[isl], value);
-        std::memcpy(nvd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
+        VT::copy_uninit(vd, isl, nvd);
+        VT::init_slot(&nvd[isl], value);
+        VT::copy_uninit(vd + isl, count - isl, nvd + isl + 1);
 
         dealloc_node(alloc, node, h->alloc_u64());
         return {tag_leaf(nn), true, false};
@@ -789,10 +789,11 @@ struct bitmask_ops {
 
         unsigned count = h->entries();
         int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
-        VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
 
         unsigned nc = count - 1;
         if (nc == 0) {
+            if constexpr (VT::HAS_DESTRUCTOR)
+                VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
             dealloc_node(alloc, node, h->alloc_u64());
             return {0, true, 0};
         }
@@ -803,12 +804,16 @@ struct bitmask_ops {
         if (!should_shrink_u64(h->alloc_u64(), new_sz)) {
             VST* vd = bl_vals_mut(node, hs);
             bm.clear_bit(suffix);
-            std::memmove(vd + slot, vd + slot + 1, (nc - slot) * sizeof(VST));
+            // C: destroy (dealloc pointer) before shift. B: move-assign handles it.
+            if constexpr (!VT::IS_INLINE)
+                VT::destroy(vd[slot], alloc);
+            VT::close_gap(vd, count, slot);
             h->set_entries(nc);
             return {tag_leaf(node), true, nc};
         }
 
-        // Realloc
+        // Realloc: destroyed slot skipped in copy
+        VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
         size_t au64 = round_up_u64(new_sz);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
@@ -820,8 +825,8 @@ struct bitmask_ops {
         bm_mut(nn, hs).clear_bit(suffix);
         const VST* ov = bl_vals(node, hs);
         VST*       nv = bl_vals_mut(nn, hs);
-        std::memcpy(nv, ov, slot * sizeof(VST));
-        std::memcpy(nv + slot, ov + slot + 1, (nc - slot) * sizeof(VST));
+        VT::copy_uninit(ov, slot, nv);
+        VT::copy_uninit(ov + slot + 1, nc - slot, nv + slot);
 
         dealloc_node(alloc, node, h->alloc_u64());
         return {tag_leaf(nn), true, nc};
@@ -845,7 +850,7 @@ struct bitmask_ops {
         for (unsigned i = 0; i < count; ++i) bm.set_bit(sorted_suffixes[i]);
         VST* vd = bl_vals_mut(node, hs);
         for (unsigned i = 0; i < count; ++i)
-            vd[bm.find_slot<slot_mode::UNFILTERED>(sorted_suffixes[i])] = values[i];
+            VT::init_slot(&vd[bm.find_slot<slot_mode::UNFILTERED>(sorted_suffixes[i])], values[i]);
         return node;
     }
 
@@ -861,7 +866,7 @@ struct bitmask_ops {
         h->set_entries(1);
         h->set_alloc_u64(sz);
         bm_mut(node, hs).set_bit(suffix);
-        VT::write_slot(&bl_vals_mut(node, hs)[0], value);
+        VT::init_slot(&bl_vals_mut(node, hs)[0], value);
         return node;
     }
 
@@ -893,7 +898,7 @@ struct bitmask_ops {
 
     static void bitmap_destroy_and_dealloc(uint64_t* node, ALLOC& alloc) {
         auto* h = get_header(node);
-        if constexpr (!VT::IS_INLINE) {
+        if constexpr (VT::HAS_DESTRUCTOR) {
             uint16_t count = h->entries();
             VST* vd = bl_vals_mut(node, hdr_u64(node));
             for (uint16_t i = 0; i < count; ++i)

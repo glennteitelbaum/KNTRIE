@@ -1002,7 +1002,7 @@ struct kntrie_ops {
             leaf = prepend_skip(leaf, sc, sb, alloc);
         }
 
-        dealloc_bitmask_subtree(tagged, alloc);
+        dealloc_bitmask_subtree<BITS>(tagged, alloc);
         return {tag_leaf(leaf), true, c.count};
     }
 
@@ -1096,23 +1096,93 @@ struct kntrie_ops {
     }
 
     // ==================================================================
-    // ==================================================================
-    // Subtree deallocation (no value destruction)
+    // Subtree deallocation (for coalesce: values already collected)
+    // B: destroy values (copies were made). C: do NOT destroy (pointers inherited).
     // ==================================================================
 
+    template<int BITS> requires (BITS >= 8)
     static void dealloc_bitmask_subtree(uint64_t tagged, ALLOC& alloc) noexcept {
         if (tagged & LEAF_BIT) {
             uint64_t* node = untag_leaf_mut(tagged);
-            dealloc_node(alloc, node, get_header(node)->alloc_u64());
+            auto* hdr = get_header(node);
+            // B type: old leaf values are copies — must destroy before dealloc.
+            // C type: new leaf inherited the pointers — do NOT destroy.
+            // A type: noop.
+            if constexpr (VT::IS_INLINE && VT::HAS_DESTRUCTOR) {
+                uint8_t skip = hdr->skip();
+                if (skip) {
+                    dealloc_leaf_skip<BITS>(node, skip, alloc);
+                } else {
+                    if constexpr (sizeof(NK) == 1)
+                        BO::bitmap_destroy_and_dealloc(node, alloc);
+                    else
+                        CO::destroy_and_dealloc(node, alloc);
+                }
+            } else {
+                dealloc_node(alloc, node, hdr->alloc_u64());
+            }
             return;
         }
         uint64_t* node = bm_to_node(tagged);
         auto* hdr = get_header(node);
         uint8_t sc = hdr->skip();
-        BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
-            dealloc_bitmask_subtree(child, alloc);
-        });
+
+        // Recurse children with narrowing through skip chain
+        if (sc > 0) {
+            dealloc_bm_chain_skip<BITS>(node, sc, 0, alloc);
+        } else {
+            dealloc_bm_final<BITS>(node, sc, alloc);
+        }
         dealloc_node(alloc, node, hdr->alloc_u64());
+    }
+
+    // Leaf skip: narrow NK through prefix bytes then destroy
+    template<int BITS> requires (BITS >= 8)
+    static void dealloc_leaf_skip(uint64_t* node, uint8_t skip,
+                                    ALLOC& alloc) noexcept {
+        if (skip == 0) {
+            if constexpr (sizeof(NK) == 1)
+                BO::bitmap_destroy_and_dealloc(node, alloc);
+            else
+                CO::destroy_and_dealloc(node, alloc);
+            return;
+        }
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                NARROW::template dealloc_leaf_skip<BITS - 8>(node, skip - 1, alloc);
+            else
+                dealloc_leaf_skip<BITS - 8>(node, skip - 1, alloc);
+        }
+    }
+
+    // Chain skip: narrow through embed bytes
+    template<int BITS> requires (BITS >= 8)
+    static void dealloc_bm_chain_skip(uint64_t* node, uint8_t sc, uint8_t pos,
+                                        ALLOC& alloc) noexcept {
+        if (pos >= sc) {
+            dealloc_bm_final<BITS>(node, sc, alloc);
+            return;
+        }
+        if constexpr (BITS > 8) {
+            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                NARROW::template dealloc_bm_chain_skip<BITS - 8>(node, sc, pos + 1, alloc);
+            else
+                dealloc_bm_chain_skip<BITS - 8>(node, sc, pos + 1, alloc);
+        }
+    }
+
+    // Final bitmap: recurse each child with narrowing
+    template<int BITS> requires (BITS >= 8)
+    static void dealloc_bm_final(uint64_t* node, uint8_t sc,
+                                   ALLOC& alloc) noexcept {
+        BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
+            if constexpr (BITS > 8) {
+                if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
+                    NARROW::template dealloc_bitmask_subtree<BITS - 8>(child, alloc);
+                else
+                    dealloc_bitmask_subtree<BITS - 8>(child, alloc);
+            }
+        });
     }
 
 };

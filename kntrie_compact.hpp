@@ -185,7 +185,7 @@ struct compact_ops {
 
     static void destroy_and_dealloc(uint64_t* node, ALLOC& alloc) {
         auto* h = get_header(node);
-        if constexpr (!VT::IS_INLINE) {
+        if constexpr (VT::HAS_DESTRUCTOR) {
             unsigned ts = h->total_slots();
             size_t hs = hdr_u64(node);
             const K* kd = keys(node, hs);
@@ -223,8 +223,8 @@ struct compact_ops {
             if constexpr (ASSIGN) {
                 int idx = base - kd;
                 VT::destroy(vd[idx], alloc);
-                VT::write_slot(&vd[idx], value);
-                // Update all dup copies too
+                VT::init_slot(&vd[idx], value);
+                // Update all dup copies too (live slots → write_slot)
                 for (int i = idx - 1; i >= 0 && kd[i] == suffix; --i)
                     VT::write_slot(&vd[i], value);
             }
@@ -287,7 +287,7 @@ struct compact_ops {
 
         // Last entry
         if (nc == 0) {
-            if constexpr (!VT::IS_INLINE)
+            if constexpr (VT::HAS_DESTRUCTOR)
                 VT::destroy(vd[idx], alloc);
             dealloc_node(alloc, node, h->alloc_u64());
             return {0, true, 0};
@@ -351,7 +351,7 @@ private:
     // Dedup + skip one key, writing into output arrays
     // ==================================================================
 
-    static void dedup_skip_into(const K* kd, const VST* vd, uint16_t ts,
+    static void dedup_skip_into(const K* kd, VST* vd, uint16_t ts,
                                   K skip_suffix,
                                   K* out_k, VST* out_v, ALLOC& alloc) {
         bool skipped = false;
@@ -360,12 +360,12 @@ private:
             if (i > 0 && kd[i] == kd[i - 1]) continue;
             if (!skipped && kd[i] == skip_suffix) {
                 skipped = true;
-                if constexpr (!VT::IS_INLINE)
+                if constexpr (VT::HAS_DESTRUCTOR)
                     VT::destroy(vd[i], alloc);
                 continue;
             }
             out_k[wi] = kd[i];
-            out_v[wi] = vd[i];
+            VT::write_slot(&out_v[wi], vd[i]);
             wi++;
         }
     }
@@ -392,17 +392,17 @@ private:
                 if (i > 0 && old_k[i] == old_k[i - 1]) continue;
                 if (!inserted && new_suffix < old_k[i]) {
                     dk[wi] = new_suffix;
-                    VT::write_slot(&dv[wi], new_val);
+                    VT::init_slot(&dv[wi], new_val);
                     wi++;
                     inserted = true;
                 }
                 dk[wi] = old_k[i];
-                dv[wi] = old_v[i];
+                VT::init_slot(&dv[wi], old_v[i]);
                 wi++;
             }
             if (!inserted) {
                 dk[wi] = new_suffix;
-                VT::write_slot(&dv[wi], new_val);
+                VT::init_slot(&dv[wi], new_val);
             }
             return;
         }
@@ -425,7 +425,7 @@ private:
             // Inject new key at sorted position
             if (!inserted && new_suffix < old_k[i]) {
                 dk[wi] = new_suffix;
-                VT::write_slot(&dv[wi], new_val);
+                VT::init_slot(&dv[wi], new_val);
                 wi++;
                 real_out++;
                 in_group++;
@@ -434,7 +434,7 @@ private:
                 // Check if group full → emit dup
                 if (placed < n_dups && in_group >= group_size) {
                     dk[wi] = dk[wi - 1];
-                    dv[wi] = dv[wi - 1];
+                    VT::init_slot(&dv[wi], dv[wi - 1]);
                     wi++;
                     placed++;
                     in_group = 0;
@@ -444,7 +444,7 @@ private:
 
             // Emit real entry from old array
             dk[wi] = old_k[i];
-            dv[wi] = old_v[i];
+            VT::init_slot(&dv[wi], old_v[i]);
             wi++;
             real_out++;
             in_group++;
@@ -452,7 +452,7 @@ private:
             // Check if group full → emit dup
             if (placed < n_dups && in_group >= group_size) {
                 dk[wi] = dk[wi - 1];
-                dv[wi] = dv[wi - 1];
+                VT::init_slot(&dv[wi], dv[wi - 1]);
                 wi++;
                 placed++;
                 in_group = 0;
@@ -463,14 +463,14 @@ private:
         // New key is largest — append at end
         if (!inserted) {
             dk[wi] = new_suffix;
-            VT::write_slot(&dv[wi], new_val);
+            VT::init_slot(&dv[wi], new_val);
             wi++;
             real_out++;
             in_group++;
 
             if (placed < n_dups && in_group >= group_size) {
                 dk[wi] = dk[wi - 1];
-                dv[wi] = dv[wi - 1];
+                VT::init_slot(&dv[wi], dv[wi - 1]);
                 wi++;
                 placed++;
             }
@@ -523,14 +523,20 @@ private:
             int shift_count = ins - 1 - dup_pos;
             if (shift_count > 0) {
                 std::memmove(kd + dup_pos, kd + dup_pos + 1, shift_count * sizeof(K));
-                std::memmove(vd + dup_pos, vd + dup_pos + 1, shift_count * sizeof(VST));
+                if constexpr (VT::IS_TRIVIAL || !VT::IS_INLINE)
+                    std::memmove(vd + dup_pos, vd + dup_pos + 1, shift_count * sizeof(VST));
+                else
+                    std::move(vd + dup_pos + 1, vd + dup_pos + 1 + shift_count, vd + dup_pos);
             }
             write_pos = ins - 1;
         } else {
             int shift_count = dup_pos - ins;
             if (shift_count > 0) {
                 std::memmove(kd + ins + 1, kd + ins, shift_count * sizeof(K));
-                std::memmove(vd + ins + 1, vd + ins, shift_count * sizeof(VST));
+                if constexpr (VT::IS_TRIVIAL || !VT::IS_INLINE)
+                    std::memmove(vd + ins + 1, vd + ins, shift_count * sizeof(VST));
+                else
+                    std::move_backward(vd + ins, vd + ins + shift_count, vd + ins + shift_count + 1);
             }
             write_pos = ins;
         }
@@ -545,7 +551,7 @@ private:
         int first = idx;
         while (first > 0 && kd[first - 1] == suffix) --first;
 
-        if constexpr (!VT::IS_INLINE)
+        if constexpr (VT::HAS_DESTRUCTOR)
             VT::destroy(vd[first], alloc);
 
         K   neighbor_key;
@@ -557,9 +563,12 @@ private:
             neighbor_key = kd[idx + 1];
             neighbor_val = vd[idx + 1];
         }
-        for (int i = first; i <= idx; ++i) {
+        // vd[first] is destroyed (uninit for B), rest are live dups
+        kd[first] = neighbor_key;
+        VT::init_slot(&vd[first], neighbor_val);
+        for (int i = first + 1; i <= idx; ++i) {
             kd[i] = neighbor_key;
-            vd[i] = neighbor_val;
+            VT::write_slot(&vd[i], neighbor_val);
         }
     }
 
@@ -576,7 +585,7 @@ private:
 
         if (n_entries == total) {
             std::memcpy(kd, real_keys, n_entries * sizeof(K));
-            std::memcpy(vd, real_vals, n_entries * sizeof(VST));
+            VT::copy_uninit(real_vals, n_entries, vd);
             return;
         }
 
@@ -588,11 +597,11 @@ private:
         while (placed < n_dups) {
             int chunk = stride + (placed < remainder ? 1 : 0);
             std::memcpy(kd + write, real_keys + src, chunk * sizeof(K));
-            std::memcpy(vd + write, real_vals + src, chunk * sizeof(VST));
+            VT::copy_uninit(real_vals + src, chunk, vd + write);
             write += chunk;
             src += chunk;
             kd[write] = kd[write - 1];
-            vd[write] = vd[write - 1];
+            VT::init_slot(&vd[write], vd[write - 1]);
             write++;
             placed++;
         }
@@ -600,7 +609,7 @@ private:
         int remaining = n_entries - src;
         if (remaining > 0) {
             std::memcpy(kd + write, real_keys + src, remaining * sizeof(K));
-            std::memcpy(vd + write, real_vals + src, remaining * sizeof(VST));
+            VT::copy_uninit(real_vals + src, remaining, vd + write);
         }
     }
 };
