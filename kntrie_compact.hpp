@@ -112,7 +112,6 @@ struct compact_ops {
     template<typename Fn>
     static void for_each(const uint64_t* node, const node_header_t* h, Fn&& cb) {
         unsigned ts = h->total_slots();
-        if (ts == 0) return;
         size_t hs = hdr_u64(node);
         const K*   kd = keys(node, hs);
         const VST* vd = vals(node, ts, hs);
@@ -131,7 +130,6 @@ struct compact_ops {
     static iter_leaf_result iter_first(const uint64_t* node,
                                         const node_header_t* h) noexcept {
         unsigned ts = h->total_slots();
-        if (ts == 0) return {0, nullptr, false};
         size_t hs = hdr_u64(node);
         const K*   kd = keys(node, hs);
         const VST* vd = vals(node, ts, hs);
@@ -141,7 +139,6 @@ struct compact_ops {
     static iter_leaf_result iter_last(const uint64_t* node,
                                        const node_header_t* h) noexcept {
         unsigned ts = h->total_slots();
-        if (ts == 0) return {0, nullptr, false};
         size_t hs = hdr_u64(node);
         const K*   kd = keys(node, hs);
         const VST* vd = vals(node, ts, hs);
@@ -153,7 +150,6 @@ struct compact_ops {
                                        const node_header_t* h,
                                        K suffix) noexcept {
         unsigned ts = h->total_slots();
-        if (ts == 0) return {0, nullptr, false};
         size_t hs = hdr_u64(node);
         const K*   kd = keys(node, hs);
         const VST* vd = vals(node, ts, hs);
@@ -171,7 +167,6 @@ struct compact_ops {
                                        const node_header_t* h,
                                        K suffix) noexcept {
         unsigned ts = h->total_slots();
-        if (ts == 0) return {0, nullptr, false};
         size_t hs = hdr_u64(node);
         const K*   kd = keys(node, hs);
         const VST* vd = vals(node, ts, hs);
@@ -192,14 +187,12 @@ struct compact_ops {
         auto* h = get_header(node);
         if constexpr (!VT::IS_INLINE) {
             unsigned ts = h->total_slots();
-            if (ts > 0) {
-                size_t hs = hdr_u64(node);
-                const K* kd = keys(node, hs);
-                VST* vd = vals_mut(node, ts, hs);
-                for (unsigned i = 0; i < ts; ++i) {
-                    if (i > 0 && kd[i] == kd[i - 1]) continue;
-                    VT::destroy(vd[i], alloc);
-                }
+            size_t hs = hdr_u64(node);
+            const K* kd = keys(node, hs);
+            VST* vd = vals_mut(node, ts, hs);
+            for (unsigned i = 0; i < ts; ++i) {
+                if (i > 0 && kd[i] == kd[i - 1]) continue;
+                VT::destroy(vd[i], alloc);
             }
         }
         dealloc_node(alloc, node, h->alloc_u64());
