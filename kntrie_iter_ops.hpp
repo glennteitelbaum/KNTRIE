@@ -276,7 +276,7 @@ struct kntrie_iter_ops {
         constexpr int IK_BITS = sizeof(IK) * 8;
         const bitmap_256_t& fbm = BO::chain_bitmap(node, sc);
         uint8_t byte = fbm.last_set_bit();
-        int slot = fbm.popcount() - 1;
+        int slot = get_header(node)->entries() - 1;
         prefix |= IK(byte) << (IK_BITS - bits - 8);
         uint64_t child = BO::chain_children(node, sc)[slot];
         if constexpr (BITS > 8) {
