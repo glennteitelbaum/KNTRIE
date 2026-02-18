@@ -8,7 +8,6 @@
 #include <type_traits>
 #include <utility>
 #include <algorithm>
-#include <array>
 #include <cassert>
 
 namespace gteitelbaum {
@@ -17,16 +16,24 @@ namespace gteitelbaum {
 // Constants
 // ==========================================================================
 
-inline constexpr size_t BITMAP256_U64 = 4;   // 32 bytes
+inline constexpr size_t BITMAP_256_U64 = 4;   // 32 bytes
 inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
 inline constexpr size_t HEADER_U64    = 1;   // base header is 1 u64 (8 bytes), +1 if skip
 
-// u64s needed for N child descriptor entries (uint16_t each)
-inline constexpr size_t desc_u64(size_t n) noexcept { return (n + 3) / 4; }
+// u64s needed for descendants count (single u64 at end of bitmask node)
+inline constexpr size_t desc_u64(size_t) noexcept { return 1; }
 
 // Tagged pointer: bit 63 = leaf (sign bit for fast test)
 static constexpr uint64_t LEAF_BIT = uint64_t(1) << 63;
+
+// ==========================================================================
+// NK narrowing: u64 → u32 → u16 → u8
+// ==========================================================================
+
+template<typename NK>
+using next_narrow_t = std::conditional_t<sizeof(NK) == 8, uint32_t,
+                      std::conditional_t<sizeof(NK) == 4, uint16_t, uint8_t>>;
 
 // ==========================================================================
 // Allocation size classes
@@ -72,7 +79,7 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 //
 // Struct layout (little-endian):
 //   [0]      flags       (bit 0: is_bitmask, bits 1-3: skip count 0-7)
-//   [1]      suffix_type (leaf only: 0=bitmap256, 1=u16, 2=u32, 3=u64)
+//   [1]      suffix_type (leaf only: 0=bitmap_256_t, 1=u16, 2=u32, 3=u64)
 //   [2..3]   entries     (uint16_t)
 //   [4..5]   alloc_u64   (uint16_t)
 //   [6..7]   total_slots (uint16_t, compact leaf slot count)
@@ -88,23 +95,17 @@ inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcep
 //                  entries=0. Sentinel-safe.
 // ==========================================================================
 
-struct node_header {
-    uint8_t  flags_       = 0;
-    uint8_t  suffix_type_ = 0;
-    uint16_t entries_     = 0;
-    uint16_t alloc_u64_   = 0;
-    uint16_t total_slots_ = 0;
+struct node_header_t {
+    uint8_t  skip_count_v  = 0;  // max 6, bits 3-7 free
+    uint8_t  reserved_v    = 0;
+    uint16_t entries_v     = 0;
+    uint16_t alloc_u64_v   = 0;
+    uint16_t total_slots_v = 0;
 
-    static constexpr uint8_t BITMASK_BIT = 1 << 0;
-
-    // --- type ---
-    bool is_leaf()    const noexcept { return !(flags_ & BITMASK_BIT); }
-    void set_bitmask()      noexcept { flags_ |= BITMASK_BIT; }
-
-    // --- skip (bits 1-3 of flags_) ---
-    uint8_t skip()    const noexcept { return (flags_ >> 1) & 0x07; }
-    bool    is_skip() const noexcept { return flags_ & 0x0E; }
-    void set_skip(uint8_t s) noexcept { flags_ = (flags_ & 0x01) | ((s & 0x07) << 1); }
+    // --- skip ---
+    uint8_t skip()    const noexcept { return skip_count_v & 0x07; }
+    bool    is_skip() const noexcept { return skip_count_v & 0x07; }
+    void set_skip(uint8_t s) noexcept { skip_count_v = (s & 0x07); }
 
     // --- leaf prefix bytes (in node[1], only valid via get_header(node)->) ---
     const uint8_t* prefix_bytes() const noexcept {
@@ -118,26 +119,19 @@ struct node_header {
     }
 
     // --- entries / alloc ---
-    uint8_t suffix_type() const noexcept { return suffix_type_; }
-    void set_suffix_type(uint8_t t) noexcept { suffix_type_ = t; }
+    unsigned entries()   const noexcept { return entries_v; }
+    void set_entries(unsigned n) noexcept { entries_v = static_cast<uint16_t>(n); }
 
-    unsigned entries()   const noexcept { return entries_; }
-    void set_entries(unsigned n) noexcept { entries_ = static_cast<uint16_t>(n); }
+    unsigned alloc_u64() const noexcept { return alloc_u64_v; }
+    void set_alloc_u64(unsigned n) noexcept { alloc_u64_v = static_cast<uint16_t>(n); }
 
-    unsigned alloc_u64() const noexcept { return alloc_u64_; }
-    void set_alloc_u64(unsigned n) noexcept { alloc_u64_ = static_cast<uint16_t>(n); }
-
-    unsigned total_slots() const noexcept { return total_slots_; }
-    void set_total_slots(unsigned n) noexcept { total_slots_ = static_cast<uint16_t>(n); }
-
-    // Bitmask-only: total_slots_ repurposed as descendant count (saturating at 0xFFFF)
-    uint16_t descendants() const noexcept { return total_slots_; }
-    void set_descendants(uint16_t n) noexcept { total_slots_ = n; }
+    unsigned total_slots() const noexcept { return total_slots_v; }
+    void set_total_slots(unsigned n) noexcept { total_slots_v = static_cast<uint16_t>(n); }
 };
-static_assert(sizeof(node_header) == 8);
+static_assert(sizeof(node_header_t) == 8);
 
-inline node_header*       get_header(uint64_t* n)       noexcept { return reinterpret_cast<node_header*>(n); }
-inline const node_header* get_header(const uint64_t* n) noexcept { return reinterpret_cast<const node_header*>(n); }
+inline node_header_t*       get_header(uint64_t* n)       noexcept { return reinterpret_cast<node_header_t*>(n); }
+inline const node_header_t* get_header(const uint64_t* n) noexcept { return reinterpret_cast<const node_header_t*>(n); }
 
 // --- Tagged pointer helpers ---
 // Bitmask ptr: points to bitmap (node+1), no LEAF_BIT. Use directly.
@@ -181,6 +175,10 @@ inline const uint64_t SENTINEL_TAGGED =
     reinterpret_cast<uint64_t>(&SENTINEL_NODE[0]) | LEAF_BIT;
 
 // ==========================================================================
+// Tagged pointer entry counting (NK-independent)
+// ==========================================================================
+
+// ==========================================================================
 // key_ops<KEY> -- internal key representation
 //
 // IK: uint32_t for KEY <= 32 bits, uint64_t otherwise.
@@ -216,75 +214,30 @@ struct key_ops {
 };
 
 // ==========================================================================
-// Suffix type helpers
-//
-// suffix_type: 0=bitmap256 (<=8 bits), 1=u16, 2=u32, 3=u64.
+// Iteration result (free struct, shared across all NK specializations)
 // ==========================================================================
 
-inline constexpr uint8_t suffix_type_for(int bits) noexcept {
-    if (bits <= 8)  return 0;  // bitmap256
-    if (bits <= 16) return 1;  // u16
-    if (bits <= 32) return 2;  // u32
-    return 3;                  // u64
-}
-
-// ==========================================================================
-// Value type normalization
-//
-// Trivially copyable types are normalized to a fixed-width type to
-// reduce template instantiations.  1→u8, 2→u16, 3-4→u32, 5-8→u64,
-// 9-64→array<u64,ceil(sz/8)>.
-// ==========================================================================
-
-template<size_t N>
-struct normalized_type {
-    using type =
-        std::conditional_t<N == 1, uint8_t,
-        std::conditional_t<N == 2, uint16_t,
-        std::conditional_t<N <= 4, uint32_t,
-        std::conditional_t<N <= 8, uint64_t,
-        std::array<uint64_t, (N + 7) / 8>>>>>;
+template<typename IK, typename VST>
+struct iter_ops_result_t {
+    IK key;
+    const VST* value;
+    bool found;
 };
-
-template<size_t N>
-using normalized_type_t = typename normalized_type<N>::type;
 
 // ==========================================================================
 // Value traits
-//
-// Three categories:
-//   A  trivially_copyable && sizeof <= 64  → normalized slot, no dtor
-//   B  nothrow_move && sizeof <= 64        → real T inline, has dtor
-//   C  else (>64 or !nothrow_move)         → T* pointer, has dtor+dealloc
-//
-// Two compile-time booleans drive dispatch:
-//   IS_INLINE      A,B: true   C: false
-//   HAS_DESTRUCTOR A: false    B,C: true
 // ==========================================================================
 
 template<typename VALUE, typename ALLOC>
 struct value_traits {
-    static constexpr bool IS_TRIVIAL =
-        std::is_trivially_copyable_v<VALUE> && sizeof(VALUE) <= 64;
     static constexpr bool IS_INLINE =
-        (std::is_trivially_copyable_v<VALUE> || std::is_nothrow_move_constructible_v<VALUE>)
-        && sizeof(VALUE) <= 64;
-    static constexpr bool HAS_DESTRUCTOR = !IS_TRIVIAL;
+        sizeof(VALUE) <= 8 && std::is_trivially_copyable_v<VALUE>;
 
-    // --- slot type ---
-    using slot_type = std::conditional_t<
-        IS_TRIVIAL, normalized_type_t<sizeof(VALUE)>,
-        std::conditional_t<IS_INLINE, VALUE, VALUE*>>;
-
-    // --- store: VALUE → slot_type (for insert) ---
+    using slot_type = std::conditional_t<IS_INLINE, VALUE, VALUE*>;
 
     static slot_type store(const VALUE& val, ALLOC& alloc) {
-        if constexpr (IS_TRIVIAL) {
-            slot_type s{};
-            std::memcpy(&s, &val, sizeof(VALUE));
-            return s;
-        } else if constexpr (IS_INLINE) {
-            return val;  // copy construct
+        if constexpr (IS_INLINE) {
+            return val;
         } else {
             using VA = typename std::allocator_traits<ALLOC>::template rebind_alloc<VALUE>;
             VA va(alloc);
@@ -294,125 +247,22 @@ struct value_traits {
         }
     }
 
-    static slot_type store(VALUE&& val, ALLOC& alloc) {
-        if constexpr (IS_TRIVIAL) {
-            slot_type s{};
-            std::memcpy(&s, &val, sizeof(VALUE));
-            return s;
-        } else if constexpr (IS_INLINE) {
-            return std::move(val);  // move construct
-        } else {
-            using VA = typename std::allocator_traits<ALLOC>::template rebind_alloc<VALUE>;
-            VA va(alloc);
-            VALUE* p = std::allocator_traits<VA>::allocate(va, 1);
-            std::allocator_traits<VA>::construct(va, p, std::move(val));
-            return p;
-        }
-    }
-
-    // --- as_ptr: slot_type → const VALUE* ---
-
     static const VALUE* as_ptr(const slot_type& s) noexcept {
-        if constexpr (IS_INLINE)
-            return std::launder(reinterpret_cast<const VALUE*>(&s));
-        else
-            return s;
+        if constexpr (IS_INLINE) return reinterpret_cast<const VALUE*>(&s);
+        else                     return s;
     }
 
-    // --- destroy: single slot ---
-
-    static void destroy(slot_type& s, ALLOC& alloc) noexcept {
+    static void destroy(slot_type s, ALLOC& alloc) noexcept {
         if constexpr (!IS_INLINE) {
             using VA = typename std::allocator_traits<ALLOC>::template rebind_alloc<VALUE>;
             VA va(alloc);
             std::allocator_traits<VA>::destroy(va, s);
             std::allocator_traits<VA>::deallocate(va, s, 1);
-        } else if constexpr (HAS_DESTRUCTOR) {
-            s.~slot_type();
         }
-        // A: noop
     }
 
-    // --- init_slot: write into UNINITIALIZED destination ---
-
-    static void init_slot(slot_type* dst, const slot_type& val) {
-        if constexpr (IS_TRIVIAL || !IS_INLINE)
-            std::memcpy(dst, &val, sizeof(slot_type));
-        else
-            ::new (dst) slot_type(val);  // copy construct
-    }
-
-    static void init_slot(slot_type* dst, slot_type&& val) {
-        if constexpr (IS_TRIVIAL || !IS_INLINE)
-            std::memcpy(dst, &val, sizeof(slot_type));
-        else
-            ::new (dst) slot_type(std::move(val));  // move construct
-    }
-
-    // --- write_slot: write into INITIALIZED (or moved-from) destination ---
-
-    static void write_slot(slot_type* dst, const slot_type& val) noexcept {
-        if constexpr (IS_TRIVIAL || !IS_INLINE)
-            std::memcpy(dst, &val, sizeof(slot_type));
-        else
-            *dst = val;  // copy assign
-    }
-
-    static void write_slot(slot_type* dst, slot_type&& val) noexcept {
-        if constexpr (IS_TRIVIAL || !IS_INLINE)
-            std::memcpy(dst, &val, sizeof(slot_type));
-        else
-            *dst = std::move(val);  // move assign
-    }
-
-    // ---------------------------------------------------------------
-    // Bulk operations
-    // ---------------------------------------------------------------
-
-    // Copy n slots to UNINITIALIZED destination, no overlap.
-    // Source is preserved (use for non-consuming copies).
-    static void copy_uninit(const slot_type* src, size_t n, slot_type* dst) {
-        if constexpr (IS_TRIVIAL || !IS_INLINE)
-            std::memcpy(dst, src, n * sizeof(slot_type));
-        else
-            std::uninitialized_copy(src, src + n, dst);
-    }
-
-    // Move n slots to UNINITIALIZED destination, no overlap.
-    // Source is left moved-from (use for realloc/split where old node is freed).
-    static void move_uninit(slot_type* src, size_t n, slot_type* dst) {
-        if constexpr (IS_TRIVIAL || !IS_INLINE)
-            std::memcpy(dst, src, n * sizeof(slot_type));
-        else
-            std::uninitialized_move(src, src + n, dst);
-    }
-
-    // In-place shift left: dst < src, overlap possible.
-    // Destination slots must be initialized (or moved-from).
-    static void shift_left(slot_type* first, slot_type* last, slot_type* dst) {
-        std::move(first, last, dst);
-    }
-
-    // In-place shift right: dst > src, overlap possible.
-    // Destination slots must be initialized (or moved-from).
-    static void shift_right(slot_type* first, slot_type* last, slot_type* d_last) {
-        std::move_backward(first, last, d_last);
-    }
-
-    // Destroy n moved-from slots (after relocating out of old node).
-    // A/C: noop.  B: call destructors.
-    static void destroy_relocated(slot_type* slots, size_t n) noexcept {
-        if constexpr (HAS_DESTRUCTOR && IS_INLINE)
-            std::destroy_n(slots, n);
-        // A: trivial, no dtors.  C: pointers were transferred, don't dealloc.
-    }
-
-    // Destroy n LIVE slots (for clear/destructor).
-    static void destroy_all(slot_type* slots, size_t n, ALLOC& alloc) noexcept {
-        if constexpr (HAS_DESTRUCTOR) {
-            for (size_t i = 0; i < n; ++i)
-                destroy(slots[i], alloc);
-        }
+    static void write_slot(slot_type* dest, const slot_type& src) noexcept {
+        std::memcpy(dest, &src, sizeof(slot_type));
     }
 };
 
@@ -445,7 +295,7 @@ struct insert_result_t {
 struct erase_result_t {
     uint64_t tagged_ptr;    // tagged pointer, or 0 if fully erased
     bool erased;
-    uint16_t subtree_entries;  // remaining entries in subtree (capped at COMPACT_MAX+1)
+    uint64_t subtree_entries;  // remaining entries in subtree (exact)
 };
 
 } // namespace gteitelbaum
