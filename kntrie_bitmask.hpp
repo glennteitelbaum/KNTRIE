@@ -73,16 +73,16 @@ struct bitmap_256_t {
 
     // Return the lowest set bit index. Undefined if bitmap is empty.
     uint8_t first_set_bit() const noexcept {
-        for (int w = 0; w < 4; ++w)
-            if (words[w]) return static_cast<uint8_t>((w << 6) + std::countr_zero(words[w]));
-        __builtin_unreachable();
+        uint64_t w0 = words[0], w1 = words[1], w2 = words[2];
+        int idx = !w0 + (!w0 & !w1) + (!w0 & !w1 & !w2);
+        return static_cast<uint8_t>((idx << 6) + std::countr_zero(words[idx]));
     }
 
     // Return the highest set bit index. Undefined if bitmap is empty.
     uint8_t last_set_bit() const noexcept {
-        for (int w = 3; w >= 0; --w)
-            if (words[w]) return static_cast<uint8_t>((w << 6) + 63 - std::countl_zero(words[w]));
-        __builtin_unreachable();
+        uint64_t w1 = words[1], w2 = words[2], w3 = words[3];
+        int idx = 3 - (!w3 + (!w3 & !w2) + (!w3 & !w2 & !w1));
+        return static_cast<uint8_t>((idx << 6) + 63 - std::countl_zero(words[idx]));
     }
 
     struct adj_result { uint8_t idx; uint16_t slot; bool found; };
@@ -114,6 +114,22 @@ struct bitmap_256_t {
             slot += std::popcount(words[ww]);
         }
         return {0, 0, false};
+    }
+
+    // Return the index of the n-th set bit (0-indexed).
+    // Only called on rare subtree-boundary path.
+    uint8_t nth_set(int n) const noexcept {
+        for (int w = 0; w < 4; ++w) {
+            int pc = std::popcount(words[w]);
+            if (n < pc) {
+                uint64_t bits = words[w];
+                for (int i = 0; i < n; ++i)
+                    bits &= bits - 1;  // clear lowest set bit
+                return static_cast<uint8_t>((w << 6) + std::countr_zero(bits));
+            }
+            n -= pc;
+        }
+        __builtin_unreachable();
     }
 
     // Find largest set bit < idx, with its slot. Single pass backward.
@@ -695,20 +711,22 @@ struct bitmask_ops {
                                             uint8_t suffix,
                                             size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
-        auto r = bmp.next_set_after(suffix);
-        if (!r.found) return {0, nullptr, false};
+        int slot = bmp.template find_slot<slot_mode::FAST_EXIT>(suffix);
+        if (slot < 0 || slot + 1 >= bmp.popcount()) return {0, nullptr, false};
         const VST* vd = bl_vals(node, header_size);
-        return {r.idx, &vd[r.slot], true};
+        uint8_t next_idx = bmp.nth_set(slot + 1);
+        return {next_idx, &vd[slot + 1], true};
     }
 
     static iter_bm_result bitmap_iter_prev(const uint64_t* node,
                                             uint8_t suffix,
                                             size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
-        auto r = bmp.prev_set_before(suffix);
-        if (!r.found) return {0, nullptr, false};
+        int slot = bmp.template find_slot<slot_mode::FAST_EXIT>(suffix);
+        if (slot <= 0) return {0, nullptr, false};
         const VST* vd = bl_vals(node, header_size);
-        return {r.idx, &vd[r.slot], true};
+        uint8_t prev_idx = bmp.nth_set(slot - 1);
+        return {prev_idx, &vd[slot - 1], true};
     }
 
     // ==================================================================

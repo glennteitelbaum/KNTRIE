@@ -276,7 +276,7 @@ struct kntrie_iter_ops {
         constexpr int IK_BITS = sizeof(IK) * 8;
         const bitmap_256_t& fbm = BO::chain_bitmap(node, sc);
         uint8_t byte = fbm.last_set_bit();
-        int slot = fbm.template find_slot<slot_mode::UNFILTERED>(byte);
+        int slot = fbm.popcount() - 1;
         prefix |= IK(byte) << (IK_BITS - bits - 8);
         uint64_t child = BO::chain_children(node, sc)[slot];
         if constexpr (BITS > 8) {
@@ -383,7 +383,8 @@ struct kntrie_iter_ops {
         __builtin_unreachable();
     }
 
-    // Final bitmap: lookup byte, recurse child or next sibling
+    // Final bitmap: lookup byte, recurse child or next sibling.
+    // BRANCHLESS: single branchless scan, returns 1-based slot (0 = not found).
     template<int BITS, typename IK> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> iter_next_bm_final(
             const uint64_t* node, uint8_t sc,
@@ -393,8 +394,9 @@ struct kntrie_iter_ops {
         const uint64_t* children = BO::chain_children(node, sc);
         uint8_t byte = static_cast<uint8_t>(ik >> (NK_BITS - 8));
 
-        if (fbm.has_bit(byte)) {
-            int slot = fbm.template find_slot<slot_mode::UNFILTERED>(byte);
+        // Single branchless scan: 1-based slot, 0 = not found
+        int slot = fbm.template find_slot<slot_mode::BRANCHLESS>(byte);
+        if (slot) {
             IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
 
             if constexpr (BITS > 8) {
@@ -402,16 +404,17 @@ struct kntrie_iter_ops {
                 iter_ops_result_t<IK, VST> r;
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
                     r = NARROW::template iter_next_node<BITS - 8, IK>(
-                        children[slot],
+                        children[slot - 1],
                         static_cast<NNK>(shifted >> (NK_BITS / 2)),
                         cp, bits + 8);
                 else
                     r = iter_next_node<BITS - 8, IK>(
-                        children[slot], shifted, cp, bits + 8);
+                        children[slot - 1], shifted, cp, bits + 8);
                 if (r.found) return r;
             }
         }
 
+        // Rare: byte not set or exhausted subtree, find next sibling
         auto adj = fbm.next_set_after(byte);
         if (adj.found) {
             IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
@@ -523,8 +526,9 @@ struct kntrie_iter_ops {
         const uint64_t* children = BO::chain_children(node, sc);
         uint8_t byte = static_cast<uint8_t>(ik >> (NK_BITS - 8));
 
-        if (fbm.has_bit(byte)) {
-            int slot = fbm.template find_slot<slot_mode::UNFILTERED>(byte);
+        // Single branchless scan: 1-based slot, 0 = not found
+        int slot = fbm.template find_slot<slot_mode::BRANCHLESS>(byte);
+        if (slot) {
             IK cp = prefix | (IK(byte) << (IK_BITS - bits - 8));
 
             if constexpr (BITS > 8) {
@@ -532,16 +536,17 @@ struct kntrie_iter_ops {
                 iter_ops_result_t<IK, VST> r;
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
                     r = NARROW::template iter_prev_node<BITS - 8, IK>(
-                        children[slot],
+                        children[slot - 1],
                         static_cast<NNK>(shifted >> (NK_BITS / 2)),
                         cp, bits + 8);
                 else
                     r = iter_prev_node<BITS - 8, IK>(
-                        children[slot], shifted, cp, bits + 8);
+                        children[slot - 1], shifted, cp, bits + 8);
                 if (r.found) return r;
             }
         }
 
+        // Rare: byte not set or exhausted subtree, find previous sibling
         auto adj = fbm.prev_set_before(byte);
         if (adj.found) {
             IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));

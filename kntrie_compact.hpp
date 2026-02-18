@@ -158,24 +158,30 @@ struct compact_ops {
         const K*   kd = keys(node, hs);
         const VST* vd = vals(node, ts, hs);
         const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
+        // Branchless search lands on LAST dup when key exists.
+        // +(*base <= suffix) handles both existing keys (always true, +1)
+        // and lower_bound misses (may be false if all keys > suffix, +0).
         unsigned pos = static_cast<unsigned>(base - kd) + (*base <= suffix);
-        if (pos < ts) return {kd[pos], &vd[pos], true};
-        return {0, nullptr, false};
+        if (pos >= ts) return {0, nullptr, false};
+        return {kd[pos], &vd[pos], true};
     }
 
-    // Largest suffix < key
+    // Largest suffix < key (key is known to exist)
     static iter_leaf_result iter_prev(const uint64_t* node,
                                        const node_header_t* h,
                                        K suffix) noexcept {
         unsigned ts = h->total_slots();
-        if (ts == 0 || suffix == 0) return {0, nullptr, false};
+        if (ts == 0) return {0, nullptr, false};
         size_t hs = hdr_u64(node);
         const K*   kd = keys(node, hs);
         const VST* vd = vals(node, ts, hs);
-        const K* base = adaptive_search<K>::find_base(kd, ts, K(suffix - 1));
-        // find_base: last position where kd[p] <= suffix-1, i.e. < suffix
-        if (*base < suffix) return {*base, &vd[base - kd], true};
-        return {0, nullptr, false};
+        const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
+        unsigned pos = static_cast<unsigned>(base - kd);
+        // Walk back past dups of suffix to first occurrence
+        while (pos > 0 && kd[pos - 1] == suffix) --pos;
+        if (pos == 0) return {0, nullptr, false};
+        --pos;  // previous distinct key (or its last dup — value is identical)
+        return {kd[pos], &vd[pos], true};
     }
 
     // ==================================================================
