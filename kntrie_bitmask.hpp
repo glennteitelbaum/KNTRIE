@@ -89,7 +89,7 @@ struct bitmap_256_t {
 
     // Find smallest set bit > idx, with its slot.
     adj_result next_set_after(uint8_t idx) const noexcept {
-        if (idx == 255) return {0, 0, false};
+        if (idx == 255) [[unlikely]] return {0, 0, false};
         int start = idx + 1;
         int w = start >> 6, b = start & 63;
 
@@ -121,7 +121,7 @@ struct bitmap_256_t {
 
     // Find largest set bit < idx, with its slot.
     adj_result prev_set_before(uint8_t idx) const noexcept {
-        if (idx == 0) return {0, 0, false};
+        if (idx == 0) [[unlikely]] return {0, 0, false};
         int last = idx - 1;
         int w = last >> 6, b = last & 63;
 
@@ -702,7 +702,7 @@ struct bitmask_ops {
                                             size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
         auto r = bmp.next_set_after(suffix);
-        if (!r.found) return {0, nullptr, false};
+        if (!r.found) [[unlikely]] return {0, nullptr, false};
         const VST* vd = bl_vals(node, header_size);
         return {r.idx, &vd[r.slot], true};
     }
@@ -712,7 +712,7 @@ struct bitmask_ops {
                                             size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
         auto r = bmp.prev_set_before(suffix);
-        if (!r.found) return {0, nullptr, false};
+        if (!r.found) [[unlikely]] return {0, nullptr, false};
         const VST* vd = bl_vals(node, header_size);
         return {r.idx, &vd[r.slot], true};
     }
@@ -731,7 +731,7 @@ struct bitmask_ops {
         unsigned count = h->entries();
         VST* vd = bl_vals_mut(node, hs);
 
-        if (bm.has_bit(suffix)) {
+        if (bm.has_bit(suffix)) [[unlikely]] {
             if constexpr (ASSIGN) {
                 int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
                 VT::destroy(vd[slot], alloc);

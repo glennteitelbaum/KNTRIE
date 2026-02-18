@@ -115,8 +115,9 @@ struct compact_ops {
         size_t hs = hdr_u64(node);
         const K*   kd = keys(node, hs);
         const VST* vd = vals(node, ts, hs);
-        for (unsigned i = 0; i < ts; ++i) {
-            if (i > 0 && kd[i] == kd[i - 1]) continue;
+        cb(kd[0], vd[0]);
+        for (unsigned i = 1; i < ts; ++i) {
+            if (kd[i] == kd[i - 1]) continue;
             cb(kd[i], vd[i]);
         }
     }
@@ -190,8 +191,9 @@ struct compact_ops {
             size_t hs = hdr_u64(node);
             const K* kd = keys(node, hs);
             VST* vd = vals_mut(node, ts, hs);
-            for (unsigned i = 0; i < ts; ++i) {
-                if (i > 0 && kd[i] == kd[i - 1]) continue;
+            VT::destroy(vd[0], alloc);
+            for (unsigned i = 1; i < ts; ++i) {
+                if (kd[i] == kd[i - 1]) continue;
                 VT::destroy(vd[i], alloc);
             }
         }
@@ -219,7 +221,7 @@ struct compact_ops {
             kd, ts, suffix);
 
         // Key exists
-        if (*base == suffix) {
+        if (*base == suffix) [[unlikely]] {
             if constexpr (ASSIGN) {
                 int idx = base - kd;
                 VT::destroy(vd[idx], alloc);
@@ -356,8 +358,18 @@ private:
                                   K* out_k, VST* out_v, ALLOC& alloc) {
         bool skipped = false;
         int wi = 0;
-        for (int i = 0; i < ts; ++i) {
-            if (i > 0 && kd[i] == kd[i - 1]) continue;
+        // Handle first element (no dup check needed)
+        if (kd[0] == skip_suffix) {
+            skipped = true;
+            if constexpr (VT::HAS_DESTRUCTOR)
+                VT::destroy(vd[0], alloc);
+        } else {
+            out_k[wi] = kd[0];
+            VT::write_slot(&out_v[wi], vd[0]);
+            wi++;
+        }
+        for (int i = 1; i < ts; ++i) {
+            if (kd[i] == kd[i - 1]) continue;
             if (!skipped && kd[i] == skip_suffix) {
                 skipped = true;
                 if constexpr (VT::HAS_DESTRUCTOR)
@@ -388,8 +400,18 @@ private:
             // No dups needed — straight copy with insert
             bool inserted = false;
             int wi = 0;
-            for (int i = 0; i < old_ts; ++i) {
-                if (i > 0 && old_k[i] == old_k[i - 1]) continue;
+            // Handle first element (no dup check needed)
+            if (new_suffix < old_k[0]) {
+                dk[wi] = new_suffix;
+                VT::init_slot(&dv[wi], new_val);
+                wi++;
+                inserted = true;
+            }
+            dk[wi] = old_k[0];
+            VT::init_slot(&dv[wi], old_v[0]);
+            wi++;
+            for (int i = 1; i < old_ts; ++i) {
+                if (old_k[i] == old_k[i - 1]) continue;
                 if (!inserted && new_suffix < old_k[i]) {
                     dk[wi] = new_suffix;
                     VT::init_slot(&dv[wi], new_val);
@@ -419,8 +441,45 @@ private:
         int in_group = 0;   // entries written in current group
 
         bool inserted = false;
-        for (int i = 0; i < old_ts; ++i) {
-            if (i > 0 && old_k[i] == old_k[i - 1]) continue;  // skip dup
+
+        // Handle first old entry (no dup check needed for i=0)
+        // Check if new key goes before first old key
+        if (new_suffix < old_k[0]) {
+            dk[wi] = new_suffix;
+            VT::init_slot(&dv[wi], new_val);
+            wi++;
+            real_out++;
+            in_group++;
+            inserted = true;
+
+            if (placed < n_dups && in_group >= group_size) {
+                dk[wi] = dk[wi - 1];
+                VT::init_slot(&dv[wi], dv[wi - 1]);
+                wi++;
+                placed++;
+                in_group = 0;
+                group_size = stride + (placed < remainder ? 1 : 0);
+            }
+        }
+
+        // Emit first old entry
+        dk[wi] = old_k[0];
+        VT::init_slot(&dv[wi], old_v[0]);
+        wi++;
+        real_out++;
+        in_group++;
+
+        if (placed < n_dups && in_group >= group_size) {
+            dk[wi] = dk[wi - 1];
+            VT::init_slot(&dv[wi], dv[wi - 1]);
+            wi++;
+            placed++;
+            in_group = 0;
+            group_size = stride + (placed < remainder ? 1 : 0);
+        }
+
+        for (int i = 1; i < old_ts; ++i) {
+            if (old_k[i] == old_k[i - 1]) continue;  // skip dup
 
             // Inject new key at sorted position
             if (!inserted && new_suffix < old_k[i]) {
