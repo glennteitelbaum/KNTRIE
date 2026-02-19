@@ -31,25 +31,110 @@ private:
     static constexpr int IK_BITS  = KO::IK_BITS;
     static constexpr int KEY_BITS = KO::KEY_BITS;
 
-    // NK0 = initial narrowed key type matching KEY width (>= 16 bits now)
+    // NK0 = initial narrowed key type matching KEY width (>= 16 bits)
     using NK0 = std::conditional_t<KEY_BITS <= 16, uint16_t,
                 std::conditional_t<KEY_BITS <= 32, uint32_t, uint64_t>>;
     using OPS      = kntrie_ops<NK0, VALUE, ALLOC>;
     using ITER_OPS = kntrie_iter_ops<NK0, VALUE, ALLOC>;
 
-    // Root-level narrowing support
     static constexpr int NK0_BITS = static_cast<int>(sizeof(NK0) * 8);
 
-    using NNK0        = next_narrow_t<NK0>;
-    using NARROW_OPS  = kntrie_ops<NNK0, VALUE, ALLOC>;
-    using NARROW_ITER = kntrie_iter_ops<NNK0, VALUE, ALLOC>;
+    using NNK0         = next_narrow_t<NK0>;
+    using NARROW_OPS   = kntrie_ops<NNK0, VALUE, ALLOC>;
+    using NARROW_ITER  = kntrie_iter_ops<NNK0, VALUE, ALLOC>;
 
-    // True only for u16/i16: after peeling top byte, 8 bits remain = uint8_t
-    static constexpr bool NARROWS_AT_ROOT =
-        (KEY_BITS - 8 == NK0_BITS / 2 && NK0_BITS > 8);
+    using NNNK0        = next_narrow_t<NNK0>;
+    using NARROW_OPS2  = kntrie_ops<NNNK0, VALUE, ALLOC>;
+    using NARROW_ITER2 = kntrie_iter_ops<NNNK0, VALUE, ALLOC>;
+
+    // MAX_ROOT_SKIP: leave 1 byte for root_v index + 1 byte for subtree
+    // u16: 0  (no skip), u32: 2, u64: 6
+    static constexpr int MAX_ROOT_SKIP = KEY_BITS / 8 - 2;
+
+    // ======================================================================
+    // root_dispatch<BITS>: compile-time trait for narrowing at a given depth
+    // ======================================================================
+
+    template<int BITS>
+    struct root_dispatch {
+        static_assert(BITS >= 8);
+        static constexpr int CONSUMED_BITS = KEY_BITS - BITS;
+        static constexpr int NNK0_BITS  = static_cast<int>(sizeof(NNK0) * 8);
+        static constexpr int NNNK0_BITS = static_cast<int>(sizeof(NNNK0) * 8);
+
+        // Which NK type to use at this depth
+        using NK_TYPE = std::conditional_t<(BITS >= NK0_BITS / 2), NK0,
+                        std::conditional_t<(BITS >= NNK0_BITS / 2), NNK0, NNNK0>>;
+
+        using OPS_TYPE  = kntrie_ops<NK_TYPE, VALUE, ALLOC>;
+        using ITER_TYPE = kntrie_iter_ops<NK_TYPE, VALUE, ALLOC>;
+
+        // Shift and narrow nk to the correct type for this depth
+        static NK_TYPE narrow(NK0 nk) noexcept {
+            NK0 shifted = static_cast<NK0>(nk << CONSUMED_BITS);
+            if constexpr (std::is_same_v<NK_TYPE, NK0>) {
+                return shifted;
+            } else {
+                constexpr int NK_TYPE_BITS = static_cast<int>(sizeof(NK_TYPE) * 8);
+                return static_cast<NK_TYPE>(shifted >> (NK0_BITS - NK_TYPE_BITS));
+            }
+        }
+    };
+
+    // ======================================================================
+    // skip_switch: dispatch a templated lambda at the correct BITS depth
+    // ======================================================================
+
+    template<typename F>
+    static decltype(auto) skip_switch(uint8_t skip, F&& fn_) {
+        if constexpr (MAX_ROOT_SKIP <= 0) {
+            return fn_.template operator()<KEY_BITS - 8>();
+        } else if constexpr (MAX_ROOT_SKIP <= 2) {
+            switch (skip) {
+            case 0: return fn_.template operator()<KEY_BITS - 8>();
+            case 1: return fn_.template operator()<KEY_BITS - 16>();
+            case 2: return fn_.template operator()<KEY_BITS - 24>();
+            default: __builtin_unreachable();
+            }
+        } else {
+            switch (skip) {
+            case 0: return fn_.template operator()<KEY_BITS - 8>();
+            case 1: return fn_.template operator()<KEY_BITS - 16>();
+            case 2: return fn_.template operator()<KEY_BITS - 24>();
+            case 3: return fn_.template operator()<KEY_BITS - 32>();
+            case 4: return fn_.template operator()<KEY_BITS - 40>();
+            case 5: return fn_.template operator()<KEY_BITS - 48>();
+            case 6: return fn_.template operator()<KEY_BITS - 56>();
+            default: __builtin_unreachable();
+            }
+        }
+    }
+
+    // ======================================================================
+    // nk_byte: extract byte i (0-based from MSB) from NK0
+    // ======================================================================
+
+    static uint8_t nk_byte(NK0 nk, uint8_t i) noexcept {
+        return static_cast<uint8_t>(nk >> (NK0_BITS - 8 * (i + 1)));
+    }
+
+    // Build IK prefix from root_prefix_v[0..skip-1] + top byte
+    IK make_prefix(uint8_t top) const noexcept {
+        IK prefix = IK(0);
+        for (uint8_t j = 0; j < root_skip_v; ++j)
+            prefix |= IK(root_prefix_v[j]) << (IK_BITS - 8 * (j + 1));
+        prefix |= IK(top) << (IK_BITS - 8 * (root_skip_v + 1));
+        return prefix;
+    }
+
+    int prefix_bits() const noexcept {
+        return 8 * (root_skip_v + 1);
+    }
 
     // --- Data members ---
-    uint64_t  root_v[256];   // flat array: root_v[top_byte] = tagged child
+    uint64_t  root_v[256];
+    uint8_t   root_skip_v;
+    uint8_t   root_prefix_v[7];   // max 6 used (u64), 7th for alignment
     size_t    size_v;
     BLD       bld_v;
 
@@ -58,8 +143,9 @@ public:
     // Constructor / Destructor
     // ==================================================================
 
-    kntrie_impl() : size_v(0), bld_v() {
+    kntrie_impl() : root_skip_v(0), size_v(0), bld_v() {
         std::fill(std::begin(root_v), std::end(root_v), SENTINEL_TAGGED);
+        std::memset(root_prefix_v, 0, sizeof(root_prefix_v));
     }
 
     ~kntrie_impl() { remove_all(); bld_v.drain(); }
@@ -68,9 +154,12 @@ public:
     kntrie_impl& operator=(const kntrie_impl&) = delete;
 
     kntrie_impl(kntrie_impl&& o) noexcept
-        : size_v(o.size_v), bld_v(std::move(o.bld_v)) {
+        : root_skip_v(o.root_skip_v), size_v(o.size_v), bld_v(std::move(o.bld_v)) {
         std::memcpy(root_v, o.root_v, sizeof(root_v));
+        std::memcpy(root_prefix_v, o.root_prefix_v, sizeof(root_prefix_v));
         std::fill(std::begin(o.root_v), std::end(o.root_v), SENTINEL_TAGGED);
+        o.root_skip_v = 0;
+        std::memset(o.root_prefix_v, 0, sizeof(o.root_prefix_v));
         o.size_v = 0;
     }
 
@@ -79,9 +168,13 @@ public:
             remove_all();
             bld_v.drain();
             std::memcpy(root_v, o.root_v, sizeof(root_v));
-            size_v  = o.size_v;
-            bld_v   = std::move(o.bld_v);
+            std::memcpy(root_prefix_v, o.root_prefix_v, sizeof(root_prefix_v));
+            root_skip_v = o.root_skip_v;
+            size_v      = o.size_v;
+            bld_v       = std::move(o.bld_v);
             std::fill(std::begin(o.root_v), std::end(o.root_v), SENTINEL_TAGGED);
+            o.root_skip_v = 0;
+            std::memset(o.root_prefix_v, 0, sizeof(o.root_prefix_v));
             o.size_v = 0;
         }
         return *this;
@@ -92,6 +185,11 @@ public:
         std::memcpy(tmp, root_v, sizeof(root_v));
         std::memcpy(root_v, o.root_v, sizeof(root_v));
         std::memcpy(o.root_v, tmp, sizeof(root_v));
+        std::swap(root_skip_v, o.root_skip_v);
+        uint8_t ptmp[7];
+        std::memcpy(ptmp, root_prefix_v, 7);
+        std::memcpy(root_prefix_v, o.root_prefix_v, 7);
+        std::memcpy(o.root_prefix_v, ptmp, 7);
         std::swap(size_v, o.size_v);
         bld_v.swap(o.bld_v);
     }
@@ -106,34 +204,30 @@ public:
         size_v = 0;
     }
 
-    void shrink_to_fit() noexcept {
-        bld_v.shrink_to_fit();
-    }
-
-    size_t memory_in_use() const noexcept {
-        return bld_v.memory_in_use();
-    }
-
-    size_t memory_needed() const noexcept {
-        return bld_v.memory_needed();
-    }
+    void shrink_to_fit() noexcept { bld_v.shrink_to_fit(); }
+    size_t memory_in_use() const noexcept { return bld_v.memory_in_use(); }
+    size_t memory_needed() const noexcept { return bld_v.memory_needed(); }
 
     // ==================================================================
-    // Find — peel top byte, index root_v, recurse at KEY_BITS-8
-    // No sentinel check: sentinel handles misses branchlessly.
+    // Find — prefix check loop + switch dispatch. No sentinel checks.
     // ==================================================================
 
     const VALUE* find_value(const KEY& key) const noexcept {
         IK ik = KO::to_internal(key);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        uint8_t top = static_cast<uint8_t>(nk >> (NK0_BITS - 8));
-        NK0 shifted = static_cast<NK0>(nk << 8);
-        if constexpr (NARROWS_AT_ROOT) {
-            return NARROW_OPS::template find_node<KEY_BITS - 8>(root_v[top],
-                static_cast<NNK0>(shifted >> (NK0_BITS / 2)));
-        } else {
-            return OPS::template find_node<KEY_BITS - 8>(root_v[top], shifted);
-        }
+
+        // Fast prefix check — all in registers
+        for (uint8_t i = 0; i < root_skip_v; ++i)
+            if (nk_byte(nk, i) != root_prefix_v[i]) [[unlikely]]
+                return nullptr;
+
+        uint8_t top = nk_byte(nk, root_skip_v);
+        uint64_t child = root_v[top];
+
+        return skip_switch(root_skip_v, [&]<int BITS>() -> const VALUE* {
+            using D = root_dispatch<BITS>;
+            return D::OPS_TYPE::template find_node<BITS>(child, D::narrow(nk));
+        });
     }
 
     bool contains(const KEY& key) const noexcept {
@@ -142,53 +236,47 @@ public:
 
 public:
     // ==================================================================
-    // Insert (insert-only: does NOT overwrite existing values)
+    // Insert / Insert-or-assign / Assign
     // ==================================================================
 
     std::pair<bool, bool> insert(const KEY& key, const VALUE& value) {
         return insert_dispatch<true, false>(key, value);
     }
 
-    // ==================================================================
-    // Insert-or-assign (overwrites existing values)
-    // ==================================================================
-
     std::pair<bool, bool> insert_or_assign(const KEY& key, const VALUE& value) {
         return insert_dispatch<true, true>(key, value);
     }
-
-    // ==================================================================
-    // Assign (overwrite only, no insert if missing)
-    // ==================================================================
 
     std::pair<bool, bool> assign(const KEY& key, const VALUE& value) {
         return insert_dispatch<false, true>(key, value);
     }
 
     // ==================================================================
-    // Erase — sentinel check (write path: structural decision)
+    // Erase — sentinel check (write path)
     // ==================================================================
 
     bool erase(const KEY& key) {
         IK ik = KO::to_internal(key);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        uint8_t top = static_cast<uint8_t>(nk >> (NK0_BITS - 8));
+
+        // Check prefix
+        for (uint8_t i = 0; i < root_skip_v; ++i)
+            if (nk_byte(nk, i) != root_prefix_v[i]) return false;
+
+        uint8_t top = nk_byte(nk, root_skip_v);
         uint64_t child = root_v[top];
         if (child == SENTINEL_TAGGED) return false;
 
-        NK0 shifted = static_cast<NK0>(nk << 8);
-        erase_result_t r;
-        if constexpr (NARROWS_AT_ROOT) {
-            r = NARROW_OPS::template erase_node<KEY_BITS - 8>(child,
-                static_cast<NNK0>(shifted >> (NK0_BITS / 2)), bld_v);
-        } else {
-            r = OPS::template erase_node<KEY_BITS - 8>(child, shifted, bld_v);
-        }
+        bool erased = skip_switch(root_skip_v, [&]<int BITS>() -> bool {
+            using D = root_dispatch<BITS>;
+            auto r = D::OPS_TYPE::template erase_node<BITS>(child, D::narrow(nk), bld_v);
+            if (!r.erased) return false;
+            root_v[top] = r.tagged_ptr ? r.tagged_ptr : SENTINEL_TAGGED;
+            return true;
+        });
 
-        if (!r.erased) return false;
-        root_v[top] = r.tagged_ptr ? r.tagged_ptr : SENTINEL_TAGGED;
-        --size_v;
-        return true;
+        if (erased) --size_v;
+        return erased;
     }
 
     // ==================================================================
@@ -206,10 +294,10 @@ public:
 
     debug_stats_t debug_stats() const noexcept {
         debug_stats_t s{};
-        s.total_bytes = sizeof(root_v);  // 2048 bytes for root array
+        s.total_bytes = sizeof(root_v);
         for (int i = 0; i < 256; ++i) {
             if (root_v[i] != SENTINEL_TAGGED)
-                collect_stats(root_v[i], s);
+                collect_stats_one(root_v[i], s);
         }
         return s;
     }
@@ -225,12 +313,10 @@ public:
         uint16_t count = 0;
         for (int i = 0; i < 256; ++i)
             if (root_v[i] != SENTINEL_TAGGED) ++count;
-        return {count, 0, false};
+        return {count, root_skip_v, false};
     }
 
-    const uint64_t* debug_root() const noexcept {
-        return root_v;
-    }
+    const uint64_t* debug_root() const noexcept { return root_v; }
 
     // ==================================================================
     // Iterator support — no sentinel checks, sentinel returns found=false
@@ -239,117 +325,92 @@ public:
     struct iter_result_t { KEY key; VALUE value; bool found; };
 
     iter_result_t iter_first() const noexcept {
-        for (int i = 0; i < 256; ++i) {
-            IK prefix = IK(i) << (IK_BITS - 8);
-            if constexpr (NARROWS_AT_ROOT) {
-                auto r = NARROW_ITER::template descend_min<KEY_BITS - 8, IK>(
-                    root_v[i], prefix, 8);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            } else {
-                auto r = ITER_OPS::template descend_min<KEY_BITS - 8, IK>(
-                    root_v[i], prefix, 8);
+        return skip_switch(root_skip_v, [&]<int BITS>() -> iter_result_t {
+            using D = root_dispatch<BITS>;
+            int pb = prefix_bits();
+            for (int i = 0; i < 256; ++i) {
+                IK pfx = make_prefix(static_cast<uint8_t>(i));
+                auto r = D::ITER_TYPE::template descend_min<BITS, IK>(
+                    root_v[i], pfx, pb);
                 if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
             }
-        }
-        return {KEY{}, VALUE{}, false};
+            return {KEY{}, VALUE{}, false};
+        });
     }
 
     iter_result_t iter_last() const noexcept {
-        for (int i = 255; i >= 0; --i) {
-            IK prefix = IK(i) << (IK_BITS - 8);
-            if constexpr (NARROWS_AT_ROOT) {
-                auto r = NARROW_ITER::template descend_max<KEY_BITS - 8, IK>(
-                    root_v[i], prefix, 8);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            } else {
-                auto r = ITER_OPS::template descend_max<KEY_BITS - 8, IK>(
-                    root_v[i], prefix, 8);
+        return skip_switch(root_skip_v, [&]<int BITS>() -> iter_result_t {
+            using D = root_dispatch<BITS>;
+            int pb = prefix_bits();
+            for (int i = 255; i >= 0; --i) {
+                IK pfx = make_prefix(static_cast<uint8_t>(i));
+                auto r = D::ITER_TYPE::template descend_max<BITS, IK>(
+                    root_v[i], pfx, pb);
                 if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
             }
-        }
-        return {KEY{}, VALUE{}, false};
+            return {KEY{}, VALUE{}, false};
+        });
     }
 
     iter_result_t iter_next(KEY key) const noexcept {
         IK ik = KO::to_internal(key);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        uint8_t top = static_cast<uint8_t>(nk >> (NK0_BITS - 8));
-        NK0 shifted = static_cast<NK0>(nk << 8);
+        uint8_t top = nk_byte(nk, root_skip_v);
 
-        // Try to find next within same slot
-        {
-            IK prefix = IK(top) << (IK_BITS - 8);
-            if constexpr (NARROWS_AT_ROOT) {
-                auto r = NARROW_ITER::template iter_next_node<KEY_BITS - 8, IK>(
-                    root_v[top],
-                    static_cast<NNK0>(shifted >> (NK0_BITS / 2)),
-                    prefix, 8);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            } else {
-                auto r = ITER_OPS::template iter_next_node<KEY_BITS - 8, IK>(
-                    root_v[top], shifted, prefix, 8);
+        return skip_switch(root_skip_v, [&]<int BITS>() -> iter_result_t {
+            using D = root_dispatch<BITS>;
+            int pb = prefix_bits();
+
+            // Try next within same slot
+            {
+                IK pfx = make_prefix(top);
+                auto r = D::ITER_TYPE::template iter_next_node<BITS, IK>(
+                    root_v[top], D::narrow(nk), pfx, pb);
                 if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
             }
-        }
 
-        // Scan forward — sentinel returns found=false naturally
-        for (int i = top + 1; i < 256; ++i) {
-            IK prefix = IK(i) << (IK_BITS - 8);
-            if constexpr (NARROWS_AT_ROOT) {
-                auto r = NARROW_ITER::template descend_min<KEY_BITS - 8, IK>(
-                    root_v[i], prefix, 8);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            } else {
-                auto r = ITER_OPS::template descend_min<KEY_BITS - 8, IK>(
-                    root_v[i], prefix, 8);
+            // Scan forward
+            for (int i = top + 1; i < 256; ++i) {
+                IK pfx = make_prefix(static_cast<uint8_t>(i));
+                auto r = D::ITER_TYPE::template descend_min<BITS, IK>(
+                    root_v[i], pfx, pb);
                 if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
             }
-        }
-        return {KEY{}, VALUE{}, false};
+            return {KEY{}, VALUE{}, false};
+        });
     }
 
     iter_result_t iter_prev(KEY key) const noexcept {
         IK ik = KO::to_internal(key);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        uint8_t top = static_cast<uint8_t>(nk >> (NK0_BITS - 8));
-        NK0 shifted = static_cast<NK0>(nk << 8);
+        uint8_t top = nk_byte(nk, root_skip_v);
 
-        // Try to find prev within same slot
-        {
-            IK prefix = IK(top) << (IK_BITS - 8);
-            if constexpr (NARROWS_AT_ROOT) {
-                auto r = NARROW_ITER::template iter_prev_node<KEY_BITS - 8, IK>(
-                    root_v[top],
-                    static_cast<NNK0>(shifted >> (NK0_BITS / 2)),
-                    prefix, 8);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            } else {
-                auto r = ITER_OPS::template iter_prev_node<KEY_BITS - 8, IK>(
-                    root_v[top], shifted, prefix, 8);
+        return skip_switch(root_skip_v, [&]<int BITS>() -> iter_result_t {
+            using D = root_dispatch<BITS>;
+            int pb = prefix_bits();
+
+            // Try prev within same slot
+            {
+                IK pfx = make_prefix(top);
+                auto r = D::ITER_TYPE::template iter_prev_node<BITS, IK>(
+                    root_v[top], D::narrow(nk), pfx, pb);
                 if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
             }
-        }
 
-        // Scan backward — sentinel returns found=false naturally
-        for (int i = top - 1; i >= 0; --i) {
-            IK prefix = IK(i) << (IK_BITS - 8);
-            if constexpr (NARROWS_AT_ROOT) {
-                auto r = NARROW_ITER::template descend_max<KEY_BITS - 8, IK>(
-                    root_v[i], prefix, 8);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            } else {
-                auto r = ITER_OPS::template descend_max<KEY_BITS - 8, IK>(
-                    root_v[i], prefix, 8);
+            // Scan backward
+            for (int i = top - 1; i >= 0; --i) {
+                IK pfx = make_prefix(static_cast<uint8_t>(i));
+                auto r = D::ITER_TYPE::template descend_max<BITS, IK>(
+                    root_v[i], pfx, pb);
                 if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
             }
-        }
-        return {KEY{}, VALUE{}, false};
+            return {KEY{}, VALUE{}, false};
+        });
     }
 
 private:
     // ==================================================================
-    // Insert dispatch (shared by insert / insert_or_assign / assign)
-    // Sentinel check: write path structural decision
+    // Insert dispatch — prefix check + initial skip + reduce + switch
     // ==================================================================
 
     template<bool INSERT, bool ASSIGN>
@@ -357,77 +418,138 @@ private:
         IK ik = KO::to_internal(key);
         VST sv = bld_v.store_value(value);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        uint8_t top = static_cast<uint8_t>(nk >> (NK0_BITS - 8));
-        NK0 shifted = static_cast<NK0>(nk << 8);
 
+        // First insert: establish max skip prefix
+        if constexpr (MAX_ROOT_SKIP > 0) {
+            if (size_v == 0) [[unlikely]] {
+                if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
+                root_skip_v = static_cast<uint8_t>(MAX_ROOT_SKIP);
+                for (uint8_t i = 0; i < root_skip_v; ++i)
+                    root_prefix_v[i] = nk_byte(nk, i);
+                // Fall through to normal insert (root_v[top] is SENTINEL_TAGGED)
+            }
+        }
+
+        // Check prefix — find first divergence
+        for (uint8_t i = 0; i < root_skip_v; ++i) {
+            if (nk_byte(nk, i) != root_prefix_v[i]) [[unlikely]] {
+                if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
+                reduce_root_skip(i);
+                break;  // prefix now valid, fall through to normal insert
+            }
+        }
+
+        uint8_t top = nk_byte(nk, root_skip_v);
         uint64_t child = root_v[top];
 
-        // Empty slot: create single-entry leaf for remaining key
+        // Empty slot: create leaf
         if (child == SENTINEL_TAGGED) {
             if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
-            uint64_t* leaf;
-            if constexpr (NARROWS_AT_ROOT) {
-                leaf = NARROW_OPS::make_single_leaf(
-                    static_cast<NNK0>(shifted >> (NK0_BITS / 2)), sv, bld_v);
-            } else {
-                leaf = OPS::make_single_leaf(shifted, sv, bld_v);
-            }
+            uint64_t* leaf = skip_switch(root_skip_v, [&]<int BITS>() -> uint64_t* {
+                using D = root_dispatch<BITS>;
+                return D::OPS_TYPE::make_single_leaf(D::narrow(nk), sv, bld_v);
+            });
             root_v[top] = tag_leaf(leaf);
             ++size_v;
             return {true, true};
         }
 
-        // Non-empty slot: recurse into child with KEY_BITS-8
-        insert_result_t r;
-        if constexpr (NARROWS_AT_ROOT) {
-            r = NARROW_OPS::template insert_node<KEY_BITS - 8, INSERT, ASSIGN>(
-                child, static_cast<NNK0>(shifted >> (NK0_BITS / 2)), sv, bld_v);
-        } else {
-            r = OPS::template insert_node<KEY_BITS - 8, INSERT, ASSIGN>(
-                child, shifted, sv, bld_v);
-        }
+        // Non-empty slot: recurse
+        bool did_insert = skip_switch(root_skip_v, [&]<int BITS>() -> bool {
+            using D = root_dispatch<BITS>;
+            auto r = D::OPS_TYPE::template insert_node<BITS, INSERT, ASSIGN>(
+                child, D::narrow(nk), sv, bld_v);
+            if (r.tagged_ptr != child) root_v[top] = r.tagged_ptr;
+            return r.inserted;
+        });
 
-        if (r.tagged_ptr != child) root_v[top] = r.tagged_ptr;
-        if (r.inserted) { ++size_v; return {true, true}; }
+        if (did_insert) { ++size_v; return {true, true}; }
         bld_v.destroy_value(sv);
         return {true, false};
     }
 
     // ==================================================================
-    // Remove all — write path, checks sentinel to skip empty slots
+    // reduce_root_skip: restructure root when prefix diverges
+    // ==================================================================
+
+    void reduce_root_skip(uint8_t div_pos) {
+        uint8_t old_skip = root_skip_v;
+
+        // Collect non-sentinel entries from old root_v
+        uint8_t indices[256];
+        uint64_t tagged_ptrs[256];
+        unsigned count = 0;
+        for (int i = 0; i < 256; ++i) {
+            if (root_v[i] != SENTINEL_TAGGED) {
+                indices[count] = static_cast<uint8_t>(i);
+                tagged_ptrs[count] = root_v[i];
+                ++count;
+            }
+        }
+
+        // Create bitmask node (or skip chain) for old subtree
+        uint64_t old_subtree;
+        uint8_t chain_len = old_skip - div_pos - 1;  // intermediate skip bytes
+        if (chain_len > 0) {
+            uint8_t chain_bytes[6];
+            for (uint8_t i = 0; i < chain_len; ++i)
+                chain_bytes[i] = root_prefix_v[div_pos + 1 + i];
+            auto* node = BO::make_skip_chain(chain_bytes, chain_len,
+                                              indices, tagged_ptrs, count, bld_v,
+                                              size_v);
+            old_subtree = tag_bitmask(node);
+        } else {
+            auto* node = BO::make_bitmask(indices, tagged_ptrs, count, bld_v,
+                                           size_v);
+            old_subtree = tag_bitmask(node);
+        }
+
+        // Clear root_v, set new skip
+        std::fill(std::begin(root_v), std::end(root_v), SENTINEL_TAGGED);
+        uint8_t old_byte = root_prefix_v[div_pos];
+        root_skip_v = div_pos;
+        // root_prefix_v[0..div_pos-1] unchanged, rest don't matter
+
+        // Place old subtree under old prefix byte at div_pos
+        root_v[old_byte] = old_subtree;
+    }
+
+    // ==================================================================
+    // Remove all — write path, switch outside loop
     // ==================================================================
 
     void remove_all() noexcept {
-        for (int i = 0; i < 256; ++i) {
-            if (root_v[i] != SENTINEL_TAGGED) {
-                if constexpr (NARROWS_AT_ROOT) {
-                    NARROW_ITER::template remove_subtree<KEY_BITS - 8>(root_v[i], bld_v);
-                } else {
-                    ITER_OPS::template remove_subtree<KEY_BITS - 8>(root_v[i], bld_v);
+        skip_switch(root_skip_v, [&]<int BITS>() -> int {
+            using D = root_dispatch<BITS>;
+            for (int i = 0; i < 256; ++i) {
+                if (root_v[i] != SENTINEL_TAGGED) {
+                    D::ITER_TYPE::template remove_subtree<BITS>(root_v[i], bld_v);
+                    root_v[i] = SENTINEL_TAGGED;
                 }
-                root_v[i] = SENTINEL_TAGGED;
             }
-        }
+            return 0;
+        });
+        root_skip_v = 0;
         size_v = 0;
     }
 
     // ==================================================================
-    // Stats collection — diagnostic path, checks sentinel
+    // Stats collection — diagnostic path
     // ==================================================================
 
-    void collect_stats(uint64_t tagged, debug_stats_t& s) const noexcept {
-        typename ITER_OPS::stats_t os{};
-        if constexpr (NARROWS_AT_ROOT) {
-            NARROW_ITER::template collect_stats<KEY_BITS - 8>(tagged, os);
-        } else {
-            ITER_OPS::template collect_stats<KEY_BITS - 8>(tagged, os);
-        }
-        s.total_bytes    += os.total_bytes;
-        s.total_entries  += os.total_entries;
-        s.bitmap_leaves  += os.bitmap_leaves;
-        s.compact_leaves += os.compact_leaves;
-        s.bitmask_nodes  += os.bitmask_nodes;
-        s.bm_children    += os.bm_children;
+    void collect_stats_one(uint64_t tagged, debug_stats_t& s) const noexcept {
+        skip_switch(root_skip_v, [&]<int BITS>() -> int {
+            using D = root_dispatch<BITS>;
+            typename D::ITER_TYPE::stats_t os{};
+            D::ITER_TYPE::template collect_stats<BITS>(tagged, os);
+            s.total_bytes    += os.total_bytes;
+            s.total_entries  += os.total_entries;
+            s.bitmap_leaves  += os.bitmap_leaves;
+            s.compact_leaves += os.compact_leaves;
+            s.bitmask_nodes  += os.bitmask_nodes;
+            s.bm_children    += os.bm_children;
+            return 0;
+        });
     }
 };
 
