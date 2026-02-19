@@ -87,66 +87,68 @@ struct bitmap_256_t {
 
     struct adj_result { uint8_t idx; uint16_t slot; bool found; };
 
-    // Find smallest set bit > idx, with its slot. Fully branchless.
+    // Find smallest set bit > idx, with its slot.
     adj_result next_set_after(uint8_t idx) const noexcept {
-        unsigned start = (unsigned(idx) + 1) & 255;
-        unsigned sw = start >> 6;
-        unsigned sb = start & 63;
+        if (idx == 255) return {0, 0, false};
+        int start = idx + 1;
+        int w = start >> 6, b = start & 63;
 
-        // Zero words before sw, partial-mask only the start word
-        uint64_t m[4] = {words[0], words[1], words[2], words[3]};
-        m[0] &= -uint64_t(0 >= sw);
-        m[1] &= -uint64_t(1 >= sw);
-        m[2] &= -uint64_t(2 >= sw);
-        m[sw & 3] &= (~0ULL << sb);
+        // Branchless prefix popcount (same pattern as find_slot)
+        int slot = std::popcount(words[0]) & -int(w > 0);
+        slot += std::popcount(words[1]) & -int(w > 1);
+        slot += std::popcount(words[2]) & -int(w > 2);
 
-        // First non-zero masked word
-        int fw = !m[0] + (!m[0] & !m[1]) + (!m[0] & !m[1] & !m[2]);
-        int biw = std::countr_zero(m[fw]);
-        int bit = (fw << 6) + biw;
+        // Mask out bits below start in starting word
+        uint64_t m = words[w] & (~0ULL << b);
+        if (m) {
+            int bit = (w << 6) + std::countr_zero(m);
+            slot += std::popcount(words[w] & ((1ULL << (bit & 63)) - 1));
+            return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
+        }
+        slot += std::popcount(words[w]);
 
-        // Slot (find_slot<BRANCHLESS> on original words)
-        uint64_t before = words[fw] << ((63 - biw) & 63);
-        int slot = std::popcount(before) - 1;
-        slot += std::popcount(words[0]) & -int(fw > 0);
-        slot += std::popcount(words[1]) & -int(fw > 1);
-        slot += std::popcount(words[2]) & -int(fw > 2);
-
-        // idx=255: start wraps to 0, finds lowest bit, uint8_t(bit) > 255 → false
-        // empty bitmap: ctz(0)=64, bit≥256, uint8_t(bit) > idx → false
-        return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot),
-                static_cast<uint8_t>(bit) > idx};
+        // Search remaining words (at most 3 iterations, typically 0-1)
+        for (int ww = w + 1; ww < 4; ++ww) {
+            if (words[ww]) {
+                int bit = (ww << 6) + std::countr_zero(words[ww]);
+                slot += std::popcount(words[ww] & ((1ULL << (bit & 63)) - 1));
+                return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
+            }
+            slot += std::popcount(words[ww]);
+        }
+        return {0, 0, false};
     }
 
-    // Find largest set bit < idx, with its slot. Fully branchless.
+    // Find largest set bit < idx, with its slot.
     adj_result prev_set_before(uint8_t idx) const noexcept {
-        unsigned last = (unsigned(idx) - 1) & 255;
-        unsigned ew = last >> 6;
-        unsigned eb = last & 63;
+        if (idx == 0) return {0, 0, false};
+        int last = idx - 1;
+        int w = last >> 6, b = last & 63;
 
-        // Zero words after ew, partial-mask only the end word
-        uint64_t m[4] = {words[0], words[1], words[2], words[3]};
-        m[3] &= -uint64_t(3 <= ew);
-        m[2] &= -uint64_t(2 <= ew);
-        m[1] &= -uint64_t(1 <= ew);
-        m[ew & 3] &= ~0ULL >> (63 - eb);
+        // Mask off bits above 'last' in starting word
+        uint64_t m = words[w] & ((2ULL << b) - 1);
+        if (m) {
+            int bit = (w << 6) + 63 - std::countl_zero(m);
+            // Branchless prefix popcount
+            int slot = std::popcount(words[0]) & -int(w > 0);
+            slot += std::popcount(words[1]) & -int(w > 1);
+            slot += std::popcount(words[2]) & -int(w > 2);
+            slot += std::popcount(m & ((1ULL << (bit & 63)) - 1));
+            return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
+        }
 
-        // Last non-zero masked word
-        int lw = 3 - !m[3] - (!m[3] & !m[2]) - (!m[3] & !m[2] & !m[1]);
-        int biw = 63 - std::countl_zero(m[lw]);
-        int bit = (lw << 6) + biw;
-
-        // Slot (find_slot<BRANCHLESS> on original words)
-        uint64_t before = words[lw] << ((63 - biw) & 63);
-        int slot = std::popcount(before) - 1;
-        slot += std::popcount(words[0]) & -int(lw > 0);
-        slot += std::popcount(words[1]) & -int(lw > 1);
-        slot += std::popcount(words[2]) & -int(lw > 2);
-
-        // idx=0: last wraps to 255, finds highest bit, uint8_t(bit) < 0 → false
-        // empty bitmap: clz(0)=64, bit=-1, uint8_t(255) < idx → false
-        return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot),
-                static_cast<uint8_t>(bit) < idx};
+        // Search lower words
+        for (int ww = w - 1; ww >= 0; --ww) {
+            if (words[ww]) {
+                int bit = (ww << 6) + 63 - std::countl_zero(words[ww]);
+                int slot = std::popcount(words[0]) & -int(ww > 0);
+                slot += std::popcount(words[1]) & -int(ww > 1);
+                slot += std::popcount(words[2]) & -int(ww > 2);
+                slot += std::popcount(words[ww] & ((1ULL << (bit & 63)) - 1));
+                return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
+            }
+        }
+        return {0, 0, false};
     }
 
     static bitmap_256_t from_indices(const uint8_t* indices, unsigned count) noexcept {
@@ -700,7 +702,7 @@ struct bitmask_ops {
                                             size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
         auto r = bmp.next_set_after(suffix);
-        if (!r.found) [[unlikely]] return {0, nullptr, false};
+        if (!r.found) return {0, nullptr, false};
         const VST* vd = bl_vals(node, header_size);
         return {r.idx, &vd[r.slot], true};
     }
@@ -710,7 +712,7 @@ struct bitmask_ops {
                                             size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
         auto r = bmp.prev_set_before(suffix);
-        if (!r.found) [[unlikely]] return {0, nullptr, false};
+        if (!r.found) return {0, nullptr, false};
         const VST* vd = bl_vals(node, header_size);
         return {r.idx, &vd[r.slot], true};
     }
@@ -729,11 +731,11 @@ struct bitmask_ops {
         unsigned count = h->entries();
         VST* vd = bl_vals_mut(node, hs);
 
-        if (bm.has_bit(suffix)) [[unlikely]] {
+        if (bm.has_bit(suffix)) {
             if constexpr (ASSIGN) {
                 int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
                 VT::destroy(vd[slot], alloc);
-                VT::init_slot(&vd[slot], value);
+                VT::write_slot(&vd[slot], value);
             }
             return {tag_leaf(node), false, false};
         }
@@ -744,11 +746,11 @@ struct bitmask_ops {
         size_t new_sz = bitmap_leaf_size_u64(nc, hs);
 
         // In-place
-        if (new_sz <= h->alloc_u64()) [[likely]] {
+        if (new_sz <= h->alloc_u64()) {
             int isl = bm.find_slot<slot_mode::UNFILTERED>(suffix);
             bm.set_bit(suffix);
-            VT::open_gap(vd, count, isl);
-            VT::init_slot(&vd[isl], value);
+            std::memmove(vd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
+            VT::write_slot(&vd[isl], value);
             h->set_entries(nc);
             return {tag_leaf(node), true, false};
         }
@@ -766,9 +768,9 @@ struct bitmask_ops {
         nbm.set_bit(suffix);
         VST* nvd = bl_vals_mut(nn, hs);
         int isl = nbm.find_slot<slot_mode::UNFILTERED>(suffix);
-        VT::copy_uninit(vd, isl, nvd);
-        VT::init_slot(&nvd[isl], value);
-        VT::copy_uninit(vd + isl, count - isl, nvd + isl + 1);
+        std::memcpy(nvd, vd, isl * sizeof(VST));
+        VT::write_slot(&nvd[isl], value);
+        std::memcpy(nvd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
 
         dealloc_node(alloc, node, h->alloc_u64());
         return {tag_leaf(nn), true, false};
@@ -783,15 +785,14 @@ struct bitmask_ops {
         auto* h = get_header(node);
         size_t hs = hdr_u64(node);
         bitmap_256_t& bm = bm_mut(node, hs);
-        if (!bm.has_bit(suffix)) [[unlikely]] return {tag_leaf(node), false, 0};
+        if (!bm.has_bit(suffix)) return {tag_leaf(node), false, 0};
 
         unsigned count = h->entries();
         int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
+        VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
 
         unsigned nc = count - 1;
-        if (nc == 0) [[unlikely]] {
-            if constexpr (VT::HAS_DESTRUCTOR)
-                VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
+        if (nc == 0) {
             dealloc_node(alloc, node, h->alloc_u64());
             return {0, true, 0};
         }
@@ -799,19 +800,15 @@ struct bitmask_ops {
         size_t new_sz = bitmap_leaf_size_u64(nc, hs);
 
         // In-place
-        if (!should_shrink_u64(h->alloc_u64(), new_sz)) [[likely]] {
+        if (!should_shrink_u64(h->alloc_u64(), new_sz)) {
             VST* vd = bl_vals_mut(node, hs);
             bm.clear_bit(suffix);
-            // C: destroy (dealloc pointer) before shift. B: move-assign handles it.
-            if constexpr (!VT::IS_INLINE)
-                VT::destroy(vd[slot], alloc);
-            VT::close_gap(vd, count, slot);
+            std::memmove(vd + slot, vd + slot + 1, (nc - slot) * sizeof(VST));
             h->set_entries(nc);
             return {tag_leaf(node), true, nc};
         }
 
-        // Realloc: destroyed slot skipped in copy
-        VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
+        // Realloc
         size_t au64 = round_up_u64(new_sz);
         uint64_t* nn = alloc_node(alloc, au64);
         auto* nh = get_header(nn);
@@ -823,8 +820,8 @@ struct bitmask_ops {
         bm_mut(nn, hs).clear_bit(suffix);
         const VST* ov = bl_vals(node, hs);
         VST*       nv = bl_vals_mut(nn, hs);
-        VT::copy_uninit(ov, slot, nv);
-        VT::copy_uninit(ov + slot + 1, nc - slot, nv + slot);
+        std::memcpy(nv, ov, slot * sizeof(VST));
+        std::memcpy(nv + slot, ov + slot + 1, (nc - slot) * sizeof(VST));
 
         dealloc_node(alloc, node, h->alloc_u64());
         return {tag_leaf(nn), true, nc};
@@ -933,7 +930,7 @@ private:
         size_t needed = bitmask_size_u64(nc, hs);
 
         // In-place
-        if (needed <= h->alloc_u64()) [[likely]] {
+        if (needed <= h->alloc_u64()) {
             // Save descendants (children shift will overwrite it)
             uint64_t saved = *descendants_ptr(node, hs, oc);
 
@@ -979,7 +976,7 @@ private:
                                        int slot, uint8_t idx, ALLOC& alloc) {
         unsigned oc = h->entries();
         unsigned nc = oc - 1;
-        if (nc == 0) [[unlikely]] {
+        if (nc == 0) {
             dealloc_node(alloc, node, h->alloc_u64());
             return nullptr;
         }
@@ -987,7 +984,7 @@ private:
         size_t needed = bitmask_size_u64(nc, hs);
 
         // In-place
-        if (!should_shrink_u64(h->alloc_u64(), needed)) [[likely]] {
+        if (!should_shrink_u64(h->alloc_u64(), needed)) {
             uint64_t saved = *descendants_ptr(node, hs, oc);
 
             bitmap_256_t::arr_remove(bm_mut(node, hs), real_children_mut(node, hs),

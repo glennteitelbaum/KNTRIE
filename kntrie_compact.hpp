@@ -187,21 +187,15 @@ struct compact_ops {
     static void destroy_and_dealloc(uint64_t* node, ALLOC& alloc) {
         auto* h = get_header(node);
         if constexpr (VT::HAS_DESTRUCTOR) {
+            // C-type (pointer): dups share pointers — destroy unique only
             unsigned ts = h->total_slots();
             size_t hs = hdr_u64(node);
+            const K* kd = keys(node, hs);
             VST* vd = vals_mut(node, ts, hs);
-            if constexpr (VT::IS_INLINE) {
-                // B-type: each dup is an independent copy — destroy ALL
-                for (unsigned i = 0; i < ts; ++i)
-                    VT::destroy(vd[i], alloc);
-            } else {
-                // C-type (pointer): dups share pointers — destroy unique only
-                const K* kd = keys(node, hs);
-                VT::destroy(vd[0], alloc);
-                for (unsigned i = 1; i < ts; ++i) {
-                    if (kd[i] == kd[i - 1]) continue;
-                    VT::destroy(vd[i], alloc);
-                }
+            VT::destroy(vd[0], alloc);
+            for (unsigned i = 1; i < ts; ++i) {
+                if (kd[i] == kd[i - 1]) continue;
+                VT::destroy(vd[i], alloc);
             }
         }
         dealloc_node(alloc, node, h->alloc_u64());
@@ -271,11 +265,6 @@ struct compact_ops {
         seed_with_insert(nn, kd, vd, ts, entries,
                           suffix, value, new_entries, new_ts, hs);
 
-        // B-type: old values are independent copies, must destroy before dealloc
-        if constexpr (VT::IS_INLINE && VT::HAS_DESTRUCTOR) {
-            for (unsigned i = 0; i < ts; ++i)
-                VT::destroy(vd[i], alloc);
-        }
         dealloc_node(alloc, node, h->alloc_u64());
         return {tag_leaf(nn), true, false};
     }
@@ -324,12 +313,6 @@ struct compact_ops {
             dedup_skip_into(kd, vd, ts, suffix, tmp_k.get(), tmp_v.get(), alloc);
             seed_from_real(nn, tmp_k.get(), tmp_v.get(), nc, new_ts, hs);
 
-            // B-type: old values are independent copies that need destruction.
-            // C-type: erased pointer freed in dedup_skip_into, others transferred.
-            if constexpr (VT::IS_INLINE && VT::HAS_DESTRUCTOR) {
-                for (unsigned i = 0; i < ts; ++i)
-                    VT::destroy(vd[i], alloc);
-            }
             dealloc_node(alloc, node, h->alloc_u64());
             return {tag_leaf(nn), true, nc};
         }
@@ -374,11 +357,9 @@ private:
                                   K* out_k, VST* out_v, ALLOC& alloc) {
         bool skipped = false;
         int wi = 0;
-        // Handle first element (no dup check needed)
         if (kd[0] == skip_suffix) {
             skipped = true;
-            // C-type: free the erased pointer now (ownership not transferred)
-            if constexpr (!VT::IS_INLINE && VT::HAS_DESTRUCTOR)
+            if constexpr (VT::HAS_DESTRUCTOR)
                 VT::destroy(vd[0], alloc);
         } else {
             out_k[wi] = kd[0];
@@ -389,7 +370,7 @@ private:
             if (kd[i] == kd[i - 1]) continue;
             if (!skipped && kd[i] == skip_suffix) {
                 skipped = true;
-                if constexpr (!VT::IS_INLINE && VT::HAS_DESTRUCTOR)
+                if constexpr (VT::HAS_DESTRUCTOR)
                     VT::destroy(vd[i], alloc);
                 continue;
             }
@@ -397,10 +378,8 @@ private:
             VT::write_slot(&out_v[wi], vd[i]);
             wi++;
         }
-        // B-type: caller must destroy ALL old slots via destroy_and_dealloc.
         // C-type: erased pointer freed above; dups share pointers with
         //         copied entries (transferred), so no further destroy needed.
-        // A-type: nothing to destroy.
     }
 
     // ==================================================================
@@ -603,20 +582,14 @@ private:
             int shift_count = ins - 1 - dup_pos;
             if (shift_count > 0) {
                 std::memmove(kd + dup_pos, kd + dup_pos + 1, shift_count * sizeof(K));
-                if constexpr (VT::IS_TRIVIAL || !VT::IS_INLINE)
-                    std::memmove(vd + dup_pos, vd + dup_pos + 1, shift_count * sizeof(VST));
-                else
-                    std::move(vd + dup_pos + 1, vd + dup_pos + 1 + shift_count, vd + dup_pos);
+                std::memmove(vd + dup_pos, vd + dup_pos + 1, shift_count * sizeof(VST));
             }
             write_pos = ins - 1;
         } else {
             int shift_count = dup_pos - ins;
             if (shift_count > 0) {
                 std::memmove(kd + ins + 1, kd + ins, shift_count * sizeof(K));
-                if constexpr (VT::IS_TRIVIAL || !VT::IS_INLINE)
-                    std::memmove(vd + ins + 1, vd + ins, shift_count * sizeof(VST));
-                else
-                    std::move_backward(vd + ins, vd + ins + shift_count, vd + ins + shift_count + 1);
+                std::memmove(vd + ins + 1, vd + ins, shift_count * sizeof(VST));
             }
             write_pos = ins;
         }

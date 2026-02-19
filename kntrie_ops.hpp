@@ -934,14 +934,16 @@ struct kntrie_ops {
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
                     auto child = NARROW::template collect_entries<BITS - 8>(rch[slot]);
                     for (size_t i = 0; i < child.count; ++i) {
-                        wk[wi] = (NK(idx) << (BITS - 8)) | NK(child.keys[i]);
+                        wk[wi] = (NK(idx) << (NK_BITS - 8))
+                               | (NK(child.keys[i]) << (NK_BITS / 2 - 8));
                         wv[wi] = child.vals[i];
                         wi++;
                     }
                 } else {
                     auto child = collect_entries<BITS - 8>(rch[slot]);
                     for (size_t i = 0; i < child.count; ++i) {
-                        wk[wi] = (NK(idx) << (BITS - 8)) | child.keys[i];
+                        wk[wi] = (NK(idx) << (NK_BITS - 8))
+                               | (child.keys[i] >> 8);
                         wv[wi] = child.vals[i];
                         wi++;
                     }
@@ -952,19 +954,20 @@ struct kntrie_ops {
     }
 
     // --- Prepend byte to same-NK results ---
-    static collected_t prepend(uint8_t byte, int child_bits, collected_t child) {
+    static collected_t prepend(uint8_t byte, int /*child_bits*/, collected_t child) {
         for (size_t i = 0; i < child.count; ++i)
-            child.keys[i] = (NK(byte) << child_bits) | child.keys[i];
+            child.keys[i] = (NK(byte) << (NK_BITS - 8)) | (child.keys[i] >> 8);
         return child;
     }
 
     // --- Widen NNK results to NK, prepending byte ---
-    static collected_t widen_prepend(uint8_t byte, int child_bits,
+    static collected_t widen_prepend(uint8_t byte, int /*child_bits*/,
                                        typename NARROW::collected_t child) {
         auto wk = std::make_unique<NK[]>(child.count);
         auto wv = std::make_unique<VST[]>(child.count);
         for (size_t i = 0; i < child.count; ++i) {
-            wk[i] = (NK(byte) << child_bits) | NK(child.keys[i]);
+            wk[i] = (NK(byte) << (NK_BITS - 8))
+                   | (NK(child.keys[i]) << (NK_BITS / 2 - 8));
             wv[i] = child.vals[i];
         }
         return {std::move(wk), std::move(wv), child.count};
@@ -1097,7 +1100,7 @@ struct kntrie_ops {
 
     // ==================================================================
     // Subtree deallocation (for coalesce: values already collected)
-    // B: destroy values (copies were made). C: do NOT destroy (pointers inherited).
+    // C-type: do NOT destroy (pointers inherited by new leaf).
     // ==================================================================
 
     template<int BITS> requires (BITS >= 8)
@@ -1105,22 +1108,7 @@ struct kntrie_ops {
         if (tagged & LEAF_BIT) [[unlikely]] {
             uint64_t* node = untag_leaf_mut(tagged);
             auto* hdr = get_header(node);
-            // B type: old leaf values are copies — must destroy before dealloc.
-            // C type: new leaf inherited the pointers — do NOT destroy.
-            // A type: noop.
-            if constexpr (VT::IS_INLINE && VT::HAS_DESTRUCTOR) {
-                uint8_t skip = hdr->skip();
-                if (skip) [[unlikely]] {
-                    dealloc_leaf_skip<BITS>(node, skip, alloc);
-                } else {
-                    if constexpr (sizeof(NK) == 1)
-                        BO::bitmap_destroy_and_dealloc(node, alloc);
-                    else
-                        CO::destroy_and_dealloc(node, alloc);
-                }
-            } else {
-                dealloc_node(alloc, node, hdr->alloc_u64());
-            }
+            dealloc_node(alloc, node, hdr->alloc_u64());
             return;
         }
         uint64_t* node = bm_to_node(tagged);

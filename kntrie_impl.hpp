@@ -241,12 +241,8 @@ private:
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
 
         // Empty trie: create single-entry leaf
-        if (root_v == SENTINEL_TAGGED) [[unlikely]] {
-            // C: dealloc heap object. B: stack dtor handles it. A: noop.
-            if constexpr (!INSERT) {
-                if constexpr (!VT::IS_INLINE) VT::destroy(sv, alloc_v);
-                return {true, false};
-            }
+        if (root_v == SENTINEL_TAGGED) {
+            if constexpr (!INSERT) { VT::destroy(sv, alloc_v); return {true, false}; }
             root_v = tag_leaf(OPS::make_single_leaf(nk, sv, alloc_v));
             ++size_v;
             return {true, true};
@@ -256,8 +252,7 @@ private:
             root_v, nk, sv, alloc_v);
         if (r.tagged_ptr != root_v) root_v = r.tagged_ptr;
         if (r.inserted) { ++size_v; return {true, true}; }
-        // Not inserted: destroy sv. C needs dealloc, B handled by stack dtor.
-        if constexpr (!VT::IS_INLINE) VT::destroy(sv, alloc_v);
+        VT::destroy(sv, alloc_v);
         return {true, false};
     }
 

@@ -131,12 +131,12 @@ struct kntrie_iter_ops {
     template<int BITS, typename IK> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_min(uint64_t ptr,
                                                      IK prefix, int bits) noexcept {
-        if (ptr & LEAF_BIT) [[unlikely]] {
+        if (ptr & LEAF_BIT) {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             if (hdr->entries() == 0) return {IK{}, nullptr, false};
             uint8_t skip = hdr->skip();
-            if (skip) [[unlikely]]
+            if (skip)
                 return descend_min_leaf_skip<BITS, IK>(
                     node, hdr, hdr->prefix_bytes(), skip, 0, prefix, bits);
             return leaf_first<IK>(node, hdr, prefix, bits);
@@ -144,7 +144,7 @@ struct kntrie_iter_ops {
 
         const uint64_t* node = bm_to_node_const(ptr);
         uint8_t sc = get_header(node)->skip();
-        if (sc > 0) [[unlikely]]
+        if (sc > 0)
             return descend_min_chain_skip<BITS, IK>(node, sc, 0, prefix, bits);
         return descend_min_bm_final<BITS, IK>(node, sc, prefix, bits);
     }
@@ -156,7 +156,7 @@ struct kntrie_iter_ops {
             const uint8_t* pb, uint8_t skip, uint8_t pos,
             IK prefix, int bits) noexcept {
         constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= skip) [[unlikely]]
+        if (pos >= skip)
             return leaf_first<IK>(node, hdr, prefix, bits);
 
         prefix |= IK(pb[pos]) << (IK_BITS - bits - 8);
@@ -177,7 +177,7 @@ struct kntrie_iter_ops {
             const uint64_t* node, uint8_t sc, uint8_t pos,
             IK prefix, int bits) noexcept {
         constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= sc) [[unlikely]]
+        if (pos >= sc)
             return descend_min_bm_final<BITS, IK>(node, sc, prefix, bits);
 
         prefix |= IK(BO::skip_byte(node, pos)) << (IK_BITS - bits - 8);
@@ -220,12 +220,12 @@ struct kntrie_iter_ops {
     template<int BITS, typename IK> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_max(uint64_t ptr,
                                                      IK prefix, int bits) noexcept {
-        if (ptr & LEAF_BIT) [[unlikely]] {
+        if (ptr & LEAF_BIT) {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             if (hdr->entries() == 0) return {IK{}, nullptr, false};
             uint8_t skip = hdr->skip();
-            if (skip) [[unlikely]]
+            if (skip)
                 return descend_max_leaf_skip<BITS, IK>(
                     node, hdr, hdr->prefix_bytes(), skip, 0, prefix, bits);
             return leaf_last<IK>(node, hdr, prefix, bits);
@@ -233,7 +233,7 @@ struct kntrie_iter_ops {
 
         const uint64_t* node = bm_to_node_const(ptr);
         uint8_t sc = get_header(node)->skip();
-        if (sc > 0) [[unlikely]]
+        if (sc > 0)
             return descend_max_chain_skip<BITS, IK>(node, sc, 0, prefix, bits);
         return descend_max_bm_final<BITS, IK>(node, sc, prefix, bits);
     }
@@ -244,7 +244,7 @@ struct kntrie_iter_ops {
             const uint8_t* pb, uint8_t skip, uint8_t pos,
             IK prefix, int bits) noexcept {
         constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= skip) [[unlikely]]
+        if (pos >= skip)
             return leaf_last<IK>(node, hdr, prefix, bits);
         prefix |= IK(pb[pos]) << (IK_BITS - bits - 8);
         if constexpr (BITS > 8) {
@@ -263,7 +263,7 @@ struct kntrie_iter_ops {
             const uint64_t* node, uint8_t sc, uint8_t pos,
             IK prefix, int bits) noexcept {
         constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= sc) [[unlikely]]
+        if (pos >= sc)
             return descend_max_bm_final<BITS, IK>(node, sc, prefix, bits);
         prefix |= IK(BO::skip_byte(node, pos)) << (IK_BITS - bits - 8);
         if constexpr (BITS > 8) {
@@ -319,7 +319,7 @@ struct kntrie_iter_ops {
         // --- BITMASK ---
         const uint64_t* node = bm_to_node_const(ptr);
         uint8_t sc = get_header(node)->skip();
-        if (sc > 0) [[unlikely]]
+        if (sc > 0)
             return iter_next_chain_skip<BITS, IK>(node, sc, ik, 0, prefix, bits);
         return iter_next_bm_final<BITS, IK>(node, sc, ik, prefix, bits);
     }
@@ -331,7 +331,7 @@ struct kntrie_iter_ops {
             NK ik, const uint8_t* pb, uint8_t skip, uint8_t pos,
             IK prefix, int bits) noexcept {
         constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= skip) [[unlikely]]
+        if (pos >= skip)
             return leaf_next<IK>(node, hdr, ik, prefix, bits);
 
         uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
@@ -364,7 +364,7 @@ struct kntrie_iter_ops {
             NK ik, uint8_t pos,
             IK prefix, int bits) noexcept {
         constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= sc) [[unlikely]]
+        if (pos >= sc)
             return iter_next_bm_final<BITS, IK>(node, sc, ik, prefix, bits);
 
         uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
@@ -456,7 +456,7 @@ struct kntrie_iter_ops {
 
         const uint64_t* node = bm_to_node_const(ptr);
         uint8_t sc = get_header(node)->skip();
-        if (sc > 0) [[unlikely]]
+        if (sc > 0)
             return iter_prev_chain_skip<BITS, IK>(node, sc, ik, 0, prefix, bits);
         return iter_prev_bm_final<BITS, IK>(node, sc, ik, prefix, bits);
     }
@@ -467,7 +467,7 @@ struct kntrie_iter_ops {
             NK ik, const uint8_t* pb, uint8_t skip, uint8_t pos,
             IK prefix, int bits) noexcept {
         constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= skip) [[unlikely]]
+        if (pos >= skip)
             return leaf_prev<IK>(node, hdr, ik, prefix, bits);
 
         uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
@@ -498,7 +498,7 @@ struct kntrie_iter_ops {
             NK ik, uint8_t pos,
             IK prefix, int bits) noexcept {
         constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= sc) [[unlikely]]
+        if (pos >= sc)
             return iter_prev_bm_final<BITS, IK>(node, sc, ik, prefix, bits);
 
         uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
@@ -589,11 +589,11 @@ struct kntrie_iter_ops {
     static void remove_subtree(uint64_t tagged, ALLOC& alloc) noexcept {
         if (tagged == SENTINEL_TAGGED) return;
 
-        if (tagged & LEAF_BIT) [[unlikely]] {
+        if (tagged & LEAF_BIT) {
             uint64_t* node = untag_leaf_mut(tagged);
             auto* hdr = get_header(node);
             uint8_t skip = hdr->skip();
-            if (skip) [[unlikely]]
+            if (skip)
                 remove_leaf_skip<BITS>(node, skip, alloc);
             else
                 destroy_leaf(node, alloc);
@@ -603,7 +603,7 @@ struct kntrie_iter_ops {
         uint64_t* node = bm_to_node(tagged);
         auto* hdr = get_header(node);
         uint8_t sc = hdr->skip();
-        if (sc > 0) [[unlikely]]
+        if (sc > 0)
             remove_chain_skip<BITS>(node, sc, 0, alloc);
         else
             remove_bm_final<BITS>(node, sc, alloc);
@@ -614,7 +614,7 @@ struct kntrie_iter_ops {
     template<int BITS> requires (BITS >= 8)
     static void remove_leaf_skip(uint64_t* node, uint8_t skip,
                                    ALLOC& alloc) noexcept {
-        if (skip == 0) [[unlikely]] {
+        if (skip == 0) {
             destroy_leaf(node, alloc);
             return;
         }
@@ -630,7 +630,7 @@ struct kntrie_iter_ops {
     template<int BITS> requires (BITS >= 8)
     static void remove_chain_skip(uint64_t* node, uint8_t sc, uint8_t pos,
                                     ALLOC& alloc) noexcept {
-        if (pos >= sc) [[unlikely]] {
+        if (pos >= sc) {
             remove_bm_final<BITS>(node, sc, alloc);
             return;
         }
@@ -664,13 +664,13 @@ struct kntrie_iter_ops {
 
     template<int BITS> requires (BITS >= 8)
     static void collect_stats(uint64_t tagged, stats_t& s) noexcept {
-        if (tagged & LEAF_BIT) [[unlikely]] {
+        if (tagged & LEAF_BIT) {
             const uint64_t* node = untag_leaf(tagged);
             auto* hdr = get_header(node);
             s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
             s.total_entries += hdr->entries();
             uint8_t skip = hdr->skip();
-            if (skip) [[unlikely]]
+            if (skip)
                 stats_leaf_skip<BITS>(node, skip, s);
             else {
                 if constexpr (sizeof(NK) == 1) s.bitmap_leaves++;
@@ -685,7 +685,7 @@ struct kntrie_iter_ops {
         s.bitmask_nodes++;
         s.bm_children += hdr->entries();
         uint8_t sc = hdr->skip();
-        if (sc > 0) [[unlikely]]
+        if (sc > 0)
             stats_chain_skip<BITS>(node, sc, 0, s);
         else
             stats_bm_final<BITS>(node, sc, s);
@@ -694,7 +694,7 @@ struct kntrie_iter_ops {
     template<int BITS> requires (BITS >= 8)
     static void stats_leaf_skip(const uint64_t*, uint8_t skip,
                                   stats_t& s) noexcept {
-        if (skip == 0) [[unlikely]] {
+        if (skip == 0) {
             if constexpr (sizeof(NK) == 1) s.bitmap_leaves++;
             else                           s.compact_leaves++;
             return;
@@ -710,7 +710,7 @@ struct kntrie_iter_ops {
     template<int BITS> requires (BITS >= 8)
     static void stats_chain_skip(const uint64_t* node, uint8_t sc, uint8_t pos,
                                    stats_t& s) noexcept {
-        if (pos >= sc) [[unlikely]] {
+        if (pos >= sc) {
             stats_bm_final<BITS>(node, sc, s);
             return;
         }
