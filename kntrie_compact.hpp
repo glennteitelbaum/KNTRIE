@@ -46,6 +46,7 @@ template<typename K, typename VALUE, typename ALLOC>
 struct compact_ops {
     using VT   = value_traits<VALUE, ALLOC>;
     using VST  = typename VT::slot_type;
+    using BLD  = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
 
     // Suffix type constant for this K
     static constexpr uint8_t STYPE =
@@ -96,11 +97,11 @@ struct compact_ops {
 
     static uint64_t* make_leaf(const K* sorted_keys, const VST* values,
                                unsigned count, uint8_t skip,
-                               const uint8_t* prefix, ALLOC& alloc) {
+                               const uint8_t* prefix, BLD& bld) {
         uint16_t ts = slots_for(count);
         size_t hu = 1 + (skip > 0);
         size_t au64 = size_u64(ts, hu);
-        uint64_t* node = alloc_node(alloc, au64);
+        uint64_t* node = bld.alloc_node(au64);
         auto* h = get_header(node);
         h->set_entries(count);
         h->set_alloc_u64(au64);
@@ -222,7 +223,7 @@ struct compact_ops {
     // Destroy all values + deallocate node
     // ==================================================================
 
-    static void destroy_and_dealloc(uint64_t* node, ALLOC& alloc) {
+    static void destroy_and_dealloc(uint64_t* node, BLD& bld) {
         auto* h = get_header(node);
         if constexpr (VT::HAS_DESTRUCTOR) {
             // C-type (pointer): dups share pointers — destroy unique only
@@ -230,13 +231,13 @@ struct compact_ops {
             size_t hs = hdr_u64(node);
             const K* kd = keys(node, hs);
             VST* vd = vals_mut(node, ts, hs);
-            VT::destroy(vd[0], alloc);
+            bld.destroy_value(vd[0]);
             for (unsigned i = 1; i < ts; ++i) {
                 if (kd[i] == kd[i - 1]) continue;
-                VT::destroy(vd[i], alloc);
+                bld.destroy_value(vd[i]);
             }
         }
-        dealloc_node(alloc, node, h->alloc_u64());
+        bld.dealloc_node(node, h->alloc_u64());
     }
 
     // ==================================================================
@@ -249,7 +250,7 @@ struct compact_ops {
     template<bool INSERT = true, bool ASSIGN = true>
     requires (INSERT || ASSIGN)
     static insert_result_t insert(uint64_t* node, node_header_t* h,
-                                  K suffix, VST value, ALLOC& alloc) {
+                                  K suffix, VST value, BLD& bld) {
         unsigned entries = h->entries();
         unsigned ts = h->total_slots();
         size_t hs = hdr_u64(node);
@@ -269,7 +270,7 @@ struct compact_ops {
                         bv.set(i, value);
                 } else {
                     VST* vd = vals_mut(node, ts, hs);
-                    VT::destroy(vd[idx], alloc);
+                    bld.destroy_value(vd[idx]);
                     VT::init_slot(&vd[idx], value);
                     for (int i = idx - 1; i >= 0 && kd[i] == suffix; --i)
                         VT::write_slot(&vd[i], value);
@@ -321,7 +322,7 @@ struct compact_ops {
         unsigned new_entries = entries + 1;
         uint16_t new_ts = slots_for(new_entries);
         size_t au64 = size_u64(new_ts, hs);
-        uint64_t* nn = alloc_node(alloc, au64);
+        uint64_t* nn = bld.alloc_node(au64);
         auto* nh = get_header(nn);
         *nh = *h;
         if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
@@ -343,7 +344,7 @@ struct compact_ops {
                               suffix, value, new_entries, new_ts);
         }
 
-        dealloc_node(alloc, node, h->alloc_u64());
+        bld.dealloc_node(node, h->alloc_u64());
         return {tag_leaf(nn), true, false};
     }
 
@@ -352,7 +353,7 @@ struct compact_ops {
     // ==================================================================
 
     static erase_result_t erase(uint64_t* node, node_header_t* h,
-                                K suffix, ALLOC& alloc) {
+                                K suffix, BLD& bld) {
         unsigned entries = h->entries();
         unsigned ts = h->total_slots();
         size_t hs = hdr_u64(node);
@@ -367,7 +368,7 @@ struct compact_ops {
 
         // Last entry
         if (nc == 0) [[unlikely]] {
-            destroy_and_dealloc(node, alloc);
+            destroy_and_dealloc(node, bld);
             return {0, true, 0};
         }
 
@@ -376,7 +377,7 @@ struct compact_ops {
         if (new_ts < ts) [[unlikely]] {
             // Realloc + re-seed at smaller slot count
             size_t au64 = size_u64(new_ts, hs);
-            uint64_t* nn = alloc_node(alloc, au64);
+            uint64_t* nn = bld.alloc_node(au64);
             auto* nh = get_header(nn);
             *nh = *h;
             if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
@@ -390,19 +391,19 @@ struct compact_ops {
             if constexpr (VT::IS_BOOL) {
                 bool old_v[ts];
                 bool_vals(node, ts, hs).unpack_to(old_v, ts);
-                dedup_skip_into(kd, old_v, ts, suffix, tmp_k.get(), tmp_v.get(), alloc);
+                dedup_skip_into(kd, old_v, ts, suffix, tmp_k.get(), tmp_v.get(), bld);
                 bool new_v[new_ts];
                 seed_from_real(keys(nn, hs), new_v,
                                tmp_k.get(), tmp_v.get(), nc, new_ts);
                 bool_vals_mut(nn, new_ts, hs).pack_from(new_v, new_ts);
             } else {
                 VST* vd = vals_mut(node, ts, hs);
-                dedup_skip_into(kd, vd, ts, suffix, tmp_k.get(), tmp_v.get(), alloc);
+                dedup_skip_into(kd, vd, ts, suffix, tmp_k.get(), tmp_v.get(), bld);
                 seed_from_real(keys(nn, hs), vals_mut(nn, new_ts, hs),
                                tmp_k.get(), tmp_v.get(), nc, new_ts);
             }
 
-            dealloc_node(alloc, node, h->alloc_u64());
+            bld.dealloc_node(node, h->alloc_u64());
             return {tag_leaf(nn), true, nc};
         }
 
@@ -427,7 +428,7 @@ struct compact_ops {
             }
         } else {
             VST* vd = vals_mut(node, ts, hs);
-            erase_create_dup(kd, vd, ts, idx, suffix, alloc);
+            erase_create_dup(kd, vd, ts, idx, suffix, bld);
         }
         h->set_entries(nc);
         return {tag_leaf(node), true, nc};
@@ -477,13 +478,13 @@ private:
 
     static void dedup_skip_into(const K* kd, VST* vd, uint16_t ts,
                                   K skip_suffix,
-                                  K* out_k, VST* out_v, ALLOC& alloc) {
+                                  K* out_k, VST* out_v, BLD& bld) {
         bool skipped = false;
         int wi = 0;
         if (kd[0] == skip_suffix) {
             skipped = true;
             if constexpr (VT::HAS_DESTRUCTOR)
-                VT::destroy(vd[0], alloc);
+                bld.destroy_value(vd[0]);
         } else {
             out_k[wi] = kd[0];
             VT::write_slot(&out_v[wi], vd[0]);
@@ -494,7 +495,7 @@ private:
             if (!skipped && kd[i] == skip_suffix) {
                 skipped = true;
                 if constexpr (VT::HAS_DESTRUCTOR)
-                    VT::destroy(vd[i], alloc);
+                    bld.destroy_value(vd[i]);
                 continue;
             }
             out_k[wi] = kd[i];
@@ -724,12 +725,12 @@ private:
 
     static void erase_create_dup(
             K* kd, VST* vd, int total, int idx,
-            K suffix, ALLOC& alloc) {
+            K suffix, BLD& bld) {
         int first = idx;
         while (first > 0 && kd[first - 1] == suffix) --first;
 
         if constexpr (VT::HAS_DESTRUCTOR)
-            VT::destroy(vd[first], alloc);
+            bld.destroy_value(vd[first]);
 
         K   neighbor_key;
         VST neighbor_val;

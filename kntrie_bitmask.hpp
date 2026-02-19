@@ -219,6 +219,7 @@ template<typename VALUE, typename ALLOC>
 struct bitmask_ops {
     using VT   = value_traits<VALUE, ALLOC>;
     using VST  = typename VT::slot_type;
+    using BLD  = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
 
     // ==================================================================
     // Size calculations
@@ -376,8 +377,8 @@ struct bitmask_ops {
 
     static uint64_t* add_child(uint64_t* node, node_header_t* h,
                                 uint8_t idx, uint64_t child_tagged,
-                                ALLOC& alloc) {
-        return add_child_at(node, h, 1, idx, child_tagged, alloc);
+                                BLD& bld) {
+        return add_child_at(node, h, 1, idx, child_tagged, bld);
     }
 
     // ==================================================================
@@ -387,9 +388,9 @@ struct bitmask_ops {
     static uint64_t* chain_add_child(uint64_t* node, node_header_t* h,
                                       uint8_t sc, uint8_t idx,
                                       uint64_t child_tagged,
-                                      ALLOC& alloc) {
+                                      BLD& bld) {
         uint64_t* nn = add_child_at(node, h, chain_hs(sc), idx,
-                                      child_tagged, alloc);
+                                      child_tagged, bld);
         if (nn != node && sc > 0) fix_embeds(nn, sc);
         return nn;
     }
@@ -400,8 +401,8 @@ struct bitmask_ops {
     // ==================================================================
 
     static uint64_t* remove_child(uint64_t* node, node_header_t* h,
-                                   int slot, uint8_t idx, ALLOC& alloc) {
-        return remove_child_at(node, h, 1, slot, idx, alloc);
+                                   int slot, uint8_t idx, BLD& bld) {
+        return remove_child_at(node, h, 1, slot, idx, bld);
     }
 
     // ==================================================================
@@ -410,8 +411,8 @@ struct bitmask_ops {
 
     static uint64_t* chain_remove_child(uint64_t* node, node_header_t* h,
                                          uint8_t sc, int slot, uint8_t idx,
-                                         ALLOC& alloc) {
-        uint64_t* nn = remove_child_at(node, h, chain_hs(sc), slot, idx, alloc);
+                                         BLD& bld) {
+        uint64_t* nn = remove_child_at(node, h, chain_hs(sc), slot, idx, bld);
         if (nn && nn != node && sc > 0) fix_embeds(nn, sc);
         return nn;
     }
@@ -422,14 +423,14 @@ struct bitmask_ops {
 
     static uint64_t* make_bitmask(const uint8_t* indices,
                                    const uint64_t* child_tagged_ptrs,
-                                   unsigned n_children, ALLOC& alloc,
+                                   unsigned n_children, BLD& bld,
                                    uint64_t descendants_ = 0) {
         bitmap_256_t bm = bitmap_256_t::from_indices(indices, n_children);
 
         constexpr size_t hs = 1;
         size_t needed = bitmask_size_u64(n_children, hs);
         size_t au64 = round_up_u64(needed);
-        uint64_t* nn = alloc_node(alloc, au64);
+        uint64_t* nn = bld.alloc_node(au64);
         auto* nh = get_header(nn);
         nh->set_entries(n_children);
         nh->set_alloc_u64(au64);
@@ -459,13 +460,13 @@ struct bitmask_ops {
     static uint64_t* make_skip_chain(const uint8_t* skip_bytes, uint8_t skip_count,
                                       const uint8_t* final_indices,
                                       const uint64_t* final_children_tagged,
-                                      unsigned final_n_children, ALLOC& alloc,
+                                      unsigned final_n_children, BLD& bld,
                                       uint64_t descendants_ = 0) {
         // Allocation: header(1) + skip_count*6 + bitmap(4) + sentinel(1) + children(N) + desc(1)
         size_t needed = 1 + static_cast<size_t>(skip_count) * 6 + 5 + final_n_children
                        + desc_u64(final_n_children);
         size_t au64 = round_up_u64(needed);
-        uint64_t* nn = alloc_node(alloc, au64);
+        uint64_t* nn = bld.alloc_node(au64);
 
         auto* nh = get_header(nn);
         nh->set_entries(final_n_children);
@@ -509,7 +510,7 @@ struct bitmask_ops {
     // ==================================================================
 
     static uint64_t build_remainder(uint64_t* old_node, uint8_t old_sc,
-                                     uint8_t from_pos, ALLOC& alloc) {
+                                     uint8_t from_pos, BLD& bld) {
         uint8_t rem_skip = old_sc - from_pos;
         unsigned final_nc = get_header(old_node)->entries();
         uint64_t old_descendants = chain_descendants(old_node, old_sc, final_nc);
@@ -527,7 +528,7 @@ struct bitmask_ops {
 
         if (rem_skip == 0) {
             return tag_bitmask(
-                make_bitmask(indices, children, final_nc, alloc, old_descendants));
+                make_bitmask(indices, children, final_nc, bld, old_descendants));
         }
 
         // rem_skip > 0: extract skip bytes for [from_pos..old_sc-1]
@@ -536,7 +537,7 @@ struct bitmask_ops {
             sb[i] = skip_byte(old_node, from_pos + i);
 
         return tag_bitmask(
-            make_skip_chain(sb, rem_skip, indices, children, final_nc, alloc, old_descendants));
+            make_skip_chain(sb, rem_skip, indices, children, final_nc, bld, old_descendants));
     }
 
     // ==================================================================
@@ -547,7 +548,7 @@ struct bitmask_ops {
     // ==================================================================
 
     static uint64_t wrap_in_chain(uint64_t* child, const uint8_t* bytes,
-                                   uint8_t count, ALLOC& alloc) {
+                                   uint8_t count, BLD& bld) {
         auto* ch = get_header(child);
         uint8_t child_sc = ch->skip();
         unsigned nc = ch->entries();
@@ -571,8 +572,8 @@ struct bitmask_ops {
         });
 
         auto* new_chain = make_skip_chain(all_bytes, total_skip, indices, children,
-                                          nc, alloc, old_descendants);
-        dealloc_node(alloc, child, ch->alloc_u64());
+                                          nc, bld, old_descendants);
+        bld.dealloc_node(child, ch->alloc_u64());
         return tag_bitmask(new_chain);
     }
 
@@ -663,8 +664,8 @@ struct bitmask_ops {
     // Bitmask node: deallocate (node only, not children)
     // ==================================================================
 
-    static void dealloc_bitmask(uint64_t* node, ALLOC& alloc) noexcept {
-        dealloc_node(alloc, node, get_header(node)->alloc_u64());
+    static void dealloc_bitmask(uint64_t* node, BLD& bld) noexcept {
+        bld.dealloc_node(node, get_header(node)->alloc_u64());
     }
 
     // ==================================================================
@@ -751,7 +752,7 @@ struct bitmask_ops {
     template<bool INSERT = true, bool ASSIGN = true>
     requires (INSERT || ASSIGN)
     static insert_result_t bitmap_insert(uint64_t* node, uint8_t suffix,
-                                          VST value, ALLOC& alloc) {
+                                          VST value, BLD& bld) {
         auto* h = get_header(node);
         size_t hs = hdr_u64(node);
         bitmap_256_t& bm = bm_mut(node, hs);
@@ -778,7 +779,7 @@ struct bitmask_ops {
             }
 
             size_t au64 = round_up_u64(new_sz);
-            uint64_t* nn = alloc_node(alloc, au64);
+            uint64_t* nn = bld.alloc_node(au64);
             auto* nh = get_header(nn);
             *nh = *h;
             if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
@@ -788,7 +789,7 @@ struct bitmask_ops {
             bm_mut(nn, hs).set_bit(suffix);
             val_bm_mut(nn, hs) = val_bm(node, hs);
             if (value) val_bm_mut(nn, hs).set_bit(suffix);
-            dealloc_node(alloc, node, h->alloc_u64());
+            bld.dealloc_node(node, h->alloc_u64());
             return {tag_leaf(nn), true, false};
         } else {
             VST* vd = bl_vals_mut(node, hs);
@@ -796,7 +797,7 @@ struct bitmask_ops {
             if (bm.has_bit(suffix)) {
                 if constexpr (ASSIGN) {
                     int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
-                    VT::destroy(vd[slot], alloc);
+                    bld.destroy_value(vd[slot]);
                     VT::write_slot(&vd[slot], value);
                 }
                 return {tag_leaf(node), false, false};
@@ -817,7 +818,7 @@ struct bitmask_ops {
             }
 
             size_t au64 = round_up_u64(new_sz);
-            uint64_t* nn = alloc_node(alloc, au64);
+            uint64_t* nn = bld.alloc_node(au64);
             auto* nh = get_header(nn);
             *nh = *h;
             if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
@@ -832,7 +833,7 @@ struct bitmask_ops {
             VT::write_slot(&nvd[isl], value);
             std::memcpy(nvd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
 
-            dealloc_node(alloc, node, h->alloc_u64());
+            bld.dealloc_node(node, h->alloc_u64());
             return {tag_leaf(nn), true, false};
         }
     }
@@ -842,7 +843,7 @@ struct bitmask_ops {
     // ==================================================================
 
     static erase_result_t bitmap_erase(uint64_t* node, uint8_t suffix,
-                                        ALLOC& alloc) {
+                                        BLD& bld) {
         auto* h = get_header(node);
         size_t hs = hdr_u64(node);
         bitmap_256_t& bm = bm_mut(node, hs);
@@ -853,7 +854,7 @@ struct bitmask_ops {
         if constexpr (VT::IS_BOOL) {
             unsigned nc = count - 1;
             if (nc == 0) {
-                dealloc_node(alloc, node, h->alloc_u64());
+                bld.dealloc_node(node, h->alloc_u64());
                 return {0, true, 0};
             }
             bm.clear_bit(suffix);
@@ -863,24 +864,24 @@ struct bitmask_ops {
             size_t new_sz = bitmap_leaf_size_u64(nc, hs);
             if (should_shrink_u64(h->alloc_u64(), new_sz)) {
                 size_t au64 = round_up_u64(new_sz);
-                uint64_t* nn = alloc_node(alloc, au64);
+                uint64_t* nn = bld.alloc_node(au64);
                 auto* nh = get_header(nn);
                 *nh = *h;
                 if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
                 nh->set_alloc_u64(au64);
                 bm_mut(nn, hs) = bm;
                 val_bm_mut(nn, hs) = val_bm(node, hs);
-                dealloc_node(alloc, node, h->alloc_u64());
+                bld.dealloc_node(node, h->alloc_u64());
                 return {tag_leaf(nn), true, nc};
             }
             return {tag_leaf(node), true, nc};
         } else {
             int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
-            VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
+            bld.destroy_value(bl_vals_mut(node, hs)[slot]);
 
             unsigned nc = count - 1;
             if (nc == 0) {
-                dealloc_node(alloc, node, h->alloc_u64());
+                bld.dealloc_node(node, h->alloc_u64());
                 return {0, true, 0};
             }
 
@@ -895,7 +896,7 @@ struct bitmask_ops {
             }
 
             size_t au64 = round_up_u64(new_sz);
-            uint64_t* nn = alloc_node(alloc, au64);
+            uint64_t* nn = bld.alloc_node(au64);
             auto* nh = get_header(nn);
             *nh = *h;
             if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
@@ -908,7 +909,7 @@ struct bitmask_ops {
             std::memcpy(nv, ov, slot * sizeof(VST));
             std::memcpy(nv + slot, ov + slot + 1, (nc - slot) * sizeof(VST));
 
-            dealloc_node(alloc, node, h->alloc_u64());
+            bld.dealloc_node(node, h->alloc_u64());
             return {tag_leaf(nn), true, nc};
         }
     }
@@ -919,10 +920,10 @@ struct bitmask_ops {
 
     static uint64_t* make_bitmap_leaf(const uint8_t* sorted_suffixes,
                                        const VST* values, unsigned count,
-                                       ALLOC& alloc) {
+                                       BLD& bld) {
         constexpr size_t hs = 1;
         size_t sz = round_up_u64(bitmap_leaf_size_u64(count));
-        uint64_t* node = alloc_node(alloc, sz);
+        uint64_t* node = bld.alloc_node(sz);
         auto* h = get_header(node);
         h->set_entries(count);
         h->set_alloc_u64(sz);
@@ -946,10 +947,10 @@ struct bitmask_ops {
     // Bitmap256 leaf: make single entry
     // ==================================================================
 
-    static uint64_t* make_single_bitmap(uint8_t suffix, VST value, ALLOC& alloc) {
+    static uint64_t* make_single_bitmap(uint8_t suffix, VST value, BLD& bld) {
         constexpr size_t hs = 1;
         size_t sz = round_up_u64(bitmap_leaf_size_u64(1));
-        uint64_t* node = alloc_node(alloc, sz);
+        uint64_t* node = bld.alloc_node(sz);
         auto* h = get_header(node);
         h->set_entries(1);
         h->set_alloc_u64(sz);
@@ -995,15 +996,15 @@ struct bitmask_ops {
     // Bitmap256 leaf: destroy values + deallocate
     // ==================================================================
 
-    static void bitmap_destroy_and_dealloc(uint64_t* node, ALLOC& alloc) {
+    static void bitmap_destroy_and_dealloc(uint64_t* node, BLD& bld) {
         auto* h = get_header(node);
         if constexpr (VT::HAS_DESTRUCTOR) {
             uint16_t count = h->entries();
             VST* vd = bl_vals_mut(node, hdr_u64(node));
             for (uint16_t i = 0; i < count; ++i)
-                VT::destroy(vd[i], alloc);
+                bld.destroy_value(vd[i]);
         }
-        dealloc_node(alloc, node, h->alloc_u64());
+        bld.dealloc_node(node, h->alloc_u64());
     }
 
     // --- Chain header size: 1 (base header) + sc * 6 (embed slots) ---
@@ -1026,7 +1027,7 @@ private:
     // --- Shared add child core: works for any header size ---
     static uint64_t* add_child_at(uint64_t* node, node_header_t* h, size_t hs,
                                     uint8_t idx, uint64_t child_tagged,
-                                    ALLOC& alloc) {
+                                    BLD& bld) {
         bitmap_256_t& bm = bm_mut(node, hs);
         unsigned oc = h->entries();
         unsigned nc = oc + 1;
@@ -1053,7 +1054,7 @@ private:
         // Realloc
         uint64_t saved = *descendants_ptr(node, hs, oc);
         size_t au64 = round_up_u64(needed);
-        uint64_t* nn = alloc_node(alloc, au64);
+        uint64_t* nn = bld.alloc_node(au64);
 
         // Copy header + embeds/bitmap + sentinel (everything before children)
         size_t prefix_u64 = hs + BITMAP_256_U64 + 1;
@@ -1071,17 +1072,17 @@ private:
 
         *descendants_ptr_mut(nn, hs, nc) = saved;
 
-        dealloc_node(alloc, node, h->alloc_u64());
+        bld.dealloc_node(node, h->alloc_u64());
         return nn;
     }
 
     // --- Shared remove child core: works for any header size ---
     static uint64_t* remove_child_at(uint64_t* node, node_header_t* h, size_t hs,
-                                       int slot, uint8_t idx, ALLOC& alloc) {
+                                       int slot, uint8_t idx, BLD& bld) {
         unsigned oc = h->entries();
         unsigned nc = oc - 1;
         if (nc == 0) {
-            dealloc_node(alloc, node, h->alloc_u64());
+            bld.dealloc_node(node, h->alloc_u64());
             return nullptr;
         }
 
@@ -1102,7 +1103,7 @@ private:
         // Realloc
         uint64_t saved = *descendants_ptr(node, hs, oc);
         size_t au64 = round_up_u64(needed);
-        uint64_t* nn = alloc_node(alloc, au64);
+        uint64_t* nn = bld.alloc_node(au64);
 
         // Copy header + embeds/bitmap + sentinel
         size_t prefix_u64 = hs + BITMAP_256_U64 + 1;
@@ -1120,7 +1121,7 @@ private:
 
         *descendants_ptr_mut(nn, hs, nc) = saved;
 
-        dealloc_node(alloc, node, h->alloc_u64());
+        bld.dealloc_node(node, h->alloc_u64());
         return nn;
     }
 

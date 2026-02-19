@@ -313,7 +313,7 @@ struct value_traits {
     //   A: trivially_copyable && sizeof <= 64  → inline, memcpy-safe, no dtor
     //   C: else                                → pointer, has dtor+dealloc
     static constexpr bool IS_TRIVIAL =
-        std::is_trivially_copyable_v<VALUE> && sizeof(VALUE) <= 64;
+        std::is_trivially_copyable_v<VALUE> && sizeof(VALUE) <= 8;
     static constexpr bool IS_INLINE = IS_TRIVIAL;
     static constexpr bool HAS_DESTRUCTOR = !IS_TRIVIAL;
     static constexpr bool IS_BOOL = std::is_same_v<VALUE, bool>;
@@ -405,20 +405,121 @@ struct value_traits {
 };
 
 // ==========================================================================
-// Allocation helpers
+// Builder — owns allocator, handles node + value alloc/dealloc
 // ==========================================================================
 
-template<typename ALLOC>
-inline uint64_t* alloc_node(ALLOC& a, size_t u64_count) {
-    uint64_t* p = a.allocate(u64_count);
-    std::memset(p, 0, u64_count * 8);
-    return p;
-}
+// Base builder: trivial values (A-type, bool) — no free list
+template<typename VALUE, bool IS_TRIVIAL, typename ALLOC>
+struct builder;
 
-template<typename ALLOC>
-inline void dealloc_node(ALLOC& a, uint64_t* p, size_t u64_count) noexcept {
-    a.deallocate(p, u64_count);
-}
+template<typename VALUE, typename ALLOC>
+struct builder<VALUE, true, ALLOC> {
+    ALLOC alloc_v;
+
+    builder() : alloc_v() {}
+    explicit builder(const ALLOC& a) : alloc_v(a) {}
+
+    builder(const builder&) = delete;
+    builder& operator=(const builder&) = delete;
+    builder(builder&&) noexcept = default;
+    builder& operator=(builder&&) noexcept = default;
+
+    void swap(builder& o) noexcept { std::swap(alloc_v, o.alloc_v); }
+
+    const ALLOC& get_allocator() const noexcept { return alloc_v; }
+
+    uint64_t* alloc_node(size_t u64_count) {
+        uint64_t* p = alloc_v.allocate(u64_count);
+        std::memset(p, 0, u64_count * 8);
+        return p;
+    }
+
+    void dealloc_node(uint64_t* p, size_t u64_count) noexcept {
+        alloc_v.deallocate(p, u64_count);
+    }
+
+    using VT = value_traits<VALUE, ALLOC>;
+    using slot_type = typename VT::slot_type;
+
+    slot_type store_value(const VALUE& val) { return val; }
+    void destroy_value(slot_type&) noexcept {}
+    void drain() noexcept {}
+};
+
+// Extended builder: C-type values — has free list
+template<typename VALUE, typename ALLOC>
+struct builder<VALUE, false, ALLOC> {
+    using BASE = builder<VALUE, true, ALLOC>;
+    using VA = typename std::allocator_traits<ALLOC>::template rebind_alloc<VALUE>;
+    using VT = value_traits<VALUE, ALLOC>;
+    using slot_type = typename VT::slot_type;  // VALUE*
+
+    BASE   base_v;
+    VALUE* free_head_v = nullptr;
+
+    builder() = default;
+    explicit builder(const ALLOC& a) : base_v(a) {}
+
+    builder(const builder&) = delete;
+    builder& operator=(const builder&) = delete;
+
+    builder(builder&& o) noexcept
+        : base_v(std::move(o.base_v))
+        , free_head_v(o.free_head_v) {
+        o.free_head_v = nullptr;
+    }
+
+    builder& operator=(builder&& o) noexcept {
+        if (this != &o) {
+            drain();
+            base_v = std::move(o.base_v);
+            free_head_v = o.free_head_v;
+            o.free_head_v = nullptr;
+        }
+        return *this;
+    }
+
+    ~builder() { drain(); }
+
+    void swap(builder& o) noexcept {
+        base_v.swap(o.base_v);
+        std::swap(free_head_v, o.free_head_v);
+    }
+
+    const ALLOC& get_allocator() const noexcept { return base_v.get_allocator(); }
+
+    uint64_t* alloc_node(size_t u64_count) { return base_v.alloc_node(u64_count); }
+    void dealloc_node(uint64_t* p, size_t u64_count) noexcept { base_v.dealloc_node(p, u64_count); }
+
+    slot_type store_value(const VALUE& val) {
+        VALUE* p;
+        if (free_head_v) {
+            p = free_head_v;
+            std::memcpy(&free_head_v, p, sizeof(VALUE*));
+            std::construct_at(p, val);
+        } else {
+            VA va(base_v.get_allocator());
+            p = std::allocator_traits<VA>::allocate(va, 1);
+            std::construct_at(p, val);
+        }
+        return p;
+    }
+
+    void destroy_value(slot_type& s) noexcept {
+        std::destroy_at(s);
+        std::memcpy(s, &free_head_v, sizeof(VALUE*));
+        free_head_v = s;
+    }
+
+    void drain() noexcept {
+        VA va(base_v.get_allocator());
+        while (free_head_v) {
+            VALUE* p = free_head_v;
+            std::memcpy(&free_head_v, p, sizeof(VALUE*));
+            std::allocator_traits<VA>::deallocate(va, p, 1);
+        }
+    }
+};
 
 // ==========================================================================
 // Result types

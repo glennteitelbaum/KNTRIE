@@ -28,6 +28,7 @@ struct kntrie_iter_ops {
     using VT  = value_traits<VALUE, ALLOC>;
     using VST = typename VT::slot_type;
     using CO  = compact_ops<NK, VALUE, ALLOC>;
+    using BLD = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
 
     static constexpr int NK_BITS = sizeof(NK) * 8;
 
@@ -573,11 +574,11 @@ struct kntrie_iter_ops {
     // Destroy leaf: compile-time NK dispatch (replaces suffix_type switch)
     // ==================================================================
 
-    static void destroy_leaf(uint64_t* node, ALLOC& alloc) noexcept {
+    static void destroy_leaf(uint64_t* node, BLD& bld) noexcept {
         if constexpr (sizeof(NK) == 1)
-            BO::bitmap_destroy_and_dealloc(node, alloc);
+            BO::bitmap_destroy_and_dealloc(node, bld);
         else
-            CO::destroy_and_dealloc(node, alloc);
+            CO::destroy_and_dealloc(node, bld);
     }
 
     // ==================================================================
@@ -586,7 +587,7 @@ struct kntrie_iter_ops {
     // ==================================================================
 
     template<int BITS> requires (BITS >= 8)
-    static void remove_subtree(uint64_t tagged, ALLOC& alloc) noexcept {
+    static void remove_subtree(uint64_t tagged, BLD& bld) noexcept {
         if (tagged == SENTINEL_TAGGED) return;
 
         if (tagged & LEAF_BIT) {
@@ -594,9 +595,9 @@ struct kntrie_iter_ops {
             auto* hdr = get_header(node);
             uint8_t skip = hdr->skip();
             if (skip)
-                remove_leaf_skip<BITS>(node, skip, alloc);
+                remove_leaf_skip<BITS>(node, skip, bld);
             else
-                destroy_leaf(node, alloc);
+                destroy_leaf(node, bld);
             return;
         }
 
@@ -604,54 +605,54 @@ struct kntrie_iter_ops {
         auto* hdr = get_header(node);
         uint8_t sc = hdr->skip();
         if (sc > 0)
-            remove_chain_skip<BITS>(node, sc, 0, alloc);
+            remove_chain_skip<BITS>(node, sc, 0, bld);
         else
-            remove_bm_final<BITS>(node, sc, alloc);
-        BO::dealloc_bitmask(node, alloc);
+            remove_bm_final<BITS>(node, sc, bld);
+        BO::dealloc_bitmask(node, bld);
     }
 
     // Leaf skip: consume prefix bytes, narrow NK, then destroy
     template<int BITS> requires (BITS >= 8)
     static void remove_leaf_skip(uint64_t* node, uint8_t skip,
-                                   ALLOC& alloc) noexcept {
+                                   BLD& bld) noexcept {
         if (skip == 0) {
-            destroy_leaf(node, alloc);
+            destroy_leaf(node, bld);
             return;
         }
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                NARROW::template remove_leaf_skip<BITS - 8>(node, skip - 1, alloc);
+                NARROW::template remove_leaf_skip<BITS - 8>(node, skip - 1, bld);
             else
-                remove_leaf_skip<BITS - 8>(node, skip - 1, alloc);
+                remove_leaf_skip<BITS - 8>(node, skip - 1, bld);
         }
     }
 
     // Chain embed: consume skip bytes, narrow, then final bitmap
     template<int BITS> requires (BITS >= 8)
     static void remove_chain_skip(uint64_t* node, uint8_t sc, uint8_t pos,
-                                    ALLOC& alloc) noexcept {
+                                    BLD& bld) noexcept {
         if (pos >= sc) {
-            remove_bm_final<BITS>(node, sc, alloc);
+            remove_bm_final<BITS>(node, sc, bld);
             return;
         }
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                NARROW::template remove_chain_skip<BITS - 8>(node, sc, pos + 1, alloc);
+                NARROW::template remove_chain_skip<BITS - 8>(node, sc, pos + 1, bld);
             else
-                remove_chain_skip<BITS - 8>(node, sc, pos + 1, alloc);
+                remove_chain_skip<BITS - 8>(node, sc, pos + 1, bld);
         }
     }
 
     // Final bitmap: recurse each child with narrowing
     template<int BITS> requires (BITS >= 8)
     static void remove_bm_final(uint64_t* node, uint8_t sc,
-                                  ALLOC& alloc) noexcept {
+                                  BLD& bld) noexcept {
         BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
             if constexpr (BITS > 8) {
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                    NARROW::template remove_subtree<BITS - 8>(child, alloc);
+                    NARROW::template remove_subtree<BITS - 8>(child, bld);
                 else
-                    remove_subtree<BITS - 8>(child, alloc);
+                    remove_subtree<BITS - 8>(child, bld);
             }
         });
     }

@@ -20,6 +20,7 @@ struct kntrie_ops {
     using VT  = value_traits<VALUE, ALLOC>;
     using VST = typename VT::slot_type;
     using CO  = compact_ops<NK, VALUE, ALLOC>;
+    using BLD = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
 
     static constexpr int NK_BITS = sizeof(NK) * 8;
 
@@ -92,11 +93,11 @@ struct kntrie_ops {
     // ==================================================================
 
     // Create a 1-entry leaf. Returns raw (untagged) pointer.
-    static uint64_t* make_single_leaf(NK suffix, VST value, ALLOC& alloc) {
+    static uint64_t* make_single_leaf(NK suffix, VST value, BLD& bld) {
         if constexpr (sizeof(NK) == 1) {
-            return BO::make_single_bitmap(static_cast<uint8_t>(suffix), value, alloc);
+            return BO::make_single_bitmap(static_cast<uint8_t>(suffix), value, bld);
         } else {
-            return CO::make_leaf(&suffix, &value, 1, 0, nullptr, alloc);
+            return CO::make_leaf(&suffix, &value, 1, 0, nullptr, bld);
         }
     }
 
@@ -105,19 +106,19 @@ struct kntrie_ops {
     // Returns raw (untagged) pointer. Caller tags.
     template<int BITS> requires (BITS >= 8)
     static uint64_t* make_leaf_descended(NK ik, VST value, uint8_t depth,
-                                           ALLOC& alloc) {
+                                           BLD& bld) {
         if (depth == 0) [[unlikely]]
-            return make_single_leaf(ik, value, alloc);
+            return make_single_leaf(ik, value, bld);
 
         if constexpr (BITS > 8) {
             NK shifted = static_cast<NK>(ik << 8);
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
                 return NARROW::template make_leaf_descended<BITS - 8>(
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    value, depth - 1, alloc);
+                    value, depth - 1, bld);
             } else {
                 return make_leaf_descended<BITS - 8>(
-                    shifted, value, depth - 1, alloc);
+                    shifted, value, depth - 1, bld);
             }
         }
         __builtin_unreachable();
@@ -138,7 +139,7 @@ struct kntrie_ops {
     static uint64_t split_on_prefix(uint64_t* node, node_header_t* hdr,
                                       NK ik, VST value,
                                       const uint8_t* actual, uint8_t skip,
-                                      uint8_t common, ALLOC& alloc) {
+                                      uint8_t common, BLD& bld) {
         uint8_t new_idx = static_cast<uint8_t>(ik >> (NK_BITS - 8));
         uint8_t old_idx = actual[common];
         uint8_t old_rem = skip - 1 - common;
@@ -155,7 +156,7 @@ struct kntrie_ops {
             hdr->set_skip(old_rem);
             hdr->set_prefix(rem, old_rem);
         } else {
-            node = remove_skip(node, alloc);
+            node = remove_skip(node, bld);
             hdr = get_header(node);
         }
 
@@ -174,13 +175,13 @@ struct kntrie_ops {
         uint64_t* new_leaf;
         if constexpr (BITS > 8) {
             new_leaf = make_leaf_descended<BITS - 8>(
-                static_cast<NK>(ik << 8), value, old_rem, alloc);
+                static_cast<NK>(ik << 8), value, old_rem, bld);
         } else {
             // BITS==8: no skip possible on 8-bit leaf, unreachable
-            new_leaf = make_single_leaf(ik, value, alloc);
+            new_leaf = make_single_leaf(ik, value, bld);
         }
         if (old_rem > 0) [[unlikely]]
-            new_leaf = prepend_skip(new_leaf, old_rem, new_prefix, alloc);
+            new_leaf = prepend_skip(new_leaf, old_rem, new_prefix, bld);
 
         // Create parent bitmask with 2 children
         uint8_t   bi[2];
@@ -195,9 +196,9 @@ struct kntrie_ops {
 
         uint64_t total = BO::exact_subtree_count(cp[0]) +
                          BO::exact_subtree_count(cp[1]);
-        auto* bm_node = BO::make_bitmask(bi, cp, 2, alloc, total);
+        auto* bm_node = BO::make_bitmask(bi, cp, 2, bld, total);
         if (common > 0) [[unlikely]]
-            return BO::wrap_in_chain(bm_node, saved_prefix, common, alloc);
+            return BO::wrap_in_chain(bm_node, saved_prefix, common, bld);
         return tag_bitmask(bm_node);
     }
 
@@ -218,7 +219,7 @@ struct kntrie_ops {
     template<int BITS> requires (BITS >= 8)
     static uint64_t split_skip_at(uint64_t* node, node_header_t* hdr,
                                     uint8_t sc, uint8_t split_pos,
-                                    NK ik, VST value, ALLOC& alloc) {
+                                    NK ik, VST value, BLD& bld) {
         uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
         uint8_t actual_byte = BO::skip_byte(node, split_pos);
 
@@ -228,16 +229,16 @@ struct kntrie_ops {
             NK shifted = static_cast<NK>(ik << 8);
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
                 auto* leaf = NARROW::make_single_leaf(
-                    static_cast<NNK>(shifted >> (NK_BITS / 2)), value, alloc);
+                    static_cast<NNK>(shifted >> (NK_BITS / 2)), value, bld);
                 new_leaf_tagged = tag_leaf(leaf);
             } else {
-                auto* leaf = make_single_leaf(shifted, value, alloc);
+                auto* leaf = make_single_leaf(shifted, value, bld);
                 new_leaf_tagged = tag_leaf(leaf);
             }
         }
 
         // Build remainder from [split_pos+1..sc-1] + final bitmask
-        uint64_t remainder = BO::build_remainder(node, sc, split_pos + 1, alloc);
+        uint64_t remainder = BO::build_remainder(node, sc, split_pos + 1, bld);
 
         // Create 2-child bitmask at split point
         uint8_t bi[2];
@@ -251,19 +252,19 @@ struct kntrie_ops {
         }
         uint64_t total = BO::exact_subtree_count(cp[0]) +
                          BO::exact_subtree_count(cp[1]);
-        auto* split_node = BO::make_bitmask(bi, cp, 2, alloc, total);
+        auto* split_node = BO::make_bitmask(bi, cp, 2, bld, total);
 
         // Wrap in skip chain for prefix bytes [0..split_pos-1]
         uint64_t result;
         if (split_pos > 0) [[unlikely]] {
             uint8_t prefix_bytes[6];
             BO::skip_bytes(node, split_pos, prefix_bytes);
-            result = BO::wrap_in_chain(split_node, prefix_bytes, split_pos, alloc);
+            result = BO::wrap_in_chain(split_node, prefix_bytes, split_pos, bld);
         } else {
             result = tag_bitmask(split_node);
         }
 
-        dealloc_node(alloc, node, hdr->alloc_u64());
+        bld.dealloc_node(node, hdr->alloc_u64());
         return result;
     }
 
@@ -281,14 +282,14 @@ struct kntrie_ops {
     }
 
     // Build leaf from NK-typed sorted arrays. Returns raw pointer.
-    static uint64_t* build_leaf(NK* suf, VST* vals, size_t count, ALLOC& alloc) {
+    static uint64_t* build_leaf(NK* suf, VST* vals, size_t count, BLD& bld) {
         if constexpr (sizeof(NK) == 1) {
             // BO expects uint8_t*
             return BO::make_bitmap_leaf(reinterpret_cast<uint8_t*>(suf), vals,
-                static_cast<uint32_t>(count), alloc);
+                static_cast<uint32_t>(count), bld);
         } else {
             return CO::make_leaf(suf, vals,
-                static_cast<uint32_t>(count), 0, nullptr, alloc);
+                static_cast<uint32_t>(count), 0, nullptr, bld);
         }
     }
 
@@ -296,10 +297,10 @@ struct kntrie_ops {
     // bits: remaining key bits at this level.
     static uint64_t build_node_from_arrays_tagged(NK* suf, VST* vals,
                                                     size_t count, int bits,
-                                                    ALLOC& alloc) {
+                                                    BLD& bld) {
         // Leaf case
         if (count <= COMPACT_MAX)
-            return tag_leaf(build_leaf(suf, vals, count, alloc));
+            return tag_leaf(build_leaf(suf, vals, count, bld));
 
         // Skip compression: all entries share same top byte?
         if (bits > 8) {
@@ -321,33 +322,33 @@ struct kntrie_ops {
                         for (size_t i = 0; i < count; ++i)
                             ns[i] = static_cast<NNK>(suf[i] >> (NK_BITS / 2));
                         child_tagged = NARROW::build_node_from_arrays_tagged(
-                            ns.get(), vals, count, bits - 8, alloc);
+                            ns.get(), vals, count, bits - 8, bld);
                     } else {
                         child_tagged = build_node_from_arrays_tagged(
-                            suf, vals, count, bits - 8, alloc);
+                            suf, vals, count, bits - 8, bld);
                     }
                 } else {
                     child_tagged = build_node_from_arrays_tagged(
-                        suf, vals, count, bits - 8, alloc);
+                        suf, vals, count, bits - 8, bld);
                 }
                 uint8_t byte_arr[1] = {first_top};
                 if (child_tagged & LEAF_BIT) {
                     uint64_t* leaf = untag_leaf_mut(child_tagged);
-                    return tag_leaf(prepend_skip(leaf, 1, byte_arr, alloc));
+                    return tag_leaf(prepend_skip(leaf, 1, byte_arr, bld));
                 } else {
                     uint64_t* bm_node = bm_to_node(child_tagged);
-                    return BO::wrap_in_chain(bm_node, byte_arr, 1, alloc);
+                    return BO::wrap_in_chain(bm_node, byte_arr, 1, bld);
                 }
             }
         }
 
-        return build_bitmask_from_arrays_tagged(suf, vals, count, bits, alloc);
+        return build_bitmask_from_arrays_tagged(suf, vals, count, bits, bld);
     }
 
     // Groups by top byte, recurses, creates bitmask node.
     static uint64_t build_bitmask_from_arrays_tagged(NK* suf, VST* vals,
                                                        size_t count, int bits,
-                                                       ALLOC& alloc) {
+                                                       BLD& bld) {
         uint8_t  indices[256];
         uint64_t child_tagged[256];
         int      n_children = 0;
@@ -367,27 +368,27 @@ struct kntrie_ops {
                         cs[j] = static_cast<NNK>(
                             static_cast<NK>(suf[start + j] << 8) >> (NK_BITS / 2));
                     child_tagged[n_children] = NARROW::build_node_from_arrays_tagged(
-                        cs.get(), vals + start, cc, bits - 8, alloc);
+                        cs.get(), vals + start, cc, bits - 8, bld);
                 } else {
                     auto cs = std::make_unique<NK[]>(cc);
                     for (size_t j = 0; j < cc; ++j)
                         cs[j] = static_cast<NK>(suf[start + j] << 8);
                     child_tagged[n_children] = build_node_from_arrays_tagged(
-                        cs.get(), vals + start, cc, bits - 8, alloc);
+                        cs.get(), vals + start, cc, bits - 8, bld);
                 }
             } else {
                 auto cs = std::make_unique<NK[]>(cc);
                 for (size_t j = 0; j < cc; ++j)
                     cs[j] = static_cast<NK>(suf[start + j] << 8);
                 child_tagged[n_children] = build_node_from_arrays_tagged(
-                    cs.get(), vals + start, cc, bits - 8, alloc);
+                    cs.get(), vals + start, cc, bits - 8, bld);
             }
             indices[n_children] = ti;
             n_children++;
         }
 
         return tag_bitmask(
-            BO::make_bitmask(indices, child_tagged, n_children, alloc, count));
+            BO::make_bitmask(indices, child_tagged, n_children, bld, count));
     }
 
     // Convert overflowing compact leaf to bitmask tree.
@@ -396,7 +397,7 @@ struct kntrie_ops {
     static uint64_t convert_to_bitmask_tagged(const uint64_t* node,
                                                 const node_header_t* hdr,
                                                 NK suffix, VST value,
-                                                int bits, ALLOC& alloc) {
+                                                int bits, BLD& bld) {
         uint16_t old_count = hdr->entries();
         size_t total = old_count + 1;
         auto wk = std::make_unique<NK[]>(total);
@@ -413,7 +414,7 @@ struct kntrie_ops {
         if (!ins) { wk[wi] = suffix; wv[wi] = value; }
 
         uint64_t child_tagged = build_node_from_arrays_tagged(
-            wk.get(), wv.get(), total, bits, alloc);
+            wk.get(), wv.get(), total, bits, bld);
 
         // Propagate old skip/prefix to new child
         uint8_t ps = hdr->skip();
@@ -421,15 +422,15 @@ struct kntrie_ops {
             const uint8_t* pfx = hdr->prefix_bytes();
             if (child_tagged & LEAF_BIT) {
                 uint64_t* leaf = untag_leaf_mut(child_tagged);
-                leaf = prepend_skip(leaf, ps, pfx, alloc);
+                leaf = prepend_skip(leaf, ps, pfx, bld);
                 child_tagged = tag_leaf(leaf);
             } else {
                 uint64_t* bm_node = bm_to_node(child_tagged);
-                child_tagged = BO::wrap_in_chain(bm_node, pfx, ps, alloc);
+                child_tagged = BO::wrap_in_chain(bm_node, pfx, ps, bld);
             }
         }
 
-        dealloc_node(alloc, const_cast<uint64_t*>(node), hdr->alloc_u64());
+        bld.dealloc_node(const_cast<uint64_t*>(node), hdr->alloc_u64());
         return child_tagged;
     }
 
@@ -442,11 +443,11 @@ struct kntrie_ops {
 
     template<int BITS, bool INSERT, bool ASSIGN> requires (BITS >= 8)
     static insert_result_t insert_node(uint64_t ptr, NK ik, VST value,
-                                         ALLOC& alloc) {
+                                         BLD& bld) {
         // SENTINEL
         if (ptr == SENTINEL_TAGGED) [[unlikely]] {
             if constexpr (!INSERT) return {ptr, false, false};
-            return {tag_leaf(make_single_leaf(ik, value, alloc)), true, false};
+            return {tag_leaf(make_single_leaf(ik, value, bld)), true, false};
         }
 
         // LEAF
@@ -458,10 +459,10 @@ struct kntrie_ops {
             if (skip) [[unlikely]] {
                 const uint8_t* actual = hdr->prefix_bytes();
                 return insert_leaf_skip<BITS, INSERT, ASSIGN>(
-                    node, hdr, ik, value, actual, skip, 0, alloc);
+                    node, hdr, ik, value, actual, skip, 0, bld);
             }
 
-            return leaf_insert<BITS, INSERT, ASSIGN>(node, hdr, ik, value, alloc);
+            return leaf_insert<BITS, INSERT, ASSIGN>(node, hdr, ik, value, bld);
         }
 
         // BITMASK
@@ -471,10 +472,10 @@ struct kntrie_ops {
 
         if (sc > 0) [[unlikely]]
             return insert_chain_skip<BITS, INSERT, ASSIGN>(
-                node, hdr, sc, ik, value, 0, alloc);
+                node, hdr, sc, ik, value, 0, bld);
 
         return insert_final_bitmask<BITS, INSERT, ASSIGN>(
-            node, hdr, 0, ik, value, alloc);
+            node, hdr, 0, ik, value, bld);
     }
 
     // --- Leaf skip prefix: recursive byte-at-a-time with narrowing ---
@@ -483,15 +484,15 @@ struct kntrie_ops {
             uint64_t* node, node_header_t* hdr,
             NK ik, VST value,
             const uint8_t* actual, uint8_t skip, uint8_t pos,
-            ALLOC& alloc) {
+            BLD& bld) {
         if (pos >= skip) [[unlikely]]
-            return leaf_insert<BITS, INSERT, ASSIGN>(node, hdr, ik, value, alloc);
+            return leaf_insert<BITS, INSERT, ASSIGN>(node, hdr, ik, value, bld);
 
         uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
         if (expected != actual[pos]) [[unlikely]] {
             if constexpr (!INSERT) return {tag_leaf(node), false, false};
             return {split_on_prefix<BITS>(node, hdr, ik, value,
-                                            actual, skip, pos, alloc), true, false};
+                                            actual, skip, pos, bld), true, false};
         }
 
         // Match — consume byte, narrow at boundary
@@ -501,10 +502,10 @@ struct kntrie_ops {
                 return NARROW::template insert_leaf_skip<BITS - 8, INSERT, ASSIGN>(
                     node, hdr,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    value, actual, skip, pos + 1, alloc);
+                    value, actual, skip, pos + 1, bld);
             } else {
                 return insert_leaf_skip<BITS - 8, INSERT, ASSIGN>(
-                    node, hdr, shifted, value, actual, skip, pos + 1, alloc);
+                    node, hdr, shifted, value, actual, skip, pos + 1, bld);
             }
         }
         __builtin_unreachable();
@@ -513,18 +514,18 @@ struct kntrie_ops {
     // --- Leaf insert: compile-time NK dispatch ---
     template<int BITS, bool INSERT, bool ASSIGN>
     static insert_result_t leaf_insert(uint64_t* node, node_header_t* hdr,
-                                         NK ik, VST value, ALLOC& alloc) {
+                                         NK ik, VST value, BLD& bld) {
         insert_result_t result;
         if constexpr (sizeof(NK) == 1) {
             result = BO::template bitmap_insert<INSERT, ASSIGN>(
-                node, static_cast<uint8_t>(ik), value, alloc);
+                node, static_cast<uint8_t>(ik), value, bld);
         } else {
             result = CO::template insert<INSERT, ASSIGN>(
-                node, hdr, ik, value, alloc);
+                node, hdr, ik, value, bld);
         }
         if (result.needs_split) [[unlikely]] {
             if constexpr (!INSERT) return {tag_leaf(node), false, false};
-            return {convert_to_bitmask_tagged(node, hdr, ik, value, BITS, alloc),
+            return {convert_to_bitmask_tagged(node, hdr, ik, value, BITS, bld),
                     true, false};
         }
         return result;
@@ -535,17 +536,17 @@ struct kntrie_ops {
     static insert_result_t insert_chain_skip(
             uint64_t* node, node_header_t* hdr,
             uint8_t sc, NK ik, VST value, uint8_t pos,
-            ALLOC& alloc) {
+            BLD& bld) {
         if (pos >= sc) [[unlikely]]
             return insert_final_bitmask<BITS, INSERT, ASSIGN>(
-                node, hdr, sc, ik, value, alloc);
+                node, hdr, sc, ik, value, bld);
 
         uint8_t actual_byte = BO::skip_byte(node, pos);
         uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
 
         if (expected != actual_byte) [[unlikely]] {
             if constexpr (!INSERT) return {tag_bitmask(node), false, false};
-            return {split_skip_at<BITS>(node, hdr, sc, pos, ik, value, alloc),
+            return {split_skip_at<BITS>(node, hdr, sc, pos, ik, value, bld),
                     true, false};
         }
 
@@ -556,10 +557,10 @@ struct kntrie_ops {
                 return NARROW::template insert_chain_skip<BITS - 8, INSERT, ASSIGN>(
                     node, hdr, sc,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    value, pos + 1, alloc);
+                    value, pos + 1, bld);
             } else {
                 return insert_chain_skip<BITS - 8, INSERT, ASSIGN>(
-                    node, hdr, sc, shifted, value, pos + 1, alloc);
+                    node, hdr, sc, shifted, value, pos + 1, bld);
             }
         }
         __builtin_unreachable();
@@ -569,7 +570,7 @@ struct kntrie_ops {
     template<int BITS, bool INSERT, bool ASSIGN> requires (BITS >= 8)
     static insert_result_t insert_final_bitmask(
             uint64_t* node, node_header_t* hdr,
-            uint8_t sc, NK ik, VST value, ALLOC& alloc) {
+            uint8_t sc, NK ik, VST value, BLD& bld) {
         uint8_t ti = static_cast<uint8_t>(ik >> (NK_BITS - 8));
 
         typename BO::child_lookup cl;
@@ -586,9 +587,9 @@ struct kntrie_ops {
                 NK shifted = static_cast<NK>(ik << 8);
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
                     leaf = NARROW::make_single_leaf(
-                        static_cast<NNK>(shifted >> (NK_BITS / 2)), value, alloc);
+                        static_cast<NNK>(shifted >> (NK_BITS / 2)), value, bld);
                 else
-                    leaf = make_single_leaf(shifted, value, alloc);
+                    leaf = make_single_leaf(shifted, value, bld);
             } else {
                 // BITS==8: no child to create — shouldn't reach here
                 // (bitmap leaf handles 8-bit case)
@@ -597,9 +598,9 @@ struct kntrie_ops {
 
             uint64_t* nn;
             if (sc > 0) [[unlikely]]
-                nn = BO::chain_add_child(node, hdr, sc, ti, tag_leaf(leaf), alloc);
+                nn = BO::chain_add_child(node, hdr, sc, ti, tag_leaf(leaf), bld);
             else
-                nn = BO::add_child(node, hdr, ti, tag_leaf(leaf), alloc);
+                nn = BO::add_child(node, hdr, ti, tag_leaf(leaf), bld);
             inc_descendants(nn, get_header(nn));
             return {tag_bitmask(nn), true, false};
         }
@@ -612,10 +613,10 @@ struct kntrie_ops {
                 cr = NARROW::template insert_node<BITS - 8, INSERT, ASSIGN>(
                     cl.child,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    value, alloc);
+                    value, bld);
             } else {
                 cr = insert_node<BITS - 8, INSERT, ASSIGN>(
-                    cl.child, shifted, value, alloc);
+                    cl.child, shifted, value, bld);
             }
 
             if (cr.tagged_ptr != cl.child) {
@@ -638,7 +639,7 @@ struct kntrie_ops {
     // ==================================================================
 
     template<int BITS> requires (BITS >= 8)
-    static erase_result_t erase_node(uint64_t ptr, NK ik, ALLOC& alloc) {
+    static erase_result_t erase_node(uint64_t ptr, NK ik, BLD& bld) {
         if (ptr == SENTINEL_TAGGED) return {ptr, false, 0};
 
         if (ptr & LEAF_BIT) [[unlikely]] {
@@ -649,10 +650,10 @@ struct kntrie_ops {
             if (skip) [[unlikely]] {
                 const uint8_t* actual = hdr->prefix_bytes();
                 return erase_leaf_skip<BITS>(
-                    node, hdr, ik, actual, skip, 0, alloc);
+                    node, hdr, ik, actual, skip, 0, bld);
             }
 
-            return leaf_erase(node, hdr, ik, alloc);
+            return leaf_erase(node, hdr, ik, bld);
         }
 
         uint64_t* node = bm_to_node(ptr);
@@ -661,10 +662,10 @@ struct kntrie_ops {
 
         if (sc > 0) [[unlikely]]
             return erase_chain_skip<BITS>(
-                node, hdr, sc, ik, 0, alloc);
+                node, hdr, sc, ik, 0, bld);
 
         return erase_final_bitmask<BITS>(
-            node, hdr, 0, ik, alloc);
+            node, hdr, 0, ik, bld);
     }
 
     // --- Leaf skip prefix: recursive byte-at-a-time with narrowing ---
@@ -672,9 +673,9 @@ struct kntrie_ops {
     static erase_result_t erase_leaf_skip(
             uint64_t* node, node_header_t* hdr,
             NK ik, const uint8_t* actual, uint8_t skip, uint8_t pos,
-            ALLOC& alloc) {
+            BLD& bld) {
         if (pos >= skip) [[unlikely]]
-            return leaf_erase(node, hdr, ik, alloc);
+            return leaf_erase(node, hdr, ik, bld);
 
         uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
         if (expected != actual[pos]) [[unlikely]]
@@ -686,10 +687,10 @@ struct kntrie_ops {
                 return NARROW::template erase_leaf_skip<BITS - 8>(
                     node, hdr,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    actual, skip, pos + 1, alloc);
+                    actual, skip, pos + 1, bld);
             } else {
                 return erase_leaf_skip<BITS - 8>(
-                    node, hdr, shifted, actual, skip, pos + 1, alloc);
+                    node, hdr, shifted, actual, skip, pos + 1, bld);
             }
         }
         __builtin_unreachable();
@@ -697,11 +698,11 @@ struct kntrie_ops {
 
     // --- Leaf erase: compile-time NK dispatch ---
     static erase_result_t leaf_erase(uint64_t* node, node_header_t* hdr,
-                                       NK ik, ALLOC& alloc) {
+                                       NK ik, BLD& bld) {
         if constexpr (sizeof(NK) == 1) {
-            return BO::bitmap_erase(node, static_cast<uint8_t>(ik), alloc);
+            return BO::bitmap_erase(node, static_cast<uint8_t>(ik), bld);
         } else {
-            return CO::erase(node, hdr, ik, alloc);
+            return CO::erase(node, hdr, ik, bld);
         }
     }
 
@@ -710,10 +711,10 @@ struct kntrie_ops {
     static erase_result_t erase_chain_skip(
             uint64_t* node, node_header_t* hdr,
             uint8_t sc, NK ik, uint8_t pos,
-            ALLOC& alloc) {
+            BLD& bld) {
         if (pos >= sc) [[unlikely]]
             return erase_final_bitmask<BITS>(
-                node, hdr, sc, ik, alloc);
+                node, hdr, sc, ik, bld);
 
         uint8_t actual_byte = BO::skip_byte(node, pos);
         uint8_t expected = static_cast<uint8_t>(ik >> (NK_BITS - 8));
@@ -727,10 +728,10 @@ struct kntrie_ops {
                 return NARROW::template erase_chain_skip<BITS - 8>(
                     node, hdr, sc,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    pos + 1, alloc);
+                    pos + 1, bld);
             } else {
                 return erase_chain_skip<BITS - 8>(
-                    node, hdr, sc, shifted, pos + 1, alloc);
+                    node, hdr, sc, shifted, pos + 1, bld);
             }
         }
         __builtin_unreachable();
@@ -740,7 +741,7 @@ struct kntrie_ops {
     template<int BITS> requires (BITS >= 8)
     static erase_result_t erase_final_bitmask(
             uint64_t* node, node_header_t* hdr,
-            uint8_t sc, NK ik, ALLOC& alloc) {
+            uint8_t sc, NK ik, BLD& bld) {
         uint8_t ti = static_cast<uint8_t>(ik >> (NK_BITS - 8));
 
         typename BO::child_lookup cl;
@@ -759,10 +760,10 @@ struct kntrie_ops {
                 cr = NARROW::template erase_node<BITS - 8>(
                     cl.child,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    alloc);
+                    bld);
             } else {
                 cr = erase_node<BITS - 8>(
-                    cl.child, shifted, alloc);
+                    cl.child, shifted, bld);
             }
         } else {
             __builtin_unreachable();
@@ -781,16 +782,16 @@ struct kntrie_ops {
             // Decrement descendants and check coalesce
             uint64_t exact = dec_descendants(node, hdr);
             if (exact <= COMPACT_MAX) [[unlikely]]
-                return do_coalesce<BITS>(node, hdr, alloc);
+                return do_coalesce<BITS>(node, hdr, bld);
             return {tag_bitmask(node), true, exact};
         }
 
         // Child fully erased — remove from bitmask
         uint64_t* nn;
         if (sc > 0) [[unlikely]]
-            nn = BO::chain_remove_child(node, hdr, sc, cl.slot, ti, alloc);
+            nn = BO::chain_remove_child(node, hdr, sc, cl.slot, ti, bld);
         else
-            nn = BO::remove_child(node, hdr, cl.slot, ti, alloc);
+            nn = BO::remove_child(node, hdr, cl.slot, ti, bld);
         if (!nn) [[unlikely]] return {0, true, 0};
 
         hdr = get_header(nn);
@@ -810,19 +811,19 @@ struct kntrie_ops {
 
             if (ci.sole_child & LEAF_BIT) {
                 uint64_t* leaf = untag_leaf_mut(ci.sole_child);
-                leaf = prepend_skip(leaf, ci.total_skip, ci.bytes, alloc);
-                dealloc_node(alloc, nn, nn_au64);
+                leaf = prepend_skip(leaf, ci.total_skip, ci.bytes, bld);
+                bld.dealloc_node(nn, nn_au64);
                 return {tag_leaf(leaf), true, exact};
             }
             uint64_t* child_node = bm_to_node(ci.sole_child);
-            dealloc_node(alloc, nn, nn_au64);
-            return {BO::wrap_in_chain(child_node, ci.bytes, ci.total_skip, alloc),
+            bld.dealloc_node(nn, nn_au64);
+            return {BO::wrap_in_chain(child_node, ci.bytes, ci.total_skip, bld),
                     true, exact};
         }
 
         // Multi-child: check coalesce
         if (exact <= COMPACT_MAX) [[unlikely]]
-            return do_coalesce<BITS>(nn, get_header(nn), alloc);
+            return do_coalesce<BITS>(nn, get_header(nn), bld);
         return {tag_bitmask(nn), true, exact};
     }
 
@@ -982,7 +983,7 @@ struct kntrie_ops {
 
     template<int BITS> requires (BITS >= 8)
     static erase_result_t do_coalesce(uint64_t* node, node_header_t* hdr,
-                                        ALLOC& alloc) {
+                                        BLD& bld) {
         uint8_t sc = hdr->skip();
 
         // Collect entries from the final bitmap directly.
@@ -991,16 +992,16 @@ struct kntrie_ops {
         auto c = collect_bm_final<BITS>(node, sc);
 
         // Build leaf at BITS level (keys are already post-skip)
-        uint64_t* leaf = build_leaf(c.keys.get(), c.vals.get(), c.count, alloc);
+        uint64_t* leaf = build_leaf(c.keys.get(), c.vals.get(), c.count, bld);
 
         // Re-attach skip prefix if this node had one
         if (sc > 0) [[unlikely]] {
             uint8_t sb[6];
             BO::skip_bytes(node, sc, sb);
-            leaf = prepend_skip(leaf, sc, sb, alloc);
+            leaf = prepend_skip(leaf, sc, sb, bld);
         }
 
-        dealloc_coalesced_node<BITS>(node, sc, alloc);
+        dealloc_coalesced_node<BITS>(node, sc, bld);
         return {tag_leaf(leaf), true, c.count};
     }
 
@@ -1008,9 +1009,9 @@ struct kntrie_ops {
     template<int BITS> requires (BITS >= 8)
     static uint64_t* coalesce_build_skip(uint8_t sc, uint8_t pos,
                                             NK* wk, VST* wv,
-                                            size_t count, ALLOC& alloc) {
+                                            size_t count, BLD& bld) {
         if (pos >= sc) [[unlikely]]
-            return build_leaf(wk, wv, count, alloc);
+            return build_leaf(wk, wv, count, bld);
 
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8) {
@@ -1018,10 +1019,10 @@ struct kntrie_ops {
                 for (size_t i = 0; i < count; ++i)
                     ns[i] = static_cast<NNK>(wk[i] >> (NK_BITS / 2));
                 return NARROW::template coalesce_build_skip<BITS - 8>(
-                    sc, pos + 1, ns.get(), wv, count, alloc);
+                    sc, pos + 1, ns.get(), wv, count, bld);
             } else {
                 return coalesce_build_skip<BITS - 8>(
-                    sc, pos + 1, wk, wv, count, alloc);
+                    sc, pos + 1, wk, wv, count, bld);
             }
         }
         __builtin_unreachable();
@@ -1050,7 +1051,7 @@ struct kntrie_ops {
 
     // Prepend skip bytes to an existing leaf. Returns raw (untagged) pointer.
     static uint64_t* prepend_skip(uint64_t* node, uint8_t new_len,
-                                    const uint8_t* new_bytes, ALLOC& alloc) {
+                                    const uint8_t* new_bytes, BLD& bld) {
         auto* h = get_header(node);
         uint8_t os = h->skip();
         uint8_t ns = os + new_len;
@@ -1068,28 +1069,28 @@ struct kntrie_ops {
         // No skip u64 — realloc with extra u64 and shift data right
         size_t old_au64 = h->alloc_u64();
         size_t new_au64 = old_au64 + 1;
-        uint64_t* nn = alloc_node(alloc, new_au64);
+        uint64_t* nn = bld.alloc_node(new_au64);
         nn[0] = node[0];
         std::memcpy(nn + 2, node + 1, (old_au64 - 1) * 8);
         auto* nh = get_header(nn);
         nh->set_alloc_u64(new_au64);
         nh->set_skip(ns);
         nh->set_prefix(combined, ns);
-        dealloc_node(alloc, node, old_au64);
+        bld.dealloc_node(node, old_au64);
         return nn;
     }
 
     // Strip the skip u64 from a leaf. Returns raw (untagged) pointer.
-    static uint64_t* remove_skip(uint64_t* node, ALLOC& alloc) {
+    static uint64_t* remove_skip(uint64_t* node, BLD& bld) {
         auto* h = get_header(node);
         size_t old_au64 = h->alloc_u64();
         size_t new_au64 = old_au64 - 1;
-        uint64_t* nn = alloc_node(alloc, new_au64);
+        uint64_t* nn = bld.alloc_node(new_au64);
         nn[0] = node[0];
         get_header(nn)->set_skip(0);
         std::memcpy(nn + 1, node + 2, (old_au64 - 2) * 8);
         get_header(nn)->set_alloc_u64(new_au64);
-        dealloc_node(alloc, node, old_au64);
+        bld.dealloc_node(node, old_au64);
         return nn;
     }
 
@@ -1099,11 +1100,11 @@ struct kntrie_ops {
     // ==================================================================
 
     template<int BITS> requires (BITS >= 8)
-    static void dealloc_bitmask_subtree(uint64_t tagged, ALLOC& alloc) noexcept {
+    static void dealloc_bitmask_subtree(uint64_t tagged, BLD& bld) noexcept {
         if (tagged & LEAF_BIT) [[unlikely]] {
             uint64_t* node = untag_leaf_mut(tagged);
             auto* hdr = get_header(node);
-            dealloc_node(alloc, node, hdr->alloc_u64());
+            bld.dealloc_node(node, hdr->alloc_u64());
             return;
         }
         uint64_t* node = bm_to_node(tagged);
@@ -1112,11 +1113,11 @@ struct kntrie_ops {
 
         // Recurse children with narrowing through skip chain
         if (sc > 0) [[unlikely]] {
-            dealloc_bm_chain_skip<BITS>(node, sc, 0, alloc);
+            dealloc_bm_chain_skip<BITS>(node, sc, 0, bld);
         } else {
-            dealloc_bm_final<BITS>(node, sc, alloc);
+            dealloc_bm_final<BITS>(node, sc, bld);
         }
-        dealloc_node(alloc, node, hdr->alloc_u64());
+        bld.dealloc_node(node, hdr->alloc_u64());
     }
 
     // Deallocate a coalesced bitmask node. Unlike dealloc_bitmask_subtree,
@@ -1124,56 +1125,56 @@ struct kntrie_ops {
     // to the final bitmap children without re-navigating the chain.
     template<int BITS> requires (BITS >= 8)
     static void dealloc_coalesced_node(uint64_t* node, uint8_t sc,
-                                         ALLOC& alloc) noexcept {
-        dealloc_bm_final<BITS>(node, sc, alloc);
-        dealloc_node(alloc, node, get_header(node)->alloc_u64());
+                                         BLD& bld) noexcept {
+        dealloc_bm_final<BITS>(node, sc, bld);
+        bld.dealloc_node(node, get_header(node)->alloc_u64());
     }
 
     // Leaf skip: narrow NK through prefix bytes then destroy
     template<int BITS> requires (BITS >= 8)
     static void dealloc_leaf_skip(uint64_t* node, uint8_t skip,
-                                    ALLOC& alloc) noexcept {
+                                    BLD& bld) noexcept {
         if (skip == 0) [[unlikely]] {
             if constexpr (sizeof(NK) == 1)
-                BO::bitmap_destroy_and_dealloc(node, alloc);
+                BO::bitmap_destroy_and_dealloc(node, bld);
             else
-                CO::destroy_and_dealloc(node, alloc);
+                CO::destroy_and_dealloc(node, bld);
             return;
         }
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                NARROW::template dealloc_leaf_skip<BITS - 8>(node, skip - 1, alloc);
+                NARROW::template dealloc_leaf_skip<BITS - 8>(node, skip - 1, bld);
             else
-                dealloc_leaf_skip<BITS - 8>(node, skip - 1, alloc);
+                dealloc_leaf_skip<BITS - 8>(node, skip - 1, bld);
         }
     }
 
     // Chain skip: narrow through embed bytes
     template<int BITS> requires (BITS >= 8)
     static void dealloc_bm_chain_skip(uint64_t* node, uint8_t sc, uint8_t pos,
-                                        ALLOC& alloc) noexcept {
+                                        BLD& bld) noexcept {
         if (pos >= sc) [[unlikely]] {
-            dealloc_bm_final<BITS>(node, sc, alloc);
+            dealloc_bm_final<BITS>(node, sc, bld);
             return;
         }
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                NARROW::template dealloc_bm_chain_skip<BITS - 8>(node, sc, pos + 1, alloc);
+                NARROW::template dealloc_bm_chain_skip<BITS - 8>(node, sc, pos + 1, bld);
             else
-                dealloc_bm_chain_skip<BITS - 8>(node, sc, pos + 1, alloc);
+                dealloc_bm_chain_skip<BITS - 8>(node, sc, pos + 1, bld);
         }
     }
 
     // Final bitmap: recurse each child with narrowing
     template<int BITS> requires (BITS >= 8)
     static void dealloc_bm_final(uint64_t* node, uint8_t sc,
-                                   ALLOC& alloc) noexcept {
+                                   BLD& bld) noexcept {
         BO::chain_for_each_child(node, sc, [&](unsigned, uint64_t child) {
             if constexpr (BITS > 8) {
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                    NARROW::template dealloc_bitmask_subtree<BITS - 8>(child, alloc);
+                    NARROW::template dealloc_bitmask_subtree<BITS - 8>(child, bld);
                 else
-                    dealloc_bitmask_subtree<BITS - 8>(child, alloc);
+                    dealloc_bitmask_subtree<BITS - 8>(child, bld);
             }
         });
     }

@@ -23,6 +23,7 @@ private:
     using VT   = value_traits<VALUE, ALLOC>;
     using VST  = typename VT::slot_type;
     using BO   = bitmask_ops<VALUE, ALLOC>;
+    using BLD  = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
 
     static constexpr int IK_BITS  = KO::IK_BITS;
     static constexpr int KEY_BITS = KO::KEY_BITS;
@@ -36,22 +37,22 @@ private:
 
     uint64_t  root_v;      // tagged pointer (LEAF_BIT for leaf, raw for bitmask)
     size_t    size_v;
-    [[no_unique_address]] ALLOC alloc_v;
+    BLD       bld_v;
 
 public:
     // ==================================================================
     // Constructor / Destructor
     // ==================================================================
 
-    kntrie_impl() : root_v(SENTINEL_TAGGED), size_v(0), alloc_v() {}
+    kntrie_impl() : root_v(SENTINEL_TAGGED), size_v(0), bld_v() {}
 
-    ~kntrie_impl() { remove_all(); }
+    ~kntrie_impl() { remove_all(); bld_v.drain(); }
 
     kntrie_impl(const kntrie_impl&) = delete;
     kntrie_impl& operator=(const kntrie_impl&) = delete;
 
     kntrie_impl(kntrie_impl&& o) noexcept
-        : root_v(o.root_v), size_v(o.size_v), alloc_v(std::move(o.alloc_v)) {
+        : root_v(o.root_v), size_v(o.size_v), bld_v(std::move(o.bld_v)) {
         o.root_v = SENTINEL_TAGGED;
         o.size_v = 0;
     }
@@ -59,9 +60,10 @@ public:
     kntrie_impl& operator=(kntrie_impl&& o) noexcept {
         if (this != &o) {
             remove_all();
+            bld_v.drain();
             root_v  = o.root_v;
             size_v  = o.size_v;
-            alloc_v = std::move(o.alloc_v);
+            bld_v   = std::move(o.bld_v);
             o.root_v = SENTINEL_TAGGED;
             o.size_v = 0;
         }
@@ -71,15 +73,16 @@ public:
     void swap(kntrie_impl& o) noexcept {
         std::swap(root_v, o.root_v);
         std::swap(size_v, o.size_v);
-        std::swap(alloc_v, o.alloc_v);
+        bld_v.swap(o.bld_v);
     }
 
     [[nodiscard]] bool      empty() const noexcept { return root_v == SENTINEL_TAGGED; }
     [[nodiscard]] size_type size()  const noexcept { return size_v; }
-    [[nodiscard]] const ALLOC& get_allocator() const noexcept { return alloc_v; }
+    [[nodiscard]] const ALLOC& get_allocator() const noexcept { return bld_v.get_allocator(); }
 
     void clear() noexcept {
         remove_all();
+        bld_v.drain();
         size_v = 0;
     }
 
@@ -133,7 +136,7 @@ public:
 
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
         auto [new_tagged, erased, sub_ent] =
-            OPS::template erase_node<KEY_BITS>(root_v, nk, alloc_v);
+            OPS::template erase_node<KEY_BITS>(root_v, nk, bld_v);
         if (!erased) return false;
 
         root_v = new_tagged ? new_tagged : SENTINEL_TAGGED;
@@ -237,22 +240,22 @@ private:
     template<bool INSERT, bool ASSIGN>
     std::pair<bool, bool> insert_dispatch(const KEY& key, const VALUE& value) {
         IK ik = KO::to_internal(key);
-        VST sv = VT::store(value, alloc_v);
+        VST sv = bld_v.store_value(value);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
 
         // Empty trie: create single-entry leaf
         if (root_v == SENTINEL_TAGGED) {
-            if constexpr (!INSERT) { VT::destroy(sv, alloc_v); return {true, false}; }
-            root_v = tag_leaf(OPS::make_single_leaf(nk, sv, alloc_v));
+            if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
+            root_v = tag_leaf(OPS::make_single_leaf(nk, sv, bld_v));
             ++size_v;
             return {true, true};
         }
 
         auto r = OPS::template insert_node<KEY_BITS, INSERT, ASSIGN>(
-            root_v, nk, sv, alloc_v);
+            root_v, nk, sv, bld_v);
         if (r.tagged_ptr != root_v) root_v = r.tagged_ptr;
         if (r.inserted) { ++size_v; return {true, true}; }
-        VT::destroy(sv, alloc_v);
+        bld_v.destroy_value(sv);
         return {true, false};
     }
 
@@ -262,7 +265,7 @@ private:
 
     void remove_all() noexcept {
         if (root_v != SENTINEL_TAGGED) {
-            ITER_OPS::template remove_subtree<KEY_BITS>(root_v, alloc_v);
+            ITER_OPS::template remove_subtree<KEY_BITS>(root_v, bld_v);
             root_v = SENTINEL_TAGGED;
         }
         size_v = 0;
