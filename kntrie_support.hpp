@@ -225,6 +225,63 @@ struct iter_ops_result_t {
 };
 
 // ==========================================================================
+// Bool slots — packed bit storage for VALUE=bool specialization
+//
+// Wraps a uint64_t* pointing into a node's packed bit region.
+// Sentinels are private — all const bool* returns go through ptr/ptr_at.
+// ==========================================================================
+
+struct bool_slots {
+private:
+    static inline constexpr bool TRUE_VAL  = true;
+    static inline constexpr bool FALSE_VAL = false;
+
+public:
+    uint64_t* data;
+
+    static const bool* ptr(bool v) noexcept {
+        return v ? &TRUE_VAL : &FALSE_VAL;
+    }
+
+    const bool* ptr_at(unsigned i) const noexcept {
+        return ptr((data[i / 64] >> (i % 64)) & 1);
+    }
+
+    bool get(unsigned i) const noexcept {
+        return (data[i / 64] >> (i % 64)) & 1;
+    }
+
+    void set(unsigned i, bool v) noexcept {
+        unsigned word = i / 64, bit = i % 64;
+        if (v) data[word] |=  (uint64_t{1} << bit);
+        else   data[word] &= ~(uint64_t{1} << bit);
+    }
+
+    void clear_all(unsigned n) noexcept {
+        std::memset(data, 0, u64_for(n) * 8);
+    }
+
+    void unpack_to(bool* dst, unsigned n) const noexcept {
+        for (unsigned i = 0; i < n; ++i)
+            dst[i] = get(i);
+    }
+
+    void pack_from(const bool* src, unsigned n) noexcept {
+        clear_all(n);
+        for (unsigned i = 0; i < n; ++i)
+            if (src[i]) set(i, true);
+    }
+
+    static constexpr size_t u64_for(unsigned n) noexcept {
+        return (n + 63) / 64;
+    }
+
+    static constexpr size_t bytes_for(unsigned n) noexcept {
+        return u64_for(n) * 8;
+    }
+};
+
+// ==========================================================================
 // Value traits
 // ==========================================================================
 
@@ -237,6 +294,7 @@ struct value_traits {
         std::is_trivially_copyable_v<VALUE> && sizeof(VALUE) <= 64;
     static constexpr bool IS_INLINE = IS_TRIVIAL;
     static constexpr bool HAS_DESTRUCTOR = !IS_TRIVIAL;
+    static constexpr bool IS_BOOL = std::is_same_v<VALUE, bool>;
 
     using slot_type = std::conditional_t<IS_INLINE, VALUE, VALUE*>;
 
@@ -257,8 +315,9 @@ struct value_traits {
     // --- as_ptr: slot_type → const VALUE* ---
 
     static const VALUE* as_ptr(const slot_type& s) noexcept {
-        if constexpr (IS_TRIVIAL) return reinterpret_cast<const VALUE*>(&s);
-        else                      return s;
+        if constexpr (IS_BOOL)        return bool_slots::ptr(s);
+        else if constexpr (IS_TRIVIAL) return reinterpret_cast<const VALUE*>(&s);
+        else                           return s;
     }
 
     // --- destroy: release resources held by slot ---

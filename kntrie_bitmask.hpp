@@ -229,9 +229,13 @@ struct bitmask_ops {
     }
 
     static constexpr size_t bitmap_leaf_size_u64(size_t count, size_t hu = HEADER_U64) noexcept {
-        size_t vb = count * sizeof(VST);
-        vb = (vb + 7) & ~size_t{7};
-        return hu + BITMAP_256_U64 + vb / 8;
+        if constexpr (VT::IS_BOOL) {
+            return hu + BITMAP_256_U64 + BITMAP_256_U64;  // presence + value bitmap
+        } else {
+            size_t vb = count * sizeof(VST);
+            vb = (vb + 7) & ~size_t{7};
+            return hu + BITMAP_256_U64 + vb / 8;
+        }
     }
 
     // ==================================================================
@@ -670,9 +674,14 @@ struct bitmask_ops {
     static const VALUE* bitmap_find(const uint64_t* node, node_header_t h,
                                      uint8_t suffix, size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
-        int slot = bmp.find_slot<slot_mode::FAST_EXIT>(suffix);
-        if (slot < 0) [[unlikely]] return nullptr;
-        return VT::as_ptr(bl_vals(node, header_size)[slot]);
+        if constexpr (VT::IS_BOOL) {
+            if (!bmp.has_bit(suffix)) [[unlikely]] return nullptr;
+            return bool_slots::ptr(val_bm(node, header_size).has_bit(suffix));
+        } else {
+            int slot = bmp.find_slot<slot_mode::FAST_EXIT>(suffix);
+            if (slot < 0) [[unlikely]] return nullptr;
+            return VT::as_ptr(bl_vals(node, header_size)[slot]);
+        }
     }
 
     // ==================================================================
@@ -684,17 +693,27 @@ struct bitmask_ops {
     static iter_bm_result bitmap_iter_first(const uint64_t* node,
                                              size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
-        const VST* vd = bl_vals(node, header_size);
-        return {bmp.first_set_bit(), &vd[0], true};
+        uint8_t idx = bmp.first_set_bit();
+        if constexpr (VT::IS_BOOL)
+            return {idx, bool_slots::ptr(val_bm(node, header_size).has_bit(idx)), true};
+        else {
+            const VST* vd = bl_vals(node, header_size);
+            return {idx, &vd[0], true};
+        }
     }
 
     static iter_bm_result bitmap_iter_last(const uint64_t* node,
                                             node_header_t h,
                                             size_t header_size) noexcept {
         const bitmap_256_t& bmp = bm(node, header_size);
-        const VST* vd = bl_vals(node, header_size);
-        unsigned count = h.entries();
-        return {bmp.last_set_bit(), &vd[count - 1], true};
+        uint8_t idx = bmp.last_set_bit();
+        if constexpr (VT::IS_BOOL)
+            return {idx, bool_slots::ptr(val_bm(node, header_size).has_bit(idx)), true};
+        else {
+            const VST* vd = bl_vals(node, header_size);
+            unsigned count = h.entries();
+            return {idx, &vd[count - 1], true};
+        }
     }
 
     static iter_bm_result bitmap_iter_next(const uint64_t* node,
@@ -703,8 +722,12 @@ struct bitmask_ops {
         const bitmap_256_t& bmp = bm(node, header_size);
         auto r = bmp.next_set_after(suffix);
         if (!r.found) return {0, nullptr, false};
-        const VST* vd = bl_vals(node, header_size);
-        return {r.idx, &vd[r.slot], true};
+        if constexpr (VT::IS_BOOL)
+            return {r.idx, bool_slots::ptr(val_bm(node, header_size).has_bit(r.idx)), true};
+        else {
+            const VST* vd = bl_vals(node, header_size);
+            return {r.idx, &vd[r.slot], true};
+        }
     }
 
     static iter_bm_result bitmap_iter_prev(const uint64_t* node,
@@ -713,8 +736,12 @@ struct bitmask_ops {
         const bitmap_256_t& bmp = bm(node, header_size);
         auto r = bmp.prev_set_before(suffix);
         if (!r.found) return {0, nullptr, false};
-        const VST* vd = bl_vals(node, header_size);
-        return {r.idx, &vd[r.slot], true};
+        if constexpr (VT::IS_BOOL)
+            return {r.idx, bool_slots::ptr(val_bm(node, header_size).has_bit(r.idx)), true};
+        else {
+            const VST* vd = bl_vals(node, header_size);
+            return {r.idx, &vd[r.slot], true};
+        }
     }
 
     // ==================================================================
@@ -729,51 +756,85 @@ struct bitmask_ops {
         size_t hs = hdr_u64(node);
         bitmap_256_t& bm = bm_mut(node, hs);
         unsigned count = h->entries();
-        VST* vd = bl_vals_mut(node, hs);
 
-        if (bm.has_bit(suffix)) {
-            if constexpr (ASSIGN) {
-                int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
-                VT::destroy(vd[slot], alloc);
-                VT::write_slot(&vd[slot], value);
+        if constexpr (VT::IS_BOOL) {
+            if (bm.has_bit(suffix)) {
+                if constexpr (ASSIGN) {
+                    if (value) val_bm_mut(node, hs).set_bit(suffix);
+                    else       val_bm_mut(node, hs).clear_bit(suffix);
+                }
+                return {tag_leaf(node), false, false};
             }
-            return {tag_leaf(node), false, false};
+            if constexpr (!INSERT) return {tag_leaf(node), false, false};
+
+            unsigned nc = count + 1;
+            size_t new_sz = bitmap_leaf_size_u64(nc, hs);
+
+            if (new_sz <= h->alloc_u64()) {
+                bm.set_bit(suffix);
+                if (value) val_bm_mut(node, hs).set_bit(suffix);
+                h->set_entries(nc);
+                return {tag_leaf(node), true, false};
+            }
+
+            size_t au64 = round_up_u64(new_sz);
+            uint64_t* nn = alloc_node(alloc, au64);
+            auto* nh = get_header(nn);
+            *nh = *h;
+            if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
+            nh->set_entries(nc);
+            nh->set_alloc_u64(au64);
+            bm_mut(nn, hs) = bm;
+            bm_mut(nn, hs).set_bit(suffix);
+            val_bm_mut(nn, hs) = val_bm(node, hs);
+            if (value) val_bm_mut(nn, hs).set_bit(suffix);
+            dealloc_node(alloc, node, h->alloc_u64());
+            return {tag_leaf(nn), true, false};
+        } else {
+            VST* vd = bl_vals_mut(node, hs);
+
+            if (bm.has_bit(suffix)) {
+                if constexpr (ASSIGN) {
+                    int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
+                    VT::destroy(vd[slot], alloc);
+                    VT::write_slot(&vd[slot], value);
+                }
+                return {tag_leaf(node), false, false};
+            }
+
+            if constexpr (!INSERT) return {tag_leaf(node), false, false};
+
+            unsigned nc = count + 1;
+            size_t new_sz = bitmap_leaf_size_u64(nc, hs);
+
+            if (new_sz <= h->alloc_u64()) {
+                int isl = bm.find_slot<slot_mode::UNFILTERED>(suffix);
+                bm.set_bit(suffix);
+                std::memmove(vd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
+                VT::write_slot(&vd[isl], value);
+                h->set_entries(nc);
+                return {tag_leaf(node), true, false};
+            }
+
+            size_t au64 = round_up_u64(new_sz);
+            uint64_t* nn = alloc_node(alloc, au64);
+            auto* nh = get_header(nn);
+            *nh = *h;
+            if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
+            nh->set_entries(nc);
+            nh->set_alloc_u64(au64);
+            bitmap_256_t& nbm = bm_mut(nn, hs);
+            nbm = bm;
+            nbm.set_bit(suffix);
+            VST* nvd = bl_vals_mut(nn, hs);
+            int isl = nbm.find_slot<slot_mode::UNFILTERED>(suffix);
+            std::memcpy(nvd, vd, isl * sizeof(VST));
+            VT::write_slot(&nvd[isl], value);
+            std::memcpy(nvd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
+
+            dealloc_node(alloc, node, h->alloc_u64());
+            return {tag_leaf(nn), true, false};
         }
-
-        if constexpr (!INSERT) return {tag_leaf(node), false, false};
-
-        unsigned nc = count + 1;
-        size_t new_sz = bitmap_leaf_size_u64(nc, hs);
-
-        // In-place
-        if (new_sz <= h->alloc_u64()) {
-            int isl = bm.find_slot<slot_mode::UNFILTERED>(suffix);
-            bm.set_bit(suffix);
-            std::memmove(vd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
-            VT::write_slot(&vd[isl], value);
-            h->set_entries(nc);
-            return {tag_leaf(node), true, false};
-        }
-
-        // Realloc
-        size_t au64 = round_up_u64(new_sz);
-        uint64_t* nn = alloc_node(alloc, au64);
-        auto* nh = get_header(nn);
-        *nh = *h;
-        if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
-        nh->set_entries(nc);
-        nh->set_alloc_u64(au64);
-        bitmap_256_t& nbm = bm_mut(nn, hs);
-        nbm = bm;
-        nbm.set_bit(suffix);
-        VST* nvd = bl_vals_mut(nn, hs);
-        int isl = nbm.find_slot<slot_mode::UNFILTERED>(suffix);
-        std::memcpy(nvd, vd, isl * sizeof(VST));
-        VT::write_slot(&nvd[isl], value);
-        std::memcpy(nvd + isl + 1, vd + isl, (count - isl) * sizeof(VST));
-
-        dealloc_node(alloc, node, h->alloc_u64());
-        return {tag_leaf(nn), true, false};
     }
 
     // ==================================================================
@@ -788,43 +849,68 @@ struct bitmask_ops {
         if (!bm.has_bit(suffix)) return {tag_leaf(node), false, 0};
 
         unsigned count = h->entries();
-        int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
-        VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
 
-        unsigned nc = count - 1;
-        if (nc == 0) {
-            dealloc_node(alloc, node, h->alloc_u64());
-            return {0, true, 0};
-        }
-
-        size_t new_sz = bitmap_leaf_size_u64(nc, hs);
-
-        // In-place
-        if (!should_shrink_u64(h->alloc_u64(), new_sz)) {
-            VST* vd = bl_vals_mut(node, hs);
+        if constexpr (VT::IS_BOOL) {
+            unsigned nc = count - 1;
+            if (nc == 0) {
+                dealloc_node(alloc, node, h->alloc_u64());
+                return {0, true, 0};
+            }
             bm.clear_bit(suffix);
-            std::memmove(vd + slot, vd + slot + 1, (nc - slot) * sizeof(VST));
+            val_bm_mut(node, hs).clear_bit(suffix);
             h->set_entries(nc);
+
+            size_t new_sz = bitmap_leaf_size_u64(nc, hs);
+            if (should_shrink_u64(h->alloc_u64(), new_sz)) {
+                size_t au64 = round_up_u64(new_sz);
+                uint64_t* nn = alloc_node(alloc, au64);
+                auto* nh = get_header(nn);
+                *nh = *h;
+                if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
+                nh->set_alloc_u64(au64);
+                bm_mut(nn, hs) = bm;
+                val_bm_mut(nn, hs) = val_bm(node, hs);
+                dealloc_node(alloc, node, h->alloc_u64());
+                return {tag_leaf(nn), true, nc};
+            }
             return {tag_leaf(node), true, nc};
+        } else {
+            int slot = bm.find_slot<slot_mode::UNFILTERED>(suffix);
+            VT::destroy(bl_vals_mut(node, hs)[slot], alloc);
+
+            unsigned nc = count - 1;
+            if (nc == 0) {
+                dealloc_node(alloc, node, h->alloc_u64());
+                return {0, true, 0};
+            }
+
+            size_t new_sz = bitmap_leaf_size_u64(nc, hs);
+
+            if (!should_shrink_u64(h->alloc_u64(), new_sz)) {
+                VST* vd = bl_vals_mut(node, hs);
+                bm.clear_bit(suffix);
+                std::memmove(vd + slot, vd + slot + 1, (nc - slot) * sizeof(VST));
+                h->set_entries(nc);
+                return {tag_leaf(node), true, nc};
+            }
+
+            size_t au64 = round_up_u64(new_sz);
+            uint64_t* nn = alloc_node(alloc, au64);
+            auto* nh = get_header(nn);
+            *nh = *h;
+            if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
+            nh->set_entries(nc);
+            nh->set_alloc_u64(au64);
+            bm_mut(nn, hs) = bm;
+            bm_mut(nn, hs).clear_bit(suffix);
+            const VST* ov = bl_vals(node, hs);
+            VST*       nv = bl_vals_mut(nn, hs);
+            std::memcpy(nv, ov, slot * sizeof(VST));
+            std::memcpy(nv + slot, ov + slot + 1, (nc - slot) * sizeof(VST));
+
+            dealloc_node(alloc, node, h->alloc_u64());
+            return {tag_leaf(nn), true, nc};
         }
-
-        // Realloc
-        size_t au64 = round_up_u64(new_sz);
-        uint64_t* nn = alloc_node(alloc, au64);
-        auto* nh = get_header(nn);
-        *nh = *h;
-        if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
-        nh->set_entries(nc);
-        nh->set_alloc_u64(au64);
-        bm_mut(nn, hs) = bm;
-        bm_mut(nn, hs).clear_bit(suffix);
-        const VST* ov = bl_vals(node, hs);
-        VST*       nv = bl_vals_mut(nn, hs);
-        std::memcpy(nv, ov, slot * sizeof(VST));
-        std::memcpy(nv + slot, ov + slot + 1, (nc - slot) * sizeof(VST));
-
-        dealloc_node(alloc, node, h->alloc_u64());
-        return {tag_leaf(nn), true, nc};
     }
 
     // ==================================================================
@@ -843,9 +929,16 @@ struct bitmask_ops {
         bitmap_256_t& bm = bm_mut(node, hs);
         bm = bitmap_256_t{};
         for (unsigned i = 0; i < count; ++i) bm.set_bit(sorted_suffixes[i]);
-        VST* vd = bl_vals_mut(node, hs);
-        for (unsigned i = 0; i < count; ++i)
-            VT::init_slot(&vd[bm.find_slot<slot_mode::UNFILTERED>(sorted_suffixes[i])], values[i]);
+        if constexpr (VT::IS_BOOL) {
+            bitmap_256_t& vbm = val_bm_mut(node, hs);
+            vbm = bitmap_256_t{};
+            for (unsigned i = 0; i < count; ++i)
+                if (values[i]) vbm.set_bit(sorted_suffixes[i]);
+        } else {
+            VST* vd = bl_vals_mut(node, hs);
+            for (unsigned i = 0; i < count; ++i)
+                VT::init_slot(&vd[bm.find_slot<slot_mode::UNFILTERED>(sorted_suffixes[i])], values[i]);
+        }
         return node;
     }
 
@@ -861,7 +954,11 @@ struct bitmask_ops {
         h->set_entries(1);
         h->set_alloc_u64(sz);
         bm_mut(node, hs).set_bit(suffix);
-        VT::init_slot(&bl_vals_mut(node, hs)[0], value);
+        if constexpr (VT::IS_BOOL) {
+            if (value) val_bm_mut(node, hs).set_bit(suffix);
+        } else {
+            VT::init_slot(&bl_vals_mut(node, hs)[0], value);
+        }
         return node;
     }
 
@@ -873,10 +970,17 @@ struct bitmask_ops {
     static void for_each_bitmap(const uint64_t* node, Fn&& cb) {
         size_t hs = hdr_u64(node);
         const bitmap_256_t& bmp = bm(node, hs);
-        const VST* vd = bl_vals(node, hs);
-        bmp.for_each_set([&](uint8_t idx, int slot) {
-            cb(idx, vd[slot]);
-        });
+        if constexpr (VT::IS_BOOL) {
+            const bitmap_256_t& vbm = val_bm(node, hs);
+            bmp.for_each_set([&](uint8_t idx, int /*slot*/) {
+                cb(idx, static_cast<VST>(vbm.has_bit(idx)));
+            });
+        } else {
+            const VST* vd = bl_vals(node, hs);
+            bmp.for_each_set([&](uint8_t idx, int slot) {
+                cb(idx, vd[slot]);
+            });
+        }
     }
 
     // ==================================================================
@@ -1059,6 +1163,14 @@ private:
     }
     static VST* bl_vals_mut(uint64_t* n, size_t header_size) noexcept {
         return reinterpret_cast<VST*>(n + header_size + BITMAP_256_U64);
+    }
+
+    // --- Bitmap256 leaf: value bitmap for bool (sits after presence bitmap) ---
+    static const bitmap_256_t& val_bm(const uint64_t* n, size_t header_size) noexcept {
+        return *reinterpret_cast<const bitmap_256_t*>(n + header_size + BITMAP_256_U64);
+    }
+    static bitmap_256_t& val_bm_mut(uint64_t* n, size_t header_size) noexcept {
+        return *reinterpret_cast<bitmap_256_t*>(n + header_size + BITMAP_256_U64);
     }
 
     // --- Bitmask node: descendants count (single u64 after children) ---

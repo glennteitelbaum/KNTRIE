@@ -984,28 +984,23 @@ struct kntrie_ops {
     static erase_result_t do_coalesce(uint64_t* node, node_header_t* hdr,
                                         ALLOC& alloc) {
         uint8_t sc = hdr->skip();
-        uint64_t tagged = tag_bitmask(node);
 
-        auto c = collect_entries<BITS>(tagged);
+        // Collect entries from the final bitmap directly.
+        // The skip chain was already consumed to reach this node at BITS,
+        // so we must NOT re-descend through it via collect_entries.
+        auto c = collect_bm_final<BITS>(node, sc);
 
-        // Strip skip bytes: shift left so suffixes are at (BITS - sc*8) level
-        if (sc > 0) [[unlikely]] {
-            unsigned shift = sc * 8;
-            for (size_t i = 0; i < c.count; ++i)
-                c.keys[i] = static_cast<NK>(c.keys[i] << shift);
-        }
+        // Build leaf at BITS level (keys are already post-skip)
+        uint64_t* leaf = build_leaf(c.keys.get(), c.vals.get(), c.count, alloc);
 
-        // Build leaf: narrow through skip bytes to find correct NK
-        uint64_t* leaf = coalesce_build_skip<BITS>(
-            sc, 0, c.keys.get(), c.vals.get(), c.count, alloc);
-
+        // Re-attach skip prefix if this node had one
         if (sc > 0) [[unlikely]] {
             uint8_t sb[6];
             BO::skip_bytes(node, sc, sb);
             leaf = prepend_skip(leaf, sc, sb, alloc);
         }
 
-        dealloc_bitmask_subtree<BITS>(tagged, alloc);
+        dealloc_coalesced_node<BITS>(node, sc, alloc);
         return {tag_leaf(leaf), true, c.count};
     }
 
@@ -1122,6 +1117,16 @@ struct kntrie_ops {
             dealloc_bm_final<BITS>(node, sc, alloc);
         }
         dealloc_node(alloc, node, hdr->alloc_u64());
+    }
+
+    // Deallocate a coalesced bitmask node. Unlike dealloc_bitmask_subtree,
+    // the skip chain was already consumed to reach BITS, so we go directly
+    // to the final bitmap children without re-navigating the chain.
+    template<int BITS> requires (BITS >= 8)
+    static void dealloc_coalesced_node(uint64_t* node, uint8_t sc,
+                                         ALLOC& alloc) noexcept {
+        dealloc_bm_final<BITS>(node, sc, alloc);
+        dealloc_node(alloc, node, get_header(node)->alloc_u64());
     }
 
     // Leaf skip: narrow NK through prefix bytes then destroy
