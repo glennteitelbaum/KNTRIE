@@ -13,7 +13,7 @@
 #include <cstring>
 
 // ==========================================================================
-// Tracking allocator — measures real heap usage for map/umap
+// Tracking allocator
 // ==========================================================================
 
 static thread_local size_t g_alloc_total = 0;
@@ -35,6 +35,10 @@ struct TrackingAlloc {
     template<typename U> bool operator==(const TrackingAlloc<U>&) const noexcept { return true; }
 };
 
+// ==========================================================================
+// Helpers
+// ==========================================================================
+
 static double now_ms() {
     using clk = std::chrono::high_resolution_clock;
     static auto t0 = clk::now();
@@ -46,26 +50,100 @@ static void do_not_optimize(T const& val) {
     asm volatile("" : : "r,m"(val) : "memory");
 }
 
-using KEY = uint64_t;
+// ==========================================================================
+// big256_t — 256 byte trivially copyable struct for testing C-type path
+// ==========================================================================
+
+struct big256_t {
+    uint8_t data[256] = {};
+    bool operator==(const big256_t&) const = default;
+};
+
+template<> struct std::hash<big256_t> {
+    size_t operator()(const big256_t& b) const noexcept {
+        size_t h = 0;
+        for (size_t i = 0; i < 256; i += 8)
+            h ^= *reinterpret_cast<const size_t*>(b.data + i) + 0x9e3779b97f4a7c15 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+// ==========================================================================
+// val_convert<K,V> — create a V from a K for insertion
+// ==========================================================================
+
+template<typename K, typename V>
+struct val_convert {
+    static V from_key(K k) {
+        if constexpr (std::is_same_v<V, bool>)
+            return static_cast<bool>(k & 1);
+        else if constexpr (std::is_arithmetic_v<V>)
+            return static_cast<V>(k);
+        else if constexpr (std::is_same_v<V, std::string>)
+            return std::to_string(static_cast<uint64_t>(k));
+        else if constexpr (std::is_same_v<V, big256_t>) {
+            big256_t b{};
+            std::memcpy(b.data, &k, std::min(sizeof(k), sizeof(b.data)));
+            return b;
+        }
+        else
+            return V{};
+    }
+};
+
+// ==========================================================================
+// acc — accumulate for do_not_optimize (works with any V)
+// ==========================================================================
+
+template<typename V>
+uint64_t acc(const V* p) {
+    if (!p) return 0;
+    if constexpr (std::is_arithmetic_v<V>)
+        return static_cast<uint64_t>(*p);
+    else if constexpr (std::is_same_v<V, std::string>)
+        return p->size();
+    else if constexpr (std::is_same_v<V, big256_t>)
+        return p->data[0];
+    else
+        return 1;
+}
+
+template<typename V>
+uint64_t acc(const V& v) {
+    return acc(&v);
+}
+
+// ==========================================================================
+// Workload — key generation and test vectors
+// ==========================================================================
 
 struct Workload {
-    std::vector<KEY> keys;          // insert keys
-    std::vector<KEY> erase_keys;    // N/2 keys to erase
-    std::vector<KEY> find_fnd;      // N keys, 100% found, shuffled
-    std::vector<KEY> find_nf;       // N keys, 100% NOT found, shuffled
+    std::vector<uint64_t> keys;
+    std::vector<uint64_t> erase_keys;
+    std::vector<uint64_t> find_fnd;
+    std::vector<uint64_t> find_nf;
     int find_iters;
 };
 
+template<typename K>
 static Workload make_workload(size_t n, const std::string& pattern,
                                int find_iters, std::mt19937_64& rng) {
     Workload w;
     w.find_iters = find_iters;
 
-    std::vector<KEY> raw(n);
+    constexpr uint64_t KEY_MAX = (sizeof(K) >= 8) ? ~uint64_t(0)
+        : (uint64_t(1) << (sizeof(K) * 8)) - 1;
+
+    // Cap n to key range
+    if (n > KEY_MAX / 2) n = static_cast<size_t>(KEY_MAX / 2);
+
+    std::vector<uint64_t> raw(n);
     if (pattern == "sequential") {
-        for (size_t i = 0; i < n; ++i) raw[i] = static_cast<KEY>(i * 2);
+        for (size_t i = 0; i < n; ++i)
+            raw[i] = (i * 2) & KEY_MAX;
     } else {
-        for (size_t i = 0; i < n; ++i) raw[i] = static_cast<KEY>(rng());
+        for (size_t i = 0; i < n; ++i)
+            raw[i] = rng() & KEY_MAX;
     }
     std::sort(raw.begin(), raw.end());
     raw.erase(std::unique(raw.begin(), raw.end()), raw.end());
@@ -76,20 +154,18 @@ static Workload make_workload(size_t n, const std::string& pattern,
     for (size_t i = 0; i < n; i += 2)
         w.erase_keys.push_back(raw[i]);
 
-    // FND: 100% hit
     w.find_fnd = raw;
     std::shuffle(w.find_fnd.begin(), w.find_fnd.end(), rng);
 
-    // NF: 100% not found (within range of inserted keys)
     if (pattern == "sequential") {
         w.find_nf.reserve(n);
         for (size_t i = 0; i < n; ++i)
-            w.find_nf.push_back(static_cast<KEY>(i * 2 + 1));
+            w.find_nf.push_back((i * 2 + 1) & KEY_MAX);
     } else {
-        std::set<KEY> existing(raw.begin(), raw.end());
+        std::set<uint64_t> existing(raw.begin(), raw.end());
         w.find_nf.reserve(n);
         while (w.find_nf.size() < n) {
-            KEY k = static_cast<KEY>(rng());
+            uint64_t k = rng() & KEY_MAX;
             if (!existing.count(k)) {
                 w.find_nf.push_back(k);
                 existing.insert(k);
@@ -109,6 +185,10 @@ static int iters_for(size_t n) {
     else                    return 1;
 }
 
+// ==========================================================================
+// Row + emit_html
+// ==========================================================================
+
 struct Row {
     std::string pattern;
     size_t n;
@@ -123,175 +203,19 @@ struct Row {
 
 constexpr int TRIALS = 3;
 
-static void bench_all(size_t target_n, const std::string& pattern,
-                      std::vector<Row>& rows) {
-    std::mt19937_64 rng(42);
-    int fi = iters_for(target_n);
-    auto w = make_workload(target_n, pattern, fi, rng);
-    size_t n = w.keys.size();
-    bool do_map = (n <= 1000000);
-
-    // Memory: one tracked run per container
-    size_t kntrie_mem, map_mem = 0, umap_mem;
-    {
-        using TrieT = gteitelbaum::kntrie<KEY, uint64_t, TrackingAlloc<uint64_t>>;
-        g_alloc_total = 0;
-        TrieT trie;
-        for (auto k : w.keys) trie.insert(k, static_cast<uint64_t>(k));
-        kntrie_mem = g_alloc_total;
-    }
-    if (do_map) {
-        using MapT = std::map<KEY, uint64_t, std::less<KEY>,
-                              TrackingAlloc<std::pair<const KEY, uint64_t>>>;
-        g_alloc_total = 0;
-        MapT m;
-        for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
-        map_mem = g_alloc_total;
-    }
-    {
-        using UMapT = std::unordered_map<KEY, uint64_t, std::hash<KEY>, std::equal_to<KEY>,
-                                          TrackingAlloc<std::pair<const KEY, uint64_t>>>;
-        g_alloc_total = 0;
-        UMapT m;
-        m.reserve(w.keys.size());
-        for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
-        umap_mem = g_alloc_total;
-    }
-
-    // Pre-generate find orders (shared across containers)
-    std::vector<std::vector<KEY>> fnd_orders(fi), nf_orders(fi);
-    for (int r = 0; r < fi; ++r) {
-        fnd_orders[r] = w.find_fnd;
-        std::shuffle(fnd_orders[r].begin(), fnd_orders[r].end(), rng);
-        nf_orders[r] = w.find_nf;
-        std::shuffle(nf_orders[r].begin(), nf_orders[r].end(), rng);
-    }
-
-    double k_fnd = 1e18, k_nf = 1e18, k_ins = 1e18, k_ers = 1e18, k_iter = 1e18;
-    double m_fnd = 1e18, m_nf = 1e18, m_ins = 1e18, m_ers = 1e18, m_iter = 1e18;
-    double u_fnd = 1e18, u_nf = 1e18, u_ins = 1e18, u_ers = 1e18, u_iter = 1e18;
-
-    for (int t = 0; t < TRIALS; ++t) {
-        // --- kntrie ---
-        std::shuffle(w.keys.begin(), w.keys.end(), rng);
-        {
-            gteitelbaum::kntrie<KEY, uint64_t> trie;
-            double t0 = now_ms();
-            for (auto k : w.keys) trie.insert(k, static_cast<uint64_t>(k));
-            k_ins = std::min(k_ins, now_ms() - t0);
-
-            { uint64_t is = 0; double ti = now_ms();
-              for (const auto& [k,v] : trie) is += v;
-              k_iter = std::min(k_iter, now_ms() - ti); do_not_optimize(is); }
-
-            uint64_t cs = 0;
-            double t1 = now_ms();
-            for (int r = 0; r < fi; ++r)
-                for (auto k : fnd_orders[r]) { auto* v = trie.find_value(k); cs += v ? *v : 0; }
-            k_fnd = std::min(k_fnd, (now_ms() - t1) / fi);
-            do_not_optimize(cs);
-
-            cs = 0;
-            double t1n = now_ms();
-            for (int r = 0; r < fi; ++r)
-                for (auto k : nf_orders[r]) { auto* v = trie.find_value(k); cs += v ? *v : 0; }
-            k_nf = std::min(k_nf, (now_ms() - t1n) / fi);
-            do_not_optimize(cs);
-
-            std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
-            double t2 = now_ms();
-            for (auto k : w.erase_keys) trie.erase(k);
-            k_ers = std::min(k_ers, now_ms() - t2);
-        }
-
-        // --- map ---
-        if (do_map) {
-            std::shuffle(w.keys.begin(), w.keys.end(), rng);
-            std::map<KEY, uint64_t> m;
-            double t0 = now_ms();
-            for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
-            m_ins = std::min(m_ins, now_ms() - t0);
-
-            { uint64_t is = 0; double ti = now_ms();
-              for (auto& [k,v] : m) is += v;
-              m_iter = std::min(m_iter, now_ms() - ti); do_not_optimize(is); }
-
-            uint64_t cs = 0;
-            double t1 = now_ms();
-            for (int r = 0; r < fi; ++r)
-                for (auto k : fnd_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
-            m_fnd = std::min(m_fnd, (now_ms() - t1) / fi);
-            do_not_optimize(cs);
-
-            cs = 0;
-            double t1n = now_ms();
-            for (int r = 0; r < fi; ++r)
-                for (auto k : nf_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
-            m_nf = std::min(m_nf, (now_ms() - t1n) / fi);
-            do_not_optimize(cs);
-
-            std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
-            double t2 = now_ms();
-            for (auto k : w.erase_keys) m.erase(k);
-            m_ers = std::min(m_ers, now_ms() - t2);
-        }
-
-        // --- umap ---
-        std::shuffle(w.keys.begin(), w.keys.end(), rng);
-        {
-            std::unordered_map<KEY, uint64_t> m;
-            m.reserve(w.keys.size());
-            double t0 = now_ms();
-            for (auto k : w.keys) m.emplace(k, static_cast<uint64_t>(k));
-            u_ins = std::min(u_ins, now_ms() - t0);
-
-            { uint64_t is = 0; double ti = now_ms();
-              for (auto& [k,v] : m) is += v;
-              u_iter = std::min(u_iter, now_ms() - ti); do_not_optimize(is); }
-
-            uint64_t cs = 0;
-            double t1 = now_ms();
-            for (int r = 0; r < fi; ++r)
-                for (auto k : fnd_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
-            u_fnd = std::min(u_fnd, (now_ms() - t1) / fi);
-            do_not_optimize(cs);
-
-            cs = 0;
-            double t1n = now_ms();
-            for (int r = 0; r < fi; ++r)
-                for (auto k : nf_orders[r]) { auto it = m.find(k); cs += (it != m.end()) ? it->second : 0; }
-            u_nf = std::min(u_nf, (now_ms() - t1n) / fi);
-            do_not_optimize(cs);
-
-            std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
-            double t2 = now_ms();
-            for (auto k : w.erase_keys) m.erase(k);
-            u_ers = std::min(u_ers, now_ms() - t2);
-        }
-    }
-
-    rows.push_back({pattern, n, "kntrie", k_fnd, k_nf, k_ins, k_ers, k_iter, kntrie_mem});
-    if (do_map)
-        rows.push_back({pattern, n, "map", m_fnd, m_nf, m_ins, m_ers, m_iter, map_mem});
-    rows.push_back({pattern, n, "umap", u_fnd, u_nf, u_ins, u_ers, u_iter, umap_mem});
-}
-
-// ==========================================================================
-// HTML output — self-contained page with Chart.js from CDN
-// ==========================================================================
-
-static void emit_html(const std::vector<Row>& rows) {
+static void emit_html(const std::vector<Row>& rows,
+                      const char* key_name, const char* val_name) {
     struct DataPoint {
         std::string pattern;
         size_t N;
-        double vals[3][6]; // [kntrie=0, map=1, umap=2] x [fnd, nf, insert, erase, iter, mem]
+        double vals[3][6];
         bool has[3];
     };
 
     auto cidx = [](const char* c) -> int {
         if (std::strcmp(c, "kntrie") == 0) return 0;
         if (std::strcmp(c, "map") == 0) return 1;
-        return 2; // umap
+        return 2;
     };
 
     std::vector<DataPoint> points;
@@ -327,8 +251,7 @@ static void emit_html(const std::vector<Row>& rows) {
     const char* names[] = {"kntrie", "map", "umap"};
     const char* suffixes[] = {"fnd", "nf", "insert", "erase", "iter", "mem"};
 
-    // HTML preamble
-    std::printf("%s", R"HTML(<!DOCTYPE html>
+    std::printf(R"HTML(<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
@@ -351,8 +274,8 @@ static void emit_html(const std::vector<Row>& rows) {
 </head>
 <body>
 <div class="wrap">
-  <h2>kntrie Benchmark (u64)</h2>
-  <p class="sub">Log-log · Per-entry · Lower is better · FND=100% hit, NF=100% miss</p>
+  <h2>kntrie Benchmark (%s &rarr; %s)</h2>
+  <p class="sub">Log-log &middot; Per-entry &middot; Lower is better &middot; FND=100%% hit, NF=100%% miss</p>
   <div class="btns">
     <button class="active" onclick="show('random')">random</button>
     <button onclick="show('sequential')">sequential</button>
@@ -364,9 +287,8 @@ static void emit_html(const std::vector<Row>& rows) {
   <div class="chart-box"><h3>Memory (B/entry)</h3><canvas id="c_mem"></canvas></div>
 </div>
 <script>
-)HTML");
+)HTML", key_name, val_name);
 
-    // Emit data blob
     std::printf("const RAW_DATA = [\n");
     for (auto& p : points) {
         std::printf("  {pattern:\"%s\",N:%zu", p.pattern.c_str(), p.N);
@@ -383,7 +305,6 @@ static void emit_html(const std::vector<Row>& rows) {
     }
     std::printf("];\n\n");
 
-    // Chart.js template
     std::printf("%s",
 R"JS(
 const LINES_FIND = [
@@ -532,23 +453,372 @@ function show(pattern) {
     std::printf("</script>\n</body>\n</html>\n");
 }
 
-int main(int argc, char* argv[]) {
+// ==========================================================================
+// bench_all<K,V> — templated benchmark core
+// ==========================================================================
+
+template<typename K, typename V>
+static void bench_all(size_t target_n, const std::string& pattern,
+                      std::vector<Row>& rows, bool verbose) {
+    using VC = val_convert<K, V>;
+    std::mt19937_64 rng(42);
+    int fi = iters_for(target_n);
+    auto w = make_workload<K>(target_n, pattern, fi, rng);
+    size_t n = w.keys.size();
+    bool do_map = (n <= 1000000);
+
+    if (verbose)
+        std::fprintf(stderr, "%s N=%zu...\n", pattern.c_str(), n);
+
+    // Memory: one tracked run per container
+    size_t kntrie_mem, map_mem = 0, umap_mem;
+    {
+        using TrieT = gteitelbaum::kntrie<K, V, TrackingAlloc<uint64_t>>;
+        g_alloc_total = 0;
+        TrieT trie;
+        for (auto k : w.keys) trie.insert(static_cast<K>(k), VC::from_key(static_cast<K>(k)));
+        trie.shrink_to_fit();
+        kntrie_mem = g_alloc_total;
+    }
+    if (do_map) {
+        using MapT = std::map<K, V, std::less<K>,
+                              TrackingAlloc<std::pair<const K, V>>>;
+        g_alloc_total = 0;
+        MapT m;
+        for (auto k : w.keys) m.emplace(static_cast<K>(k), VC::from_key(static_cast<K>(k)));
+        map_mem = g_alloc_total;
+    }
+    {
+        using UMapT = std::unordered_map<K, V, std::hash<K>, std::equal_to<K>,
+                                          TrackingAlloc<std::pair<const K, V>>>;
+        g_alloc_total = 0;
+        UMapT m;
+        m.reserve(w.keys.size());
+        for (auto k : w.keys) m.emplace(static_cast<K>(k), VC::from_key(static_cast<K>(k)));
+        umap_mem = g_alloc_total;
+    }
+
+    // Pre-generate find orders
+    std::vector<std::vector<uint64_t>> fnd_orders(fi), nf_orders(fi);
+    for (int r = 0; r < fi; ++r) {
+        fnd_orders[r] = w.find_fnd;
+        std::shuffle(fnd_orders[r].begin(), fnd_orders[r].end(), rng);
+        nf_orders[r] = w.find_nf;
+        std::shuffle(nf_orders[r].begin(), nf_orders[r].end(), rng);
+    }
+
+    double k_fnd = 1e18, k_nf = 1e18, k_ins = 1e18, k_ers = 1e18, k_iter = 1e18;
+    double m_fnd = 1e18, m_nf = 1e18, m_ins = 1e18, m_ers = 1e18, m_iter = 1e18;
+    double u_fnd = 1e18, u_nf = 1e18, u_ins = 1e18, u_ers = 1e18, u_iter = 1e18;
+
+    for (int t = 0; t < TRIALS; ++t) {
+        // --- kntrie ---
+        std::shuffle(w.keys.begin(), w.keys.end(), rng);
+        {
+            gteitelbaum::kntrie<K, V> trie;
+            double t0 = now_ms();
+            for (auto k : w.keys) trie.insert(static_cast<K>(k), VC::from_key(static_cast<K>(k)));
+            k_ins = std::min(k_ins, now_ms() - t0);
+
+            { uint64_t is = 0; double ti = now_ms();
+              for (const auto& [k,v] : trie) is += acc(v);
+              k_iter = std::min(k_iter, now_ms() - ti); do_not_optimize(is); }
+
+            uint64_t cs = 0;
+            double t1 = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : fnd_orders[r]) { auto* v = trie.find_value(static_cast<K>(k)); cs += acc(v); }
+            k_fnd = std::min(k_fnd, (now_ms() - t1) / fi);
+            do_not_optimize(cs);
+
+            cs = 0;
+            double t1n = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : nf_orders[r]) { auto* v = trie.find_value(static_cast<K>(k)); cs += acc(v); }
+            k_nf = std::min(k_nf, (now_ms() - t1n) / fi);
+            do_not_optimize(cs);
+
+            std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
+            double t2 = now_ms();
+            for (auto k : w.erase_keys) trie.erase(static_cast<K>(k));
+            k_ers = std::min(k_ers, now_ms() - t2);
+        }
+
+        // --- map ---
+        if (do_map) {
+            std::shuffle(w.keys.begin(), w.keys.end(), rng);
+            std::map<K, V> m;
+            double t0 = now_ms();
+            for (auto k : w.keys) m.emplace(static_cast<K>(k), VC::from_key(static_cast<K>(k)));
+            m_ins = std::min(m_ins, now_ms() - t0);
+
+            { uint64_t is = 0; double ti = now_ms();
+              for (auto& [k,v] : m) is += acc(v);
+              m_iter = std::min(m_iter, now_ms() - ti); do_not_optimize(is); }
+
+            uint64_t cs = 0;
+            double t1 = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : fnd_orders[r]) { auto it = m.find(static_cast<K>(k)); cs += (it != m.end()) ? acc(it->second) : 0; }
+            m_fnd = std::min(m_fnd, (now_ms() - t1) / fi);
+            do_not_optimize(cs);
+
+            cs = 0;
+            double t1n = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : nf_orders[r]) { auto it = m.find(static_cast<K>(k)); cs += (it != m.end()) ? acc(it->second) : 0; }
+            m_nf = std::min(m_nf, (now_ms() - t1n) / fi);
+            do_not_optimize(cs);
+
+            std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
+            double t2 = now_ms();
+            for (auto k : w.erase_keys) m.erase(static_cast<K>(k));
+            m_ers = std::min(m_ers, now_ms() - t2);
+        }
+
+        // --- umap ---
+        std::shuffle(w.keys.begin(), w.keys.end(), rng);
+        {
+            std::unordered_map<K, V> m;
+            m.reserve(w.keys.size());
+            double t0 = now_ms();
+            for (auto k : w.keys) m.emplace(static_cast<K>(k), VC::from_key(static_cast<K>(k)));
+            u_ins = std::min(u_ins, now_ms() - t0);
+
+            { uint64_t is = 0; double ti = now_ms();
+              for (auto& [k,v] : m) is += acc(v);
+              u_iter = std::min(u_iter, now_ms() - ti); do_not_optimize(is); }
+
+            uint64_t cs = 0;
+            double t1 = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : fnd_orders[r]) { auto it = m.find(static_cast<K>(k)); cs += (it != m.end()) ? acc(it->second) : 0; }
+            u_fnd = std::min(u_fnd, (now_ms() - t1) / fi);
+            do_not_optimize(cs);
+
+            cs = 0;
+            double t1n = now_ms();
+            for (int r = 0; r < fi; ++r)
+                for (auto k : nf_orders[r]) { auto it = m.find(static_cast<K>(k)); cs += (it != m.end()) ? acc(it->second) : 0; }
+            u_nf = std::min(u_nf, (now_ms() - t1n) / fi);
+            do_not_optimize(cs);
+
+            std::shuffle(w.erase_keys.begin(), w.erase_keys.end(), rng);
+            double t2 = now_ms();
+            for (auto k : w.erase_keys) m.erase(static_cast<K>(k));
+            u_ers = std::min(u_ers, now_ms() - t2);
+        }
+    }
+
+    rows.push_back({pattern, n, "kntrie", k_fnd, k_nf, k_ins, k_ers, k_iter, kntrie_mem});
+    if (do_map)
+        rows.push_back({pattern, n, "map", m_fnd, m_nf, m_ins, m_ers, m_iter, map_mem});
+    rows.push_back({pattern, n, "umap", u_fnd, u_nf, u_ins, u_ers, u_iter, umap_mem});
+}
+
+// ==========================================================================
+// run_bench<K,V> — top-level for a given K,V pair
+// ==========================================================================
+
+template<typename K, typename V>
+static void run_bench(size_t max_n, bool verbose,
+                      const char* key_name, const char* val_name) {
     std::vector<size_t> sizes;
-    double MAX_N = 3000000;
-    if (argc > 1) MAX_N = std::atof(argv[1]);
-    for (double n = 100; n < MAX_N; n *= 1.5)
+    for (double n = 100; n < static_cast<double>(max_n); n *= 1.5)
         sizes.push_back(static_cast<size_t>(n));
 
     const char* patterns[] = {"random", "sequential"};
     std::vector<Row> rows;
 
-    for (auto* pat : patterns) {
-        for (auto n : sizes) {
-            std::fprintf(stderr, "u64 %s N=%zu...\n", pat, n);
-            bench_all(n, pat, rows);
-        }
+    for (auto* pat : patterns)
+        for (auto n : sizes)
+            bench_all<K, V>(n, pat, rows, verbose);
+
+    emit_html(rows, key_name, val_name);
+}
+
+// ==========================================================================
+// Dispatch — nested switch on key type x value type
+// ==========================================================================
+
+enum type_id {
+    T_BOOL, T_U8, T_I8, T_U16, T_I16, T_U32, T_I32, T_U64, T_I64,
+    T_STRING, T_BIG256, T_INVALID
+};
+
+static type_id parse_type(const char* s) {
+    if (!std::strcmp(s, "bool"))   return T_BOOL;
+    if (!std::strcmp(s, "u8"))     return T_U8;
+    if (!std::strcmp(s, "i8"))     return T_I8;
+    if (!std::strcmp(s, "u16"))    return T_U16;
+    if (!std::strcmp(s, "i16"))    return T_I16;
+    if (!std::strcmp(s, "u32"))    return T_U32;
+    if (!std::strcmp(s, "i32"))    return T_I32;
+    if (!std::strcmp(s, "u64"))    return T_U64;
+    if (!std::strcmp(s, "i64"))    return T_I64;
+    if (!std::strcmp(s, "string")) return T_STRING;
+    if (!std::strcmp(s, "big256")) return T_BIG256;
+    return T_INVALID;
+}
+
+
+int main(int argc, char* argv[]) {
+    if (argc != 5) {
+        std::fprintf(stderr,
+            "Usage: %s <key_type> <val_type> <max_entries> <verbose:y/n>\n"
+            "  Key types:   u8 i8 u16 i16 u32 i32 u64 i64\n"
+            "  Value types: bool u8 i8 u16 i16 u32 i32 u64 i64 string big256\n"
+            "  Example: %s u64 i32 6000000 y\n",
+            argv[0], argv[0]);
+        return 1;
     }
 
-    emit_html(rows);
+    const char* kn = argv[1];
+    const char* vn = argv[2];
+    size_t max_n = static_cast<size_t>(std::atof(argv[3]));
+    bool verbose = (argv[4][0] == 'y' || argv[4][0] == 'Y');
+
+    type_id kt = parse_type(kn);
+    type_id vt = parse_type(vn);
+
+    if (kt == T_INVALID || kt == T_STRING || kt == T_BIG256 || kt == T_BOOL) {
+        std::fprintf(stderr, "Invalid key type: %s (must be u8/i8/u16/i16/u32/i32/u64/i64)\n", kn);
+        return 1;
+    }
+    if (vt == T_INVALID) {
+        std::fprintf(stderr, "Invalid value type: %s\n", vn);
+        return 1;
+    }
+
+    switch (kt) {
+        case T_U8:
+            switch (vt) {
+                case T_BOOL:   run_bench<uint8_t, bool>       (max_n, verbose, kn, vn); break;
+                case T_U8:     run_bench<uint8_t, uint8_t>    (max_n, verbose, kn, vn); break;
+                case T_I8:     run_bench<uint8_t, int8_t>     (max_n, verbose, kn, vn); break;
+                case T_U16:    run_bench<uint8_t, uint16_t>   (max_n, verbose, kn, vn); break;
+                case T_I16:    run_bench<uint8_t, int16_t>    (max_n, verbose, kn, vn); break;
+                case T_U32:    run_bench<uint8_t, uint32_t>   (max_n, verbose, kn, vn); break;
+                case T_I32:    run_bench<uint8_t, int32_t>    (max_n, verbose, kn, vn); break;
+                case T_U64:    run_bench<uint8_t, uint64_t>   (max_n, verbose, kn, vn); break;
+                case T_I64:    run_bench<uint8_t, int64_t>    (max_n, verbose, kn, vn); break;
+                case T_STRING: run_bench<uint8_t, std::string>(max_n, verbose, kn, vn); break;
+                case T_BIG256: run_bench<uint8_t, big256_t>   (max_n, verbose, kn, vn); break;
+                default: goto bad_val;
+            } break;
+        case T_I8:
+            switch (vt) {
+                case T_BOOL:   run_bench<int8_t, bool>       (max_n, verbose, kn, vn); break;
+                case T_U8:     run_bench<int8_t, uint8_t>    (max_n, verbose, kn, vn); break;
+                case T_I8:     run_bench<int8_t, int8_t>     (max_n, verbose, kn, vn); break;
+                case T_U16:    run_bench<int8_t, uint16_t>   (max_n, verbose, kn, vn); break;
+                case T_I16:    run_bench<int8_t, int16_t>    (max_n, verbose, kn, vn); break;
+                case T_U32:    run_bench<int8_t, uint32_t>   (max_n, verbose, kn, vn); break;
+                case T_I32:    run_bench<int8_t, int32_t>    (max_n, verbose, kn, vn); break;
+                case T_U64:    run_bench<int8_t, uint64_t>   (max_n, verbose, kn, vn); break;
+                case T_I64:    run_bench<int8_t, int64_t>    (max_n, verbose, kn, vn); break;
+                case T_STRING: run_bench<int8_t, std::string>(max_n, verbose, kn, vn); break;
+                case T_BIG256: run_bench<int8_t, big256_t>   (max_n, verbose, kn, vn); break;
+                default: goto bad_val;
+            } break;
+        case T_U16:
+            switch (vt) {
+                case T_BOOL:   run_bench<uint16_t, bool>       (max_n, verbose, kn, vn); break;
+                case T_U8:     run_bench<uint16_t, uint8_t>    (max_n, verbose, kn, vn); break;
+                case T_I8:     run_bench<uint16_t, int8_t>     (max_n, verbose, kn, vn); break;
+                case T_U16:    run_bench<uint16_t, uint16_t>   (max_n, verbose, kn, vn); break;
+                case T_I16:    run_bench<uint16_t, int16_t>    (max_n, verbose, kn, vn); break;
+                case T_U32:    run_bench<uint16_t, uint32_t>   (max_n, verbose, kn, vn); break;
+                case T_I32:    run_bench<uint16_t, int32_t>    (max_n, verbose, kn, vn); break;
+                case T_U64:    run_bench<uint16_t, uint64_t>   (max_n, verbose, kn, vn); break;
+                case T_I64:    run_bench<uint16_t, int64_t>    (max_n, verbose, kn, vn); break;
+                case T_STRING: run_bench<uint16_t, std::string>(max_n, verbose, kn, vn); break;
+                case T_BIG256: run_bench<uint16_t, big256_t>   (max_n, verbose, kn, vn); break;
+                default: goto bad_val;
+            } break;
+        case T_I16:
+            switch (vt) {
+                case T_BOOL:   run_bench<int16_t, bool>       (max_n, verbose, kn, vn); break;
+                case T_U8:     run_bench<int16_t, uint8_t>    (max_n, verbose, kn, vn); break;
+                case T_I8:     run_bench<int16_t, int8_t>     (max_n, verbose, kn, vn); break;
+                case T_U16:    run_bench<int16_t, uint16_t>   (max_n, verbose, kn, vn); break;
+                case T_I16:    run_bench<int16_t, int16_t>    (max_n, verbose, kn, vn); break;
+                case T_U32:    run_bench<int16_t, uint32_t>   (max_n, verbose, kn, vn); break;
+                case T_I32:    run_bench<int16_t, int32_t>    (max_n, verbose, kn, vn); break;
+                case T_U64:    run_bench<int16_t, uint64_t>   (max_n, verbose, kn, vn); break;
+                case T_I64:    run_bench<int16_t, int64_t>    (max_n, verbose, kn, vn); break;
+                case T_STRING: run_bench<int16_t, std::string>(max_n, verbose, kn, vn); break;
+                case T_BIG256: run_bench<int16_t, big256_t>   (max_n, verbose, kn, vn); break;
+                default: goto bad_val;
+            } break;
+        case T_U32:
+            switch (vt) {
+                case T_BOOL:   run_bench<uint32_t, bool>       (max_n, verbose, kn, vn); break;
+                case T_U8:     run_bench<uint32_t, uint8_t>    (max_n, verbose, kn, vn); break;
+                case T_I8:     run_bench<uint32_t, int8_t>     (max_n, verbose, kn, vn); break;
+                case T_U16:    run_bench<uint32_t, uint16_t>   (max_n, verbose, kn, vn); break;
+                case T_I16:    run_bench<uint32_t, int16_t>    (max_n, verbose, kn, vn); break;
+                case T_U32:    run_bench<uint32_t, uint32_t>   (max_n, verbose, kn, vn); break;
+                case T_I32:    run_bench<uint32_t, int32_t>    (max_n, verbose, kn, vn); break;
+                case T_U64:    run_bench<uint32_t, uint64_t>   (max_n, verbose, kn, vn); break;
+                case T_I64:    run_bench<uint32_t, int64_t>    (max_n, verbose, kn, vn); break;
+                case T_STRING: run_bench<uint32_t, std::string>(max_n, verbose, kn, vn); break;
+                case T_BIG256: run_bench<uint32_t, big256_t>   (max_n, verbose, kn, vn); break;
+                default: goto bad_val;
+            } break;
+        case T_I32:
+            switch (vt) {
+                case T_BOOL:   run_bench<int32_t, bool>       (max_n, verbose, kn, vn); break;
+                case T_U8:     run_bench<int32_t, uint8_t>    (max_n, verbose, kn, vn); break;
+                case T_I8:     run_bench<int32_t, int8_t>     (max_n, verbose, kn, vn); break;
+                case T_U16:    run_bench<int32_t, uint16_t>   (max_n, verbose, kn, vn); break;
+                case T_I16:    run_bench<int32_t, int16_t>    (max_n, verbose, kn, vn); break;
+                case T_U32:    run_bench<int32_t, uint32_t>   (max_n, verbose, kn, vn); break;
+                case T_I32:    run_bench<int32_t, int32_t>    (max_n, verbose, kn, vn); break;
+                case T_U64:    run_bench<int32_t, uint64_t>   (max_n, verbose, kn, vn); break;
+                case T_I64:    run_bench<int32_t, int64_t>    (max_n, verbose, kn, vn); break;
+                case T_STRING: run_bench<int32_t, std::string>(max_n, verbose, kn, vn); break;
+                case T_BIG256: run_bench<int32_t, big256_t>   (max_n, verbose, kn, vn); break;
+                default: goto bad_val;
+            } break;
+        case T_U64:
+            switch (vt) {
+                case T_BOOL:   run_bench<uint64_t, bool>       (max_n, verbose, kn, vn); break;
+                case T_U8:     run_bench<uint64_t, uint8_t>    (max_n, verbose, kn, vn); break;
+                case T_I8:     run_bench<uint64_t, int8_t>     (max_n, verbose, kn, vn); break;
+                case T_U16:    run_bench<uint64_t, uint16_t>   (max_n, verbose, kn, vn); break;
+                case T_I16:    run_bench<uint64_t, int16_t>    (max_n, verbose, kn, vn); break;
+                case T_U32:    run_bench<uint64_t, uint32_t>   (max_n, verbose, kn, vn); break;
+                case T_I32:    run_bench<uint64_t, int32_t>    (max_n, verbose, kn, vn); break;
+                case T_U64:    run_bench<uint64_t, uint64_t>   (max_n, verbose, kn, vn); break;
+                case T_I64:    run_bench<uint64_t, int64_t>    (max_n, verbose, kn, vn); break;
+                case T_STRING: run_bench<uint64_t, std::string>(max_n, verbose, kn, vn); break;
+                case T_BIG256: run_bench<uint64_t, big256_t>   (max_n, verbose, kn, vn); break;
+                default: goto bad_val;
+            } break;
+        case T_I64:
+            switch (vt) {
+                case T_BOOL:   run_bench<int64_t, bool>       (max_n, verbose, kn, vn); break;
+                case T_U8:     run_bench<int64_t, uint8_t>    (max_n, verbose, kn, vn); break;
+                case T_I8:     run_bench<int64_t, int8_t>     (max_n, verbose, kn, vn); break;
+                case T_U16:    run_bench<int64_t, uint16_t>   (max_n, verbose, kn, vn); break;
+                case T_I16:    run_bench<int64_t, int16_t>    (max_n, verbose, kn, vn); break;
+                case T_U32:    run_bench<int64_t, uint32_t>   (max_n, verbose, kn, vn); break;
+                case T_I32:    run_bench<int64_t, int32_t>    (max_n, verbose, kn, vn); break;
+                case T_U64:    run_bench<int64_t, uint64_t>   (max_n, verbose, kn, vn); break;
+                case T_I64:    run_bench<int64_t, int64_t>    (max_n, verbose, kn, vn); break;
+                case T_STRING: run_bench<int64_t, std::string>(max_n, verbose, kn, vn); break;
+                case T_BIG256: run_bench<int64_t, big256_t>   (max_n, verbose, kn, vn); break;
+                default: goto bad_val;
+            } break;
+        default:
+            std::fprintf(stderr, "Invalid key type: %s\n", kn);
+            return 1;
+    }
+
     return 0;
+
+bad_val:
+    std::fprintf(stderr, "Invalid value type: %s\n", vn);
+    return 1;
 }
