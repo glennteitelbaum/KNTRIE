@@ -87,68 +87,66 @@ struct bitmap_256_t {
 
     struct adj_result { uint8_t idx; uint16_t slot; bool found; };
 
-    // Find smallest set bit > idx, with its slot.
+    // Find smallest set bit > idx, with its slot. Fully branchless.
     adj_result next_set_after(uint8_t idx) const noexcept {
-        if (idx == 255) [[unlikely]] return {0, 0, false};
-        int start = idx + 1;
-        int w = start >> 6, b = start & 63;
+        unsigned start = (unsigned(idx) + 1) & 255;
+        unsigned sw = start >> 6;
+        unsigned sb = start & 63;
 
-        // Branchless prefix popcount (same pattern as find_slot)
-        int slot = std::popcount(words[0]) & -int(w > 0);
-        slot += std::popcount(words[1]) & -int(w > 1);
-        slot += std::popcount(words[2]) & -int(w > 2);
+        // Zero words before sw, partial-mask only the start word
+        uint64_t m[4] = {words[0], words[1], words[2], words[3]};
+        m[0] &= -uint64_t(0 >= sw);
+        m[1] &= -uint64_t(1 >= sw);
+        m[2] &= -uint64_t(2 >= sw);
+        m[sw & 3] &= (~0ULL << sb);
 
-        // Mask out bits below start in starting word
-        uint64_t m = words[w] & (~0ULL << b);
-        if (m) {
-            int bit = (w << 6) + std::countr_zero(m);
-            slot += std::popcount(words[w] & ((1ULL << (bit & 63)) - 1));
-            return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
-        }
-        slot += std::popcount(words[w]);
+        // First non-zero masked word
+        int fw = !m[0] + (!m[0] & !m[1]) + (!m[0] & !m[1] & !m[2]);
+        int biw = std::countr_zero(m[fw]);
+        int bit = (fw << 6) + biw;
 
-        // Search remaining words (at most 3 iterations, typically 0-1)
-        for (int ww = w + 1; ww < 4; ++ww) {
-            if (words[ww]) {
-                int bit = (ww << 6) + std::countr_zero(words[ww]);
-                slot += std::popcount(words[ww] & ((1ULL << (bit & 63)) - 1));
-                return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
-            }
-            slot += std::popcount(words[ww]);
-        }
-        return {0, 0, false};
+        // Slot (find_slot<BRANCHLESS> on original words)
+        uint64_t before = words[fw] << ((63 - biw) & 63);
+        int slot = std::popcount(before) - 1;
+        slot += std::popcount(words[0]) & -int(fw > 0);
+        slot += std::popcount(words[1]) & -int(fw > 1);
+        slot += std::popcount(words[2]) & -int(fw > 2);
+
+        // idx=255: start wraps to 0, finds lowest bit, uint8_t(bit) > 255 → false
+        // empty bitmap: ctz(0)=64, bit≥256, uint8_t(bit) > idx → false
+        return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot),
+                static_cast<uint8_t>(bit) > idx};
     }
 
-    // Find largest set bit < idx, with its slot.
+    // Find largest set bit < idx, with its slot. Fully branchless.
     adj_result prev_set_before(uint8_t idx) const noexcept {
-        if (idx == 0) [[unlikely]] return {0, 0, false};
-        int last = idx - 1;
-        int w = last >> 6, b = last & 63;
+        unsigned last = (unsigned(idx) - 1) & 255;
+        unsigned ew = last >> 6;
+        unsigned eb = last & 63;
 
-        // Mask off bits above 'last' in starting word
-        uint64_t m = words[w] & ((2ULL << b) - 1);
-        if (m) {
-            int bit = (w << 6) + 63 - std::countl_zero(m);
-            // Branchless prefix popcount
-            int slot = std::popcount(words[0]) & -int(w > 0);
-            slot += std::popcount(words[1]) & -int(w > 1);
-            slot += std::popcount(words[2]) & -int(w > 2);
-            slot += std::popcount(m & ((1ULL << (bit & 63)) - 1));
-            return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
-        }
+        // Zero words after ew, partial-mask only the end word
+        uint64_t m[4] = {words[0], words[1], words[2], words[3]};
+        m[3] &= -uint64_t(3 <= ew);
+        m[2] &= -uint64_t(2 <= ew);
+        m[1] &= -uint64_t(1 <= ew);
+        m[ew & 3] &= ~0ULL >> (63 - eb);
 
-        // Search lower words
-        for (int ww = w - 1; ww >= 0; --ww) {
-            if (words[ww]) {
-                int bit = (ww << 6) + 63 - std::countl_zero(words[ww]);
-                int slot = std::popcount(words[0]) & -int(ww > 0);
-                slot += std::popcount(words[1]) & -int(ww > 1);
-                slot += std::popcount(words[2]) & -int(ww > 2);
-                slot += std::popcount(words[ww] & ((1ULL << (bit & 63)) - 1));
-                return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot), true};
-            }
-        }
-        return {0, 0, false};
+        // Last non-zero masked word
+        int lw = 3 - !m[3] - (!m[3] & !m[2]) - (!m[3] & !m[2] & !m[1]);
+        int biw = 63 - std::countl_zero(m[lw]);
+        int bit = (lw << 6) + biw;
+
+        // Slot (find_slot<BRANCHLESS> on original words)
+        uint64_t before = words[lw] << ((63 - biw) & 63);
+        int slot = std::popcount(before) - 1;
+        slot += std::popcount(words[0]) & -int(lw > 0);
+        slot += std::popcount(words[1]) & -int(lw > 1);
+        slot += std::popcount(words[2]) & -int(lw > 2);
+
+        // idx=0: last wraps to 255, finds highest bit, uint8_t(bit) < 0 → false
+        // empty bitmap: clz(0)=64, bit=-1, uint8_t(255) < idx → false
+        return {static_cast<uint8_t>(bit), static_cast<uint16_t>(slot),
+                static_cast<uint8_t>(bit) < idx};
     }
 
     static bitmap_256_t from_indices(const uint8_t* indices, unsigned count) noexcept {
