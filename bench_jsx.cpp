@@ -472,7 +472,7 @@ static void bench_all(size_t target_n, const std::string& pattern,
     int fi = iters_for(target_n);
     auto w = make_workload<K>(target_n, pattern, fi, rng);
     size_t n = w.keys.size();
-    bool do_map = (n <= 1000000);
+    bool do_map = (n <= 250000);
 
     if (verbose)
         std::fprintf(stderr, "%s N=%zu...\n", pattern.c_str(), n);
