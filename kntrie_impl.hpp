@@ -86,6 +86,10 @@ public:
         size_v = 0;
     }
 
+    void shrink_to_fit() noexcept {
+        bld_v.drain();
+    }
+
     // ==================================================================
     // Find — delegates to kntrie_ops<NK0, VALUE, ALLOC>
     // ==================================================================

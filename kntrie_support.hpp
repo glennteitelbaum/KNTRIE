@@ -456,12 +456,16 @@ struct builder<VALUE, true, ALLOC> {
     uint64_t* alloc_node(size_t u64_count) {
         int bin = bin_for(u64_count);
         if (bin < static_cast<int>(NUM_BINS)) {
+            size_t actual = BIN_SIZES[bin];
             if (bins_v[bin]) {
                 uint64_t* p = bins_v[bin];
                 bins_v[bin] = reinterpret_cast<uint64_t*>(p[0]);
-                std::memset(p, 0, u64_count * 8);
+                std::memset(p, 0, actual * 8);
                 return p;
             }
+            uint64_t* p = alloc_v.allocate(actual);
+            std::memset(p, 0, actual * 8);
+            return p;
         }
         uint64_t* p = alloc_v.allocate(u64_count);
         std::memset(p, 0, u64_count * 8);

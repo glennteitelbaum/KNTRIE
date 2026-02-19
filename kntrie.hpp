@@ -196,6 +196,7 @@ public:
     }
 
     void clear() noexcept { impl_.clear(); }
+    void shrink_to_fit() noexcept { impl_.shrink_to_fit(); }
     size_type erase(const KEY& key) { return impl_.erase(to_unsigned(key)) ? 1 : 0; }
 
     iterator erase(const_iterator pos) {
