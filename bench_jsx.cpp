@@ -199,6 +199,7 @@ struct Row {
     double erase_ms;
     double iter_ms;
     size_t mem_bytes;
+    size_t mem_pre_bytes;  // before shrink_to_fit (includes freelist)
 };
 
 constexpr int TRIALS = 3;
@@ -210,6 +211,7 @@ static void emit_html(const std::vector<Row>& rows,
         size_t N;
         double vals[3][6];
         bool has[3];
+        double mem_pre;  // kntrie memory before shrink_to_fit
     };
 
     auto cidx = [](const char* c) -> int {
@@ -231,6 +233,7 @@ static void emit_html(const std::vector<Row>& rows,
             dp.pattern = r.pattern;
             dp.N = r.n;
             std::memset(dp.has, 0, sizeof(dp.has));
+            dp.mem_pre = 0;
             points.push_back(dp);
         }
         int ci = cidx(r.container);
@@ -240,6 +243,7 @@ static void emit_html(const std::vector<Row>& rows,
         points[pi].vals[ci][3] = r.erase_ms;
         points[pi].vals[ci][4] = r.iter_ms;
         points[pi].vals[ci][5] = static_cast<double>(r.mem_bytes);
+        if (ci == 0) points[pi].mem_pre = static_cast<double>(r.mem_pre_bytes);
         points[pi].has[ci] = true;
     }
 
@@ -301,6 +305,8 @@ static void emit_html(const std::vector<Row>& rows,
                     std::printf(",%s_%s:%.4f", names[ci], suffixes[mi], p.vals[ci][mi]);
             }
         }
+        if (p.mem_pre > 0)
+            std::printf(",kntrie_mempre:%.0f", p.mem_pre);
         std::printf("},\n");
     }
     std::printf("];\n\n");
@@ -330,6 +336,7 @@ const LINES_ERASE = [
 
 const LINES_MEM = [
   { key: "kntrie", suffix: "mem", color: "#3b82f6", dash: [], width: 2.5, label: "kntrie" },
+  { key: "kntrie", suffix: "mempre", color: "#93c5fd", dash: [6,3], width: 1.5, label: "kntrie +freelist" },
   { key: "map",    suffix: "mem", color: "#ef4444", dash: [], width: 2.5, label: "map" },
   { key: "umap",   suffix: "mem", color: "#22c55e", dash: [], width: 2.5, label: "umap" },
   { key: "raw",    suffix: "mem", color: "#888",    dash: [3,3], width: 1, label: "raw (16B)" },
@@ -471,12 +478,13 @@ static void bench_all(size_t target_n, const std::string& pattern,
         std::fprintf(stderr, "%s N=%zu...\n", pattern.c_str(), n);
 
     // Memory: one tracked run per container
-    size_t kntrie_mem, map_mem = 0, umap_mem;
+    size_t kntrie_mem, kntrie_mem_pre, map_mem = 0, umap_mem;
     {
         using TrieT = gteitelbaum::kntrie<K, V, TrackingAlloc<uint64_t>>;
         g_alloc_total = 0;
         TrieT trie;
         for (auto k : w.keys) trie.insert(static_cast<K>(k), VC::from_key(static_cast<K>(k)));
+        kntrie_mem_pre = g_alloc_total;
         trie.shrink_to_fit();
         kntrie_mem = g_alloc_total;
     }
@@ -610,10 +618,10 @@ static void bench_all(size_t target_n, const std::string& pattern,
         }
     }
 
-    rows.push_back({pattern, n, "kntrie", k_fnd, k_nf, k_ins, k_ers, k_iter, kntrie_mem});
+    rows.push_back({pattern, n, "kntrie", k_fnd, k_nf, k_ins, k_ers, k_iter, kntrie_mem, kntrie_mem_pre});
     if (do_map)
-        rows.push_back({pattern, n, "map", m_fnd, m_nf, m_ins, m_ers, m_iter, map_mem});
-    rows.push_back({pattern, n, "umap", u_fnd, u_nf, u_ins, u_ers, u_iter, umap_mem});
+        rows.push_back({pattern, n, "map", m_fnd, m_nf, m_ins, m_ers, m_iter, map_mem, 0});
+    rows.push_back({pattern, n, "umap", u_fnd, u_nf, u_ins, u_ers, u_iter, umap_mem, 0});
 }
 
 // ==========================================================================
