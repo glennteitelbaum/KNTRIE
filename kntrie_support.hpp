@@ -36,32 +36,35 @@ using next_narrow_t = std::conditional_t<sizeof(NK) == 8, uint32_t,
                       std::conditional_t<sizeof(NK) == 4, uint16_t, uint8_t>>;
 
 // ==========================================================================
-// Allocation size classes
+// Freelist size classes
 //
-// Up to 8 u64s: exact
-// Then quarter-steps within each power-of-2 range:
-//   [9,16]:   step 2  -> 10,12,14,16
-//   [17,32]:  step 4  -> 20,24,28,32
-//   [33,64]:  step 8  -> 40,48,56,64
-//   [65,128]: step 16 -> 80,96,112,128
-//   etc.
+// Allocations <= FREE_MAX u64s use 7 size-class bins for freelisting.
+// Allocations > FREE_MAX use power-of-2 with midpoints for in-place growth.
 //
-// Worst-case waste: ~25%.  Enables in-place insert/erase.
+// Bins: {4, 6, 8, 12, 18, 26, 34}  (max waste 27%, avg 11%)
 // ==========================================================================
 
-// ==========================================================================
-// Allocation size classes (bitmask nodes only)
-//
-// Compact leaves use power-of-2 slot counts with exact allocation.
-// Bitmask nodes use these size classes:
-//   Up to 12 u64s: step 4 -> 4,8,12
-//   Then powers-of-2 with midpoints (+2 for header):
-//     16, 26, 32, 50, 64, 98, 128, 194, ...
-//   Max waste: ~33%.
-// ==========================================================================
+inline constexpr size_t FREE_MAX  = 34;
+inline constexpr size_t NUM_BINS  = 7;
+inline constexpr size_t BIN_SIZES[NUM_BINS] = {4, 6, 8, 12, 18, 26, 34};
 
+// Map requested u64 count to bin index. Returns NUM_BINS if > FREE_MAX.
+inline constexpr int bin_for(size_t n) noexcept {
+    if (n <= 4)  return 0;
+    if (n <= 6)  return 1;
+    if (n <= 8)  return 2;
+    if (n <= 12) return 3;
+    if (n <= 18) return 4;
+    if (n <= 26) return 5;
+    if (n <= 34) return 6;
+    return NUM_BINS;
+}
+
+// round_up_u64: "actual allocation size" for any request.
+//   <= FREE_MAX: returns bin class size (freelist handles it)
+//   >  FREE_MAX: power-of-2 with midpoints (in-place growth for large bitmask nodes)
 inline constexpr size_t round_up_u64(size_t n) noexcept {
-    if (n < 12) return ((n + 3) / 4) * 4;
+    if (n <= FREE_MAX) return BIN_SIZES[bin_for(n)];
     int bit  = static_cast<int>(std::bit_width(n - 1));
     size_t pow2 = size_t{1} << bit;
     size_t mid  = pow2 / 2 + pow2 / 4 + 2;
@@ -69,7 +72,7 @@ inline constexpr size_t round_up_u64(size_t n) noexcept {
 }
 
 // Shrink when allocated exceeds the class for 2x the needed size.
-// Bitmask nodes only — compact leaves use power-of-2 shrink logic.
+// Works for both binned (≤ FREE_MAX) and large (> FREE_MAX) allocations.
 inline constexpr bool should_shrink_u64(size_t allocated, size_t needed) noexcept {
     return allocated > round_up_u64(needed * 2);
 }
@@ -408,34 +411,81 @@ struct value_traits {
 // Builder — owns allocator, handles node + value alloc/dealloc
 // ==========================================================================
 
-// Base builder: trivial values (A-type, bool) — no free list
+// Base builder: trivial values (A-type, bool) — 7-bin size-class freelist
 template<typename VALUE, bool IS_TRIVIAL, typename ALLOC>
 struct builder;
 
 template<typename VALUE, typename ALLOC>
 struct builder<VALUE, true, ALLOC> {
     ALLOC alloc_v;
+    uint64_t* bins_v[NUM_BINS] = {};
 
     builder() : alloc_v() {}
     explicit builder(const ALLOC& a) : alloc_v(a) {}
 
     builder(const builder&) = delete;
     builder& operator=(const builder&) = delete;
-    builder(builder&&) noexcept = default;
-    builder& operator=(builder&&) noexcept = default;
 
-    void swap(builder& o) noexcept { std::swap(alloc_v, o.alloc_v); }
+    builder(builder&& o) noexcept : alloc_v(std::move(o.alloc_v)) {
+        for (size_t i = 0; i < NUM_BINS; ++i) {
+            bins_v[i] = o.bins_v[i];
+            o.bins_v[i] = nullptr;
+        }
+    }
+
+    builder& operator=(builder&& o) noexcept {
+        if (this != &o) {
+            drain();
+            alloc_v = std::move(o.alloc_v);
+            for (size_t i = 0; i < NUM_BINS; ++i) {
+                bins_v[i] = o.bins_v[i];
+                o.bins_v[i] = nullptr;
+            }
+        }
+        return *this;
+    }
+
+    void swap(builder& o) noexcept {
+        std::swap(alloc_v, o.alloc_v);
+        for (size_t i = 0; i < NUM_BINS; ++i)
+            std::swap(bins_v[i], o.bins_v[i]);
+    }
 
     const ALLOC& get_allocator() const noexcept { return alloc_v; }
 
     uint64_t* alloc_node(size_t u64_count) {
+        int bin = bin_for(u64_count);
+        if (bin < static_cast<int>(NUM_BINS)) {
+            if (bins_v[bin]) {
+                uint64_t* p = bins_v[bin];
+                bins_v[bin] = reinterpret_cast<uint64_t*>(p[0]);
+                std::memset(p, 0, u64_count * 8);
+                return p;
+            }
+        }
         uint64_t* p = alloc_v.allocate(u64_count);
         std::memset(p, 0, u64_count * 8);
         return p;
     }
 
     void dealloc_node(uint64_t* p, size_t u64_count) noexcept {
-        alloc_v.deallocate(p, u64_count);
+        int bin = bin_for(u64_count);
+        if (bin < static_cast<int>(NUM_BINS)) {
+            p[0] = reinterpret_cast<uint64_t>(bins_v[bin]);
+            bins_v[bin] = p;
+        } else {
+            alloc_v.deallocate(p, u64_count);
+        }
+    }
+
+    void drain() noexcept {
+        for (size_t i = 0; i < NUM_BINS; ++i) {
+            while (bins_v[i]) {
+                uint64_t* p = bins_v[i];
+                bins_v[i] = reinterpret_cast<uint64_t*>(p[0]);
+                alloc_v.deallocate(p, BIN_SIZES[i]);
+            }
+        }
     }
 
     using VT = value_traits<VALUE, ALLOC>;
@@ -443,10 +493,9 @@ struct builder<VALUE, true, ALLOC> {
 
     slot_type store_value(const VALUE& val) { return val; }
     void destroy_value(slot_type&) noexcept {}
-    void drain() noexcept {}
 };
 
-// Extended builder: C-type values — has free list
+// Extended builder: C-type values — routes through base_v freelist bins
 template<typename VALUE, typename ALLOC>
 struct builder<VALUE, false, ALLOC> {
     using BASE = builder<VALUE, true, ALLOC>;
@@ -454,8 +503,9 @@ struct builder<VALUE, false, ALLOC> {
     using VT = value_traits<VALUE, ALLOC>;
     using slot_type = typename VT::slot_type;  // VALUE*
 
-    BASE   base_v;
-    VALUE* free_head_v = nullptr;
+    static constexpr size_t VAL_U64 = (sizeof(VALUE) + 7) / 8;
+
+    BASE base_v;
 
     builder() = default;
     explicit builder(const ALLOC& a) : base_v(a) {}
@@ -464,26 +514,19 @@ struct builder<VALUE, false, ALLOC> {
     builder& operator=(const builder&) = delete;
 
     builder(builder&& o) noexcept
-        : base_v(std::move(o.base_v))
-        , free_head_v(o.free_head_v) {
-        o.free_head_v = nullptr;
-    }
+        : base_v(std::move(o.base_v)) {}
 
     builder& operator=(builder&& o) noexcept {
         if (this != &o) {
-            drain();
             base_v = std::move(o.base_v);
-            free_head_v = o.free_head_v;
-            o.free_head_v = nullptr;
         }
         return *this;
     }
 
-    ~builder() { drain(); }
+    ~builder() = default;
 
     void swap(builder& o) noexcept {
         base_v.swap(o.base_v);
-        std::swap(free_head_v, o.free_head_v);
     }
 
     const ALLOC& get_allocator() const noexcept { return base_v.get_allocator(); }
@@ -492,32 +535,30 @@ struct builder<VALUE, false, ALLOC> {
     void dealloc_node(uint64_t* p, size_t u64_count) noexcept { base_v.dealloc_node(p, u64_count); }
 
     slot_type store_value(const VALUE& val) {
-        VALUE* p;
-        if (free_head_v) {
-            p = free_head_v;
-            std::memcpy(&free_head_v, p, sizeof(VALUE*));
-            std::construct_at(p, val);
+        if constexpr (VAL_U64 <= FREE_MAX) {
+            uint64_t* p = base_v.alloc_node(round_up_u64(VAL_U64));
+            std::construct_at(reinterpret_cast<VALUE*>(p), val);
+            return reinterpret_cast<VALUE*>(p);
         } else {
             VA va(base_v.get_allocator());
-            p = std::allocator_traits<VA>::allocate(va, 1);
+            VALUE* p = std::allocator_traits<VA>::allocate(va, 1);
             std::construct_at(p, val);
+            return p;
         }
-        return p;
     }
 
     void destroy_value(slot_type& s) noexcept {
         std::destroy_at(s);
-        std::memcpy(s, &free_head_v, sizeof(VALUE*));
-        free_head_v = s;
+        if constexpr (VAL_U64 <= FREE_MAX) {
+            base_v.dealloc_node(reinterpret_cast<uint64_t*>(s), round_up_u64(VAL_U64));
+        } else {
+            VA va(base_v.get_allocator());
+            std::allocator_traits<VA>::deallocate(va, s, 1);
+        }
     }
 
     void drain() noexcept {
-        VA va(base_v.get_allocator());
-        while (free_head_v) {
-            VALUE* p = free_head_v;
-            std::memcpy(&free_head_v, p, sizeof(VALUE*));
-            std::allocator_traits<VA>::deallocate(va, p, 1);
-        }
+        base_v.drain();
     }
 };
 
