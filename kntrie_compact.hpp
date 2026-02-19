@@ -289,10 +289,26 @@ struct compact_ops {
         if (dups > 0) [[likely]] {
             if constexpr (VT::IS_BOOL) {
                 auto bv = bool_vals_mut(node, ts, hs);
-                bool tmp[ts];
-                bv.unpack_to(tmp, ts);
-                insert_consume_dup(kd, tmp, ts, ins, entries, suffix, value);
-                bv.pack_from(tmp, ts);
+                // Find dup and shift keys (keys are always memmove'd)
+                int dup_pos = find_dup_pos(kd, ts, ins, entries);
+                int write_pos;
+                if (dup_pos < ins) {
+                    int sc = ins - 1 - dup_pos;
+                    if (sc > 0) {
+                        std::memmove(kd + dup_pos, kd + dup_pos + 1, sc * sizeof(K));
+                        bv.shift_left_1(dup_pos + 1, sc);
+                    }
+                    write_pos = ins - 1;
+                } else {
+                    int sc = dup_pos - ins;
+                    if (sc > 0) {
+                        std::memmove(kd + ins + 1, kd + ins, sc * sizeof(K));
+                        bv.shift_right_1(ins, sc);
+                    }
+                    write_pos = ins;
+                }
+                kd[write_pos] = suffix;
+                bv.set(write_pos, value);
             } else {
                 VST* vd = vals_mut(node, ts, hs);
                 insert_consume_dup(kd, vd, ts, ins, entries, suffix, value);
@@ -393,10 +409,22 @@ struct compact_ops {
         // In-place: convert erased entry's run to neighbor dups
         if constexpr (VT::IS_BOOL) {
             auto bv = bool_vals_mut(node, ts, hs);
-            bool tmp[ts];
-            bv.unpack_to(tmp, ts);
-            erase_create_dup(kd, tmp, ts, idx, suffix, alloc);
-            bv.pack_from(tmp, ts);
+            int first = idx;
+            while (first > 0 && kd[first - 1] == suffix) --first;
+
+            bool neighbor_val;
+            K neighbor_key;
+            if (first > 0) {
+                neighbor_key = kd[first - 1];
+                neighbor_val = bv.get(first - 1);
+            } else {
+                neighbor_key = kd[idx + 1];
+                neighbor_val = bv.get(idx + 1);
+            }
+            for (int i = first; i <= (int)idx; ++i) {
+                kd[i] = neighbor_key;
+                bv.set(i, neighbor_val);
+            }
         } else {
             VST* vd = vals_mut(node, ts, hs);
             erase_create_dup(kd, vd, ts, idx, suffix, alloc);
@@ -632,11 +660,8 @@ private:
     // Dup helpers
     // ==================================================================
 
-    static void insert_consume_dup(
-            K* kd, VST* vd, int total, int ins, unsigned entries,
-            K suffix, VST value) {
+    static int find_dup_pos(const K* kd, int total, int ins, unsigned entries) {
         int dup_pos = -1;
-
         if (total <= 64) {
             for (int i = ins; i < total - 1; ++i) {
                 if (kd[i] == kd[i + 1]) { dup_pos = i; break; }
@@ -668,6 +693,13 @@ private:
                 l_hi = l_lo - 1;
             }
         }
+        return dup_pos;
+    }
+
+    static void insert_consume_dup(
+            K* kd, VST* vd, int total, int ins, unsigned entries,
+            K suffix, VST value) {
+        int dup_pos = find_dup_pos(kd, total, ins, entries);
 
         int write_pos;
         if (dup_pos < ins) {

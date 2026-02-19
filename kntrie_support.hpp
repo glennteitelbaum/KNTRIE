@@ -272,6 +272,28 @@ public:
             if (src[i]) set(i, true);
     }
 
+    // Shift bits [from, from+count) left by 1 (toward lower index).
+    // Bit at 'from' is overwritten. Bit at from+count is unchanged.
+    // Equivalent to memmove(vd + from - 1, vd + from, count) for 1-byte slots.
+    void shift_left_1(unsigned from, unsigned count) noexcept {
+        for (unsigned i = 0; i < count; ++i)
+            set(from - 1 + i, get(from + i));
+    }
+
+    // Shift bits [from, from+count) right by 1 (toward higher index).
+    // Bit at from+count is overwritten. Bit at 'from' is freed.
+    // Equivalent to memmove(vd + from + 1, vd + from, count) for 1-byte slots.
+    void shift_right_1(unsigned from, unsigned count) noexcept {
+        for (unsigned i = count; i > 0; --i)
+            set(from + i, get(from + i - 1));
+    }
+
+    // Fill bits [from, from+count) with value v.
+    void fill_range(unsigned from, unsigned count, bool v) noexcept {
+        for (unsigned i = 0; i < count; ++i)
+            set(from + i, v);
+    }
+
     static constexpr size_t u64_for(unsigned n) noexcept {
         return (n + 63) / 64;
     }
