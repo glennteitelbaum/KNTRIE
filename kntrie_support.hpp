@@ -41,12 +41,16 @@ using next_narrow_t = std::conditional_t<sizeof(NK) == 8, uint32_t,
 // Allocations <= FREE_MAX u64s use 7 size-class bins for freelisting.
 // Allocations > FREE_MAX use power-of-2 with midpoints for in-place growth.
 //
-// Bins: {4, 6, 8, 12, 18, 26, 34}  (max waste 27%, avg 11%)
+// Bins: {4, 6, 8, 12, 18, 26, 34, 48, 68}
+// Bins 7-8 capture medium bitmask nodes (up to 61 children)
 // ==========================================================================
 
-inline constexpr size_t FREE_MAX  = 34;
-inline constexpr size_t NUM_BINS  = 7;
-inline constexpr size_t BIN_SIZES[NUM_BINS] = {4, 6, 8, 12, 18, 26, 34};
+inline constexpr size_t FREE_MAX  = 68;
+inline constexpr size_t NUM_BINS  = 9;
+inline constexpr size_t BIN_SIZES[NUM_BINS] = {4, 6, 8, 12, 18, 26, 34, 48, 68};
+
+// Page size for slab allocation (4K = 512 u64s)
+inline constexpr size_t PAGE_U64S = 512;
 
 // Map requested u64 count to bin index. Returns NUM_BINS if > FREE_MAX.
 inline constexpr int bin_for(size_t n) noexcept {
@@ -57,6 +61,8 @@ inline constexpr int bin_for(size_t n) noexcept {
     if (n <= 18) return 4;
     if (n <= 26) return 5;
     if (n <= 34) return 6;
+    if (n <= 48) return 7;
+    if (n <= 68) return 8;
     return NUM_BINS;
 }
 
@@ -411,14 +417,25 @@ struct value_traits {
 // Builder — owns allocator, handles node + value alloc/dealloc
 // ==========================================================================
 
-// Base builder: trivial values (A-type, bool) — 7-bin size-class freelist
+// Base builder: trivial values (A-type, bool) — page-based slab allocator
+//
+// Three-level allocation:
+//   mega (growing) → pages (4K) → blocks (bin-sized)
+//
+// Hot path: pop from bins_v[b].
+// Cold path: grow_bin → pop page from page_free_v → carve blocks.
+// Colder:    grow_pages → allocate mega → thread pages into page_free_v.
 template<typename VALUE, bool IS_TRIVIAL, typename ALLOC>
 struct builder;
 
 template<typename VALUE, typename ALLOC>
 struct builder<VALUE, true, ALLOC> {
-    ALLOC alloc_v;
-    uint64_t* bins_v[NUM_BINS] = {};
+    ALLOC      alloc_v;
+    uint64_t*  alloc_head_v = nullptr;   // intrusive chain of mega allocations
+    uint64_t*  page_free_v  = nullptr;   // uncarved pages
+    uint64_t*  bins_v[NUM_BINS] = {};    // per-bin block freelists
+    double     mega_pages_v = 1.0;       // pages in next mega (grows 1.25x)
+    size_t     mem_in_use_v = 0;         // block bytes handed out
 
     builder() : alloc_v() {}
     explicit builder(const ALLOC& a) : alloc_v(a) {}
@@ -426,71 +443,144 @@ struct builder<VALUE, true, ALLOC> {
     builder(const builder&) = delete;
     builder& operator=(const builder&) = delete;
 
-    builder(builder&& o) noexcept : alloc_v(std::move(o.alloc_v)) {
-        for (size_t i = 0; i < NUM_BINS; ++i) {
-            bins_v[i] = o.bins_v[i];
-            o.bins_v[i] = nullptr;
-        }
+    builder(builder&& o) noexcept
+        : alloc_v(std::move(o.alloc_v))
+        , alloc_head_v(o.alloc_head_v)
+        , page_free_v(o.page_free_v)
+        , mega_pages_v(o.mega_pages_v)
+        , mem_in_use_v(o.mem_in_use_v)
+    {
+        std::memcpy(bins_v, o.bins_v, sizeof(bins_v));
+        o.alloc_head_v = nullptr;
+        o.page_free_v  = nullptr;
+        std::memset(o.bins_v, 0, sizeof(o.bins_v));
+        o.mega_pages_v = 1.0;
+        o.mem_in_use_v = 0;
     }
 
     builder& operator=(builder&& o) noexcept {
         if (this != &o) {
             drain();
             alloc_v = std::move(o.alloc_v);
-            for (size_t i = 0; i < NUM_BINS; ++i) {
-                bins_v[i] = o.bins_v[i];
-                o.bins_v[i] = nullptr;
-            }
+            alloc_head_v = o.alloc_head_v;
+            page_free_v  = o.page_free_v;
+            mega_pages_v = o.mega_pages_v;
+            mem_in_use_v = o.mem_in_use_v;
+            std::memcpy(bins_v, o.bins_v, sizeof(bins_v));
+            o.alloc_head_v = nullptr;
+            o.page_free_v  = nullptr;
+            std::memset(o.bins_v, 0, sizeof(o.bins_v));
+            o.mega_pages_v = 1.0;
+            o.mem_in_use_v = 0;
         }
         return *this;
     }
 
     void swap(builder& o) noexcept {
-        std::swap(alloc_v, o.alloc_v);
+        using std::swap;
+        swap(alloc_v, o.alloc_v);
+        swap(alloc_head_v, o.alloc_head_v);
+        swap(page_free_v, o.page_free_v);
+        swap(mega_pages_v, o.mega_pages_v);
+        swap(mem_in_use_v, o.mem_in_use_v);
         for (size_t i = 0; i < NUM_BINS; ++i)
-            std::swap(bins_v[i], o.bins_v[i]);
+            swap(bins_v[i], o.bins_v[i]);
     }
 
     const ALLOC& get_allocator() const noexcept { return alloc_v; }
+    size_t memory_in_use() const noexcept { return mem_in_use_v; }
 
+    // --- Mega allocation: grow page_free_v ---
+    void grow_pages() {
+        size_t pages = static_cast<size_t>(mega_pages_v);
+        if (pages < 1) pages = 1;
+        size_t u64s = 2 + pages * PAGE_U64S;
+
+        uint64_t* mega = alloc_v.allocate(u64s);
+        mega[0] = reinterpret_cast<uint64_t>(alloc_head_v);
+        mega[1] = u64s;
+        alloc_head_v = mega;
+
+        uint64_t* base = mega + 2;
+        for (size_t i = 0; i < pages; ++i) {
+            uint64_t* page = base + i * PAGE_U64S;
+            page[0] = reinterpret_cast<uint64_t>(page_free_v);
+            page_free_v = page;
+        }
+
+        mega_pages_v *= 1.25;
+    }
+
+    // --- Carve a page into blocks for bin, thread into freelist ---
+    void grow_bin(int bin) {
+        if (!page_free_v) grow_pages();
+
+        uint64_t* page = page_free_v;
+        page_free_v = reinterpret_cast<uint64_t*>(page[0]);
+
+        size_t bs = BIN_SIZES[bin];
+        size_t count = PAGE_U64S / bs;
+
+        for (size_t i = 0; i < count; ++i) {
+            uint64_t* block = page + i * bs;
+            if (i + 1 < count)
+                block[0] = reinterpret_cast<uint64_t>(page + (i + 1) * bs);
+            else
+                block[0] = reinterpret_cast<uint64_t>(bins_v[bin]);
+        }
+        bins_v[bin] = page;
+    }
+
+    // --- Allocate a node ---
     uint64_t* alloc_node(size_t u64_count) {
         int bin = bin_for(u64_count);
         if (bin < static_cast<int>(NUM_BINS)) {
             size_t actual = BIN_SIZES[bin];
-            if (bins_v[bin]) {
-                uint64_t* p = bins_v[bin];
-                bins_v[bin] = reinterpret_cast<uint64_t*>(p[0]);
-                std::memset(p, 0, actual * 8);
-                return p;
-            }
-            uint64_t* p = alloc_v.allocate(actual);
+            if (!bins_v[bin]) [[unlikely]]
+                grow_bin(bin);
+            uint64_t* p = bins_v[bin];
+            bins_v[bin] = reinterpret_cast<uint64_t*>(p[0]);
             std::memset(p, 0, actual * 8);
+            mem_in_use_v += actual * 8;
             return p;
         }
+        // Large allocation — direct malloc
         uint64_t* p = alloc_v.allocate(u64_count);
         std::memset(p, 0, u64_count * 8);
+        mem_in_use_v += u64_count * 8;
         return p;
     }
 
+    // --- Return a node to its bin freelist ---
     void dealloc_node(uint64_t* p, size_t u64_count) noexcept {
         int bin = bin_for(u64_count);
         if (bin < static_cast<int>(NUM_BINS)) {
             p[0] = reinterpret_cast<uint64_t>(bins_v[bin]);
             bins_v[bin] = p;
+            mem_in_use_v -= BIN_SIZES[bin] * 8;
         } else {
             alloc_v.deallocate(p, u64_count);
+            mem_in_use_v -= u64_count * 8;
         }
     }
 
+    // --- Free all megas. Only safe when all nodes are dead. ---
     void drain() noexcept {
-        for (size_t i = 0; i < NUM_BINS; ++i) {
-            while (bins_v[i]) {
-                uint64_t* p = bins_v[i];
-                bins_v[i] = reinterpret_cast<uint64_t*>(p[0]);
-                alloc_v.deallocate(p, BIN_SIZES[i]);
-            }
+        uint64_t* m = alloc_head_v;
+        while (m) {
+            uint64_t* next = reinterpret_cast<uint64_t*>(m[0]);
+            alloc_v.deallocate(m, m[1]);
+            m = next;
         }
+        alloc_head_v = nullptr;
+        page_free_v = nullptr;
+        std::memset(bins_v, 0, sizeof(bins_v));
+        mega_pages_v = 1.0;
+        mem_in_use_v = 0;
     }
+
+    // --- shrink_to_fit: no-op (pages cannot be partially freed) ---
+    void shrink_to_fit() noexcept {}
 
     using VT = value_traits<VALUE, ALLOC>;
     using slot_type = typename VT::slot_type;
@@ -564,6 +654,9 @@ struct builder<VALUE, false, ALLOC> {
     void drain() noexcept {
         base_v.drain();
     }
+
+    void shrink_to_fit() noexcept { base_v.shrink_to_fit(); }
+    size_t memory_in_use() const noexcept { return base_v.memory_in_use(); }
 };
 
 // ==========================================================================

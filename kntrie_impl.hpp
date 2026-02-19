@@ -87,7 +87,11 @@ public:
     }
 
     void shrink_to_fit() noexcept {
-        bld_v.drain();
+        bld_v.shrink_to_fit();
+    }
+
+    size_t memory_in_use() const noexcept {
+        return bld_v.memory_in_use();
     }
 
     // ==================================================================

@@ -379,7 +379,7 @@ struct kntrie_ops {
             } else {
                 auto cs = std::make_unique<NK[]>(cc);
                 for (size_t j = 0; j < cc; ++j)
-                    cs[j] = static_cast<NK>(suf[start + j] << 8);
+                    cs[j] = static_cast<NK>(static_cast<unsigned>(suf[start + j]) << 8);
                 child_tagged[n_children] = build_node_from_arrays_tagged(
                     cs.get(), vals + start, cc, bits - 8, bld);
             }
