@@ -673,7 +673,7 @@ int main(int argc, char* argv[]) {
     if (argc != 5) {
         std::fprintf(stderr,
             "Usage: %s <key_type> <val_type> <max_entries> <verbose:y/n>\n"
-            "  Key types:   u8 i8 u16 i16 u32 i32 u64 i64\n"
+            "  Key types:   u16 i16 u32 i32 u64 i64\n"
             "  Value types: bool u8 i8 u16 i16 u32 i32 u64 i64 string big256\n"
             "  Example: %s u64 i32 6000000 y\n",
             argv[0], argv[0]);
@@ -688,8 +688,9 @@ int main(int argc, char* argv[]) {
     type_id kt = parse_type(kn);
     type_id vt = parse_type(vn);
 
-    if (kt == T_INVALID || kt == T_STRING || kt == T_BIG256 || kt == T_BOOL) {
-        std::fprintf(stderr, "Invalid key type: %s (must be u8/i8/u16/i16/u32/i32/u64/i64)\n", kn);
+    if (kt == T_INVALID || kt == T_STRING || kt == T_BIG256 || kt == T_BOOL
+        || kt == T_U8 || kt == T_I8) {
+        std::fprintf(stderr, "Invalid key type: %s (must be u16/i16/u32/i32/u64/i64)\n", kn);
         return 1;
     }
     if (vt == T_INVALID) {
@@ -698,36 +699,6 @@ int main(int argc, char* argv[]) {
     }
 
     switch (kt) {
-        case T_U8:
-            switch (vt) {
-                case T_BOOL:   run_bench<uint8_t, bool>       (max_n, verbose, kn, vn); break;
-                case T_U8:     run_bench<uint8_t, uint8_t>    (max_n, verbose, kn, vn); break;
-                case T_I8:     run_bench<uint8_t, int8_t>     (max_n, verbose, kn, vn); break;
-                case T_U16:    run_bench<uint8_t, uint16_t>   (max_n, verbose, kn, vn); break;
-                case T_I16:    run_bench<uint8_t, int16_t>    (max_n, verbose, kn, vn); break;
-                case T_U32:    run_bench<uint8_t, uint32_t>   (max_n, verbose, kn, vn); break;
-                case T_I32:    run_bench<uint8_t, int32_t>    (max_n, verbose, kn, vn); break;
-                case T_U64:    run_bench<uint8_t, uint64_t>   (max_n, verbose, kn, vn); break;
-                case T_I64:    run_bench<uint8_t, int64_t>    (max_n, verbose, kn, vn); break;
-                case T_STRING: run_bench<uint8_t, std::string>(max_n, verbose, kn, vn); break;
-                case T_BIG256: run_bench<uint8_t, big256_t>   (max_n, verbose, kn, vn); break;
-                default: goto bad_val;
-            } break;
-        case T_I8:
-            switch (vt) {
-                case T_BOOL:   run_bench<int8_t, bool>       (max_n, verbose, kn, vn); break;
-                case T_U8:     run_bench<int8_t, uint8_t>    (max_n, verbose, kn, vn); break;
-                case T_I8:     run_bench<int8_t, int8_t>     (max_n, verbose, kn, vn); break;
-                case T_U16:    run_bench<int8_t, uint16_t>   (max_n, verbose, kn, vn); break;
-                case T_I16:    run_bench<int8_t, int16_t>    (max_n, verbose, kn, vn); break;
-                case T_U32:    run_bench<int8_t, uint32_t>   (max_n, verbose, kn, vn); break;
-                case T_I32:    run_bench<int8_t, int32_t>    (max_n, verbose, kn, vn); break;
-                case T_U64:    run_bench<int8_t, uint64_t>   (max_n, verbose, kn, vn); break;
-                case T_I64:    run_bench<int8_t, int64_t>    (max_n, verbose, kn, vn); break;
-                case T_STRING: run_bench<int8_t, std::string>(max_n, verbose, kn, vn); break;
-                case T_BIG256: run_bench<int8_t, big256_t>   (max_n, verbose, kn, vn); break;
-                default: goto bad_val;
-            } break;
         case T_U16:
             switch (vt) {
                 case T_BOOL:   run_bench<uint16_t, bool>       (max_n, verbose, kn, vn); break;

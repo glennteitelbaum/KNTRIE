@@ -10,7 +10,8 @@ namespace gteitelbaum {
 
 template<typename KEY, typename VALUE, typename ALLOC = std::allocator<uint64_t>>
 class kntrie {
-    static_assert(std::is_integral_v<KEY>, "KEY must be integral");
+    static_assert(std::is_integral_v<KEY> && sizeof(KEY) >= 2,
+                  "KEY must be integral and at least 16 bits");
 
     using UK     = std::make_unsigned_t<KEY>;
     using impl_t = kntrie_impl<UK, VALUE, ALLOC>;
@@ -198,6 +199,7 @@ public:
     void clear() noexcept { impl_.clear(); }
     void shrink_to_fit() noexcept { impl_.shrink_to_fit(); }
     size_t memory_in_use() const noexcept { return impl_.memory_in_use(); }
+    size_t memory_needed() const noexcept { return impl_.memory_needed(); }
     size_type erase(const KEY& key) { return impl_.erase(to_unsigned(key)) ? 1 : 0; }
 
     iterator erase(const_iterator pos) {

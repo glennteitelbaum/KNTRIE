@@ -435,7 +435,8 @@ struct builder<VALUE, true, ALLOC> {
     uint64_t*  page_free_v  = nullptr;   // uncarved pages
     uint64_t*  bins_v[NUM_BINS] = {};    // per-bin block freelists
     double     mega_pages_v = 1.0;       // pages in next mega (grows 1.25x)
-    size_t     mem_in_use_v = 0;         // block bytes handed out
+    size_t     mem_in_use_v = 0;         // block bytes handed out (bin-padded)
+    size_t     mem_needed_v = 0;         // block bytes requested (before padding)
 
     builder() : alloc_v() {}
     explicit builder(const ALLOC& a) : alloc_v(a) {}
@@ -449,6 +450,7 @@ struct builder<VALUE, true, ALLOC> {
         , page_free_v(o.page_free_v)
         , mega_pages_v(o.mega_pages_v)
         , mem_in_use_v(o.mem_in_use_v)
+        , mem_needed_v(o.mem_needed_v)
     {
         std::memcpy(bins_v, o.bins_v, sizeof(bins_v));
         o.alloc_head_v = nullptr;
@@ -456,6 +458,7 @@ struct builder<VALUE, true, ALLOC> {
         std::memset(o.bins_v, 0, sizeof(o.bins_v));
         o.mega_pages_v = 1.0;
         o.mem_in_use_v = 0;
+        o.mem_needed_v = 0;
     }
 
     builder& operator=(builder&& o) noexcept {
@@ -466,12 +469,14 @@ struct builder<VALUE, true, ALLOC> {
             page_free_v  = o.page_free_v;
             mega_pages_v = o.mega_pages_v;
             mem_in_use_v = o.mem_in_use_v;
+            mem_needed_v = o.mem_needed_v;
             std::memcpy(bins_v, o.bins_v, sizeof(bins_v));
             o.alloc_head_v = nullptr;
             o.page_free_v  = nullptr;
             std::memset(o.bins_v, 0, sizeof(o.bins_v));
             o.mega_pages_v = 1.0;
             o.mem_in_use_v = 0;
+            o.mem_needed_v = 0;
         }
         return *this;
     }
@@ -483,12 +488,14 @@ struct builder<VALUE, true, ALLOC> {
         swap(page_free_v, o.page_free_v);
         swap(mega_pages_v, o.mega_pages_v);
         swap(mem_in_use_v, o.mem_in_use_v);
+        swap(mem_needed_v, o.mem_needed_v);
         for (size_t i = 0; i < NUM_BINS; ++i)
             swap(bins_v[i], o.bins_v[i]);
     }
 
     const ALLOC& get_allocator() const noexcept { return alloc_v; }
     size_t memory_in_use() const noexcept { return mem_in_use_v; }
+    size_t memory_needed() const noexcept { return mem_needed_v; }
 
     // --- Mega allocation: grow page_free_v ---
     void grow_pages() {
@@ -542,12 +549,14 @@ struct builder<VALUE, true, ALLOC> {
             bins_v[bin] = reinterpret_cast<uint64_t*>(p[0]);
             std::memset(p, 0, actual * 8);
             mem_in_use_v += actual * 8;
+            mem_needed_v += u64_count * 8;
             return p;
         }
         // Large allocation — direct malloc
         uint64_t* p = alloc_v.allocate(u64_count);
         std::memset(p, 0, u64_count * 8);
         mem_in_use_v += u64_count * 8;
+        mem_needed_v += u64_count * 8;
         return p;
     }
 
@@ -558,9 +567,11 @@ struct builder<VALUE, true, ALLOC> {
             p[0] = reinterpret_cast<uint64_t>(bins_v[bin]);
             bins_v[bin] = p;
             mem_in_use_v -= BIN_SIZES[bin] * 8;
+            mem_needed_v -= u64_count * 8;
         } else {
             alloc_v.deallocate(p, u64_count);
             mem_in_use_v -= u64_count * 8;
+            mem_needed_v -= u64_count * 8;
         }
     }
 
@@ -577,6 +588,7 @@ struct builder<VALUE, true, ALLOC> {
         std::memset(bins_v, 0, sizeof(bins_v));
         mega_pages_v = 1.0;
         mem_in_use_v = 0;
+        mem_needed_v = 0;
     }
 
     // --- shrink_to_fit: no-op (pages cannot be partially freed) ---
@@ -657,6 +669,7 @@ struct builder<VALUE, false, ALLOC> {
 
     void shrink_to_fit() noexcept { base_v.shrink_to_fit(); }
     size_t memory_in_use() const noexcept { return base_v.memory_in_use(); }
+    size_t memory_needed() const noexcept { return base_v.memory_needed(); }
 };
 
 // ==========================================================================
