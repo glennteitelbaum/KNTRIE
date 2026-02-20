@@ -38,7 +38,7 @@ struct kntrie_ops {
 
     struct leaf_ops_entry_t {
         using find_fn_t   = const VALUE* (*)(const uint64_t*, node_header_t, NK) noexcept;
-        using iter_fn_t   = iter_ops_result_t<IK, VST> (*)(const uint64_t*, node_header_t, NK, IK, int) noexcept;
+        using iter_fn_t   = iter_ops_result_t<IK, VST> (*)(const uint64_t*, node_header_t, NK, IK) noexcept;
         using minmax_fn_t = iter_ops_result_t<IK, VST> (*)(const uint64_t*, node_header_t, IK, int) noexcept;
 
         find_fn_t   find;
@@ -84,6 +84,27 @@ struct kntrie_ops {
             constexpr int SUF_BITS = static_cast<int>(sizeof(SUF) * 8);
             return (IK(suf) << (IK_BITS - SUF_BITS)) >> bits;
         }
+
+        // Derive prefix from full_ik at compile-time BITS depth.
+        // On the match path, consumed bits in full_ik are the correct prefix.
+        template<int REM>
+        static IK derive_prefix(IK full_ik) noexcept {
+            if constexpr (REM >= IK_BITS)
+                return IK(0);
+            else
+                return full_ik & (~IK(0) << REM);
+        }
+
+        // Compile-time suffix positioning: shift suffix to correct IK position
+        template<int REM, typename SUF>
+        static IK suffix_to_ik_ct(SUF suf) noexcept {
+            constexpr int SUF_BITS = static_cast<int>(sizeof(SUF) * 8);
+            if constexpr (REM == SUF_BITS)
+                return IK(suf);
+            else
+                return IK(suf) << (REM - SUF_BITS);
+        }
+
 
         // --- find_at<SKIP> ---
         template<int SKIP>
@@ -142,7 +163,8 @@ struct kntrie_ops {
         // --- next_at<SKIP> ---
         template<int SKIP>
         static iter_ops_result_t<IK, VST> next_at(const uint64_t* node,
-                                                    node_header_t hdr, NK ik, IK prefix, int bits) noexcept {
+                                                    node_header_t hdr, NK ik, IK full_ik) noexcept {
+            constexpr int REMAINING = BITS - 8 * SKIP;
             if constexpr (SKIP > 0) {
                 uint64_t key64 = static_cast<uint64_t>(ik) << (64 - NK_BITS);
                 uint64_t pfx = node[1];
@@ -152,30 +174,34 @@ struct kntrie_ops {
                     int shift = std::countl_zero(diff) & ~7;
                     uint8_t kb = static_cast<uint8_t>(key64 >> (56 - shift));
                     uint8_t pb = static_cast<uint8_t>(pfx >> (56 - shift));
-                    if (kb < pb) return min_at<SKIP>(node, hdr, prefix, bits);
+                    if (kb < pb) {
+                        constexpr int bits = IK_BITS - BITS;
+                        IK prefix = derive_prefix<BITS>(full_ik);
+                        return min_at<SKIP>(node, hdr, prefix, bits);
+                    }
                     return {IK{}, nullptr, false};
                 }
             }
-            accum_prefix<SKIP>(node[1], prefix, bits);
             constexpr size_t HS = 1 + (SKIP > 0);
-            constexpr int REMAINING = BITS - 8 * SKIP;
+            IK prefix = derive_prefix<REMAINING>(full_ik);
             auto suf = narrow_suffix<SKIP>(ik);
             if constexpr (REMAINING <= 8) {
                 auto r = BO::bitmap_iter_next(node, suf, HS);
                 if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
-                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+                return {prefix | suffix_to_ik_ct<REMAINING>(r.suffix), r.value, true};
             } else {
                 using RCO = compact_ops<nk_for_bits_t<REMAINING>, VALUE, ALLOC>;
                 auto r = RCO::iter_next(node, &hdr, suf);
                 if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
-                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+                return {prefix | suffix_to_ik_ct<REMAINING>(r.suffix), r.value, true};
             }
         }
 
         // --- prev_at<SKIP> ---
         template<int SKIP>
         static iter_ops_result_t<IK, VST> prev_at(const uint64_t* node,
-                                                    node_header_t hdr, NK ik, IK prefix, int bits) noexcept {
+                                                    node_header_t hdr, NK ik, IK full_ik) noexcept {
+            constexpr int REMAINING = BITS - 8 * SKIP;
             if constexpr (SKIP > 0) {
                 uint64_t key64 = static_cast<uint64_t>(ik) << (64 - NK_BITS);
                 uint64_t pfx = node[1];
@@ -185,23 +211,26 @@ struct kntrie_ops {
                     int shift = std::countl_zero(diff) & ~7;
                     uint8_t kb = static_cast<uint8_t>(key64 >> (56 - shift));
                     uint8_t pb = static_cast<uint8_t>(pfx >> (56 - shift));
-                    if (kb > pb) return max_at<SKIP>(node, hdr, prefix, bits);
+                    if (kb > pb) {
+                        constexpr int bits = IK_BITS - BITS;
+                        IK prefix = derive_prefix<BITS>(full_ik);
+                        return max_at<SKIP>(node, hdr, prefix, bits);
+                    }
                     return {IK{}, nullptr, false};
                 }
             }
-            accum_prefix<SKIP>(node[1], prefix, bits);
             constexpr size_t HS = 1 + (SKIP > 0);
-            constexpr int REMAINING = BITS - 8 * SKIP;
+            IK prefix = derive_prefix<REMAINING>(full_ik);
             auto suf = narrow_suffix<SKIP>(ik);
             if constexpr (REMAINING <= 8) {
                 auto r = BO::bitmap_iter_prev(node, suf, HS);
                 if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
-                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+                return {prefix | suffix_to_ik_ct<REMAINING>(r.suffix), r.value, true};
             } else {
                 using RCO = compact_ops<nk_for_bits_t<REMAINING>, VALUE, ALLOC>;
                 auto r = RCO::iter_prev(node, &hdr, suf);
                 if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
-                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+                return {prefix | suffix_to_ik_ct<REMAINING>(r.suffix), r.value, true};
             }
         }
 
