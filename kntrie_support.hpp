@@ -466,12 +466,28 @@ struct builder<VALUE, true, ALLOC> {
     };
     static_assert(sizeof(Page) <= BUDDY_PAGE);
 
+    // Aligned wrapper for allocator-based page allocation
+    struct alignas(BUDDY_PAGE) aligned_page_t { char data[BUDDY_PAGE]; };
+    using PAGE_ALLOC = typename std::allocator_traits<ALLOC>::template rebind_alloc<aligned_page_t>;
+
     ALLOC      alloc_v;
+    PAGE_ALLOC page_alloc_v;
     Block*     free_lists_v[NUM_BUCKETS + 1] = {};
     Page*      pages_v      = nullptr;
     size_t     num_empty_v  = 0;
     size_t     mem_in_use_v = 0;
     size_t     mem_needed_v = 0;
+
+    Page* alloc_page() {
+        auto* raw = page_alloc_v.allocate(1);
+        auto* page = reinterpret_cast<Page*>(raw);
+        std::memset(page, 0, sizeof(Page));
+        return page;
+    }
+
+    void dealloc_page(Page* page) {
+        page_alloc_v.deallocate(reinterpret_cast<aligned_page_t*>(page), 1);
+    }
 
     static constexpr size_t bucket_for(size_t bytes) noexcept {
         if (bytes <= MIN_BUDDY) return MIN_BUCKET;
@@ -490,7 +506,7 @@ struct builder<VALUE, true, ALLOC> {
             j++;
 
         if (j > NUM_BUCKETS) {
-            auto* page = new (std::align_val_t{BUDDY_PAGE}) Page{};
+            auto* page = alloc_page();
             page->meta.next = pages_v;
             pages_v = page;
 
@@ -588,20 +604,21 @@ struct builder<VALUE, true, ALLOC> {
                         pcursor = &(*pcursor)->meta.next;
                     *pcursor = page->meta.next;
                     num_empty_v--;
-                    ::operator delete(page, std::align_val_t{BUDDY_PAGE});
+                    dealloc_page(page);
                 }
             }
         }
     }
 
-    builder() : alloc_v() {}
-    explicit builder(const ALLOC& a) : alloc_v(a) {}
+    builder() : alloc_v(), page_alloc_v(alloc_v) {}
+    explicit builder(const ALLOC& a) : alloc_v(a), page_alloc_v(alloc_v) {}
 
     builder(const builder&) = delete;
     builder& operator=(const builder&) = delete;
 
     builder(builder&& o) noexcept
         : alloc_v(std::move(o.alloc_v))
+        , page_alloc_v(alloc_v)
         , pages_v(o.pages_v)
         , num_empty_v(o.num_empty_v)
         , mem_in_use_v(o.mem_in_use_v)
@@ -619,6 +636,7 @@ struct builder<VALUE, true, ALLOC> {
         if (this != &o) {
             drain();
             alloc_v = std::move(o.alloc_v);
+            page_alloc_v = PAGE_ALLOC(alloc_v);
             pages_v      = o.pages_v;
             num_empty_v  = o.num_empty_v;
             mem_in_use_v = o.mem_in_use_v;
@@ -636,6 +654,7 @@ struct builder<VALUE, true, ALLOC> {
     void swap(builder& o) noexcept {
         using std::swap;
         swap(alloc_v, o.alloc_v);
+        swap(page_alloc_v, o.page_alloc_v);
         swap(pages_v, o.pages_v);
         swap(num_empty_v, o.num_empty_v);
         swap(mem_in_use_v, o.mem_in_use_v);
@@ -690,7 +709,7 @@ struct builder<VALUE, true, ALLOC> {
             list = nullptr;
         while (pages_v) {
             auto* next = pages_v->meta.next;
-            ::operator delete(pages_v, std::align_val_t{BUDDY_PAGE});
+            dealloc_page(pages_v);
             pages_v = next;
         }
         num_empty_v  = 0;

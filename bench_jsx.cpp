@@ -11,6 +11,7 @@
 #include <set>
 #include <string>
 #include <cstring>
+#include <new>
 
 // ==========================================================================
 // Tracking allocator
@@ -26,11 +27,17 @@ struct TrackingAlloc {
     T* allocate(size_t n) {
         size_t bytes = n * sizeof(T);
         g_alloc_total += bytes;
-        return static_cast<T*>(::operator new(bytes));
+        if constexpr (alignof(T) > __STDCPP_DEFAULT_NEW_ALIGNMENT__)
+            return static_cast<T*>(::operator new(bytes, std::align_val_t{alignof(T)}));
+        else
+            return static_cast<T*>(::operator new(bytes));
     }
     void deallocate(T* p, size_t n) noexcept {
         g_alloc_total -= n * sizeof(T);
-        ::operator delete(p);
+        if constexpr (alignof(T) > __STDCPP_DEFAULT_NEW_ALIGNMENT__)
+            ::operator delete(p, std::align_val_t{alignof(T)});
+        else
+            ::operator delete(p);
     }
     template<typename U> bool operator==(const TrackingAlloc<U>&) const noexcept { return true; }
 };
