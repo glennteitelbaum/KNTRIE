@@ -407,7 +407,7 @@ public:
             if (root_v[i] == SENTINEL_TAGGED) continue;
             IK pfx = make_prefix(static_cast<uint8_t>(i));
             auto r = ops.min(root_v[i], pfx, pb);
-            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
+            return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
         }
         return {KEY{}, VALUE{}, false};
     }
@@ -419,7 +419,7 @@ public:
             if (root_v[i] == SENTINEL_TAGGED) continue;
             IK pfx = make_prefix(static_cast<uint8_t>(i));
             auto r = ops.max(root_v[i], pfx, pb);
-            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
+            return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
         }
         return {KEY{}, VALUE{}, false};
     }
@@ -431,18 +431,18 @@ public:
         auto& ops = ROOT_OPS[root_skip_v];
 
         // Try next within same slot
-        {
+        if (root_v[top] != SENTINEL_TAGGED) {
             auto r = ops.next(root_v[top], nk, ik);
             if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
         }
 
-        // Scan forward
+        // Scan forward — non-sentinel root always has entries
         int pb = prefix_bits();
         for (int i = top + 1; i < 256; ++i) {
             if (root_v[i] == SENTINEL_TAGGED) continue;
             IK pfx = make_prefix(static_cast<uint8_t>(i));
             auto r = ops.min(root_v[i], pfx, pb);
-            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
+            return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
         }
         return {KEY{}, VALUE{}, false};
     }
@@ -454,18 +454,18 @@ public:
         auto& ops = ROOT_OPS[root_skip_v];
 
         // Try prev within same slot
-        {
+        if (root_v[top] != SENTINEL_TAGGED) {
             auto r = ops.prev(root_v[top], nk, ik);
             if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
         }
 
-        // Scan backward
+        // Scan backward — non-sentinel root always has entries
         int pb = prefix_bits();
         for (int i = top - 1; i >= 0; --i) {
             if (root_v[i] == SENTINEL_TAGGED) continue;
             IK pfx = make_prefix(static_cast<uint8_t>(i));
             auto r = ops.max(root_v[i], pfx, pb);
-            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
+            return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
         }
         return {KEY{}, VALUE{}, false};
     }
