@@ -99,10 +99,10 @@ struct kntrie_ops {
         template<int REM, typename SUF>
         static IK suffix_to_ik_ct(SUF suf) noexcept {
             constexpr int SUF_BITS = static_cast<int>(sizeof(SUF) * 8);
-            if constexpr (REM == SUF_BITS)
-                return IK(suf);
-            else
+            if constexpr (REM >= SUF_BITS)
                 return IK(suf) << (REM - SUF_BITS);
+            else
+                return IK(suf) >> (SUF_BITS - REM);
         }
 
 
