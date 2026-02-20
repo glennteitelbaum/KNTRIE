@@ -30,18 +30,19 @@ private:
 
     static constexpr int IK_BITS  = KO::IK_BITS;
     static constexpr int KEY_BITS = KO::KEY_BITS;
+    static constexpr int IK_OFF   = IK_BITS - KEY_BITS;
 
     // NK0 = initial narrowed key type matching KEY width (>= 16 bits)
     using NK0 = std::conditional_t<KEY_BITS <= 16, uint16_t,
                 std::conditional_t<KEY_BITS <= 32, uint32_t, uint64_t>>;
-    using OPS      = kntrie_ops<NK0, VALUE, ALLOC, IK>;
-    using ITER_OPS = kntrie_iter_ops<NK0, VALUE, ALLOC, IK>;
+    using OPS      = kntrie_ops<NK0, VALUE, ALLOC, IK, IK_OFF>;
+    using ITER_OPS = kntrie_iter_ops<NK0, VALUE, ALLOC, IK, IK_OFF>;
 
     static constexpr int NK0_BITS = static_cast<int>(sizeof(NK0) * 8);
 
     using NNK0         = next_narrow_t<NK0>;
-    using NARROW_OPS   = kntrie_ops<NNK0, VALUE, ALLOC, IK>;
-    using NARROW_ITER  = kntrie_iter_ops<NNK0, VALUE, ALLOC, IK>;
+    using NARROW_OPS   = kntrie_ops<NNK0, VALUE, ALLOC, IK, IK_OFF>;
+    using NARROW_ITER  = kntrie_iter_ops<NNK0, VALUE, ALLOC, IK, IK_OFF>;
 
     using NNNK0  = next_narrow_t<NNK0>;
     using NNNNK0 = next_narrow_t<NNNK0>;   // uint8_t for u64 keys
@@ -71,8 +72,8 @@ private:
                         std::conditional_t<(BITS > NNK0_BITS / 2), NNK0,
                         std::conditional_t<(BITS > NNNK0_BITS / 2), NNNK0, NNNNK0>>>;
 
-        using OPS_TYPE  = kntrie_ops<NK_TYPE, VALUE, ALLOC, IK>;
-        using ITER_TYPE = kntrie_iter_ops<NK_TYPE, VALUE, ALLOC, IK>;
+        using OPS_TYPE  = kntrie_ops<NK_TYPE, VALUE, ALLOC, IK, IK_OFF>;
+        using ITER_TYPE = kntrie_iter_ops<NK_TYPE, VALUE, ALLOC, IK, IK_OFF>;
 
         // Shift and narrow nk to the correct type for this depth
         static NK_TYPE narrow(NK0 nk) noexcept {
@@ -245,6 +246,7 @@ public:
         }
         uint8_t top = nk_byte(nk, SKIP);
         uint64_t child = root[top];
+        if (child == SENTINEL_TAGGED) [[unlikely]] return nullptr;
         constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
         using D = root_dispatch<BITS>;
         return D::OPS_TYPE::template find_node<BITS>(child, D::narrow(nk));

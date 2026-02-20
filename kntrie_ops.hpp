@@ -18,7 +18,7 @@ namespace gteitelbaum {
 //      Used by leaf dispatch for iteration key reconstruction.
 // ======================================================================
 
-template<typename NK, typename VALUE, typename ALLOC, typename IK = NK>
+template<typename NK, typename VALUE, typename ALLOC, typename IK = NK, int IK_OFF_V = 0>
 struct kntrie_ops {
     using BO  = bitmask_ops<VALUE, ALLOC>;
     using VT  = value_traits<VALUE, ALLOC>;
@@ -28,9 +28,10 @@ struct kntrie_ops {
 
     static constexpr int NK_BITS = sizeof(NK) * 8;
     static constexpr int IK_BITS = sizeof(IK) * 8;
+    static constexpr int IK_OFF  = IK_OFF_V;
 
     using NNK    = next_narrow_t<NK>;
-    using NARROW = kntrie_ops<NNK, VALUE, ALLOC, IK>;
+    using NARROW = kntrie_ops<NNK, VALUE, ALLOC, IK, IK_OFF>;
 
     // ==================================================================
     // leaf_ops — combined functor entry + table for leaf dispatch.
@@ -86,23 +87,27 @@ struct kntrie_ops {
         }
 
         // Derive prefix from full_ik at compile-time BITS depth.
-        // On the match path, consumed bits in full_ik are the correct prefix.
+        // REM = remaining key bits. IK position = REM + IK_OFF.
         template<int REM>
         static IK derive_prefix(IK full_ik) noexcept {
-            if constexpr (REM >= IK_BITS)
+            constexpr int SHIFT = REM + IK_OFF;
+            if constexpr (SHIFT >= IK_BITS)
                 return IK(0);
             else
-                return full_ik & (~IK(0) << REM);
+                return full_ik & (~IK(0) << SHIFT);
         }
 
         // Compile-time suffix positioning: shift suffix to correct IK position
         template<int REM, typename SUF>
         static IK suffix_to_ik_ct(SUF suf) noexcept {
             constexpr int SUF_BITS = static_cast<int>(sizeof(SUF) * 8);
-            if constexpr (REM >= SUF_BITS)
-                return IK(suf) << (REM - SUF_BITS);
+            constexpr int SHIFT = REM - SUF_BITS + IK_OFF;
+            if constexpr (SHIFT > 0)
+                return IK(suf) << SHIFT;
+            else if constexpr (SHIFT < 0)
+                return IK(suf) >> (-SHIFT);
             else
-                return IK(suf) >> (SUF_BITS - REM);
+                return IK(suf);
         }
 
 
@@ -175,7 +180,7 @@ struct kntrie_ops {
                     uint8_t kb = static_cast<uint8_t>(key64 >> (56 - shift));
                     uint8_t pb = static_cast<uint8_t>(pfx >> (56 - shift));
                     if (kb < pb) {
-                        constexpr int bits = IK_BITS - BITS;
+                        constexpr int bits = IK_BITS - IK_OFF - BITS;
                         IK prefix = derive_prefix<BITS>(full_ik);
                         return min_at<SKIP>(node, hdr, prefix, bits);
                     }
@@ -212,7 +217,7 @@ struct kntrie_ops {
                     uint8_t kb = static_cast<uint8_t>(key64 >> (56 - shift));
                     uint8_t pb = static_cast<uint8_t>(pfx >> (56 - shift));
                     if (kb > pb) {
-                        constexpr int bits = IK_BITS - BITS;
+                        constexpr int bits = IK_BITS - IK_OFF - BITS;
                         IK prefix = derive_prefix<BITS>(full_ik);
                         return max_at<SKIP>(node, hdr, prefix, bits);
                     }
