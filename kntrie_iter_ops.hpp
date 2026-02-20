@@ -3,6 +3,7 @@
 
 #include "kntrie_bitmask.hpp"
 #include "kntrie_compact.hpp"
+#include "kntrie_ops.hpp"
 
 namespace gteitelbaum {
 
@@ -22,18 +23,20 @@ struct kntrie_stats_t {
 // Standalone stateless struct. Same NK narrowing pattern as kntrie_ops.
 // ======================================================================
 
-template<typename NK, typename VALUE, typename ALLOC>
+template<typename NK, typename VALUE, typename ALLOC, typename IK = NK>
 struct kntrie_iter_ops {
     using BO  = bitmask_ops<VALUE, ALLOC>;
     using VT  = value_traits<VALUE, ALLOC>;
     using VST = typename VT::slot_type;
     using CO  = compact_ops<NK, VALUE, ALLOC>;
     using BLD = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
+    using OPS = kntrie_ops<NK, VALUE, ALLOC, IK>;
 
     static constexpr int NK_BITS = sizeof(NK) * 8;
+    static constexpr int IK_BITS = sizeof(IK) * 8;
 
     using NNK    = next_narrow_t<NK>;
-    using NARROW = kntrie_iter_ops<NNK, VALUE, ALLOC>;
+    using NARROW = kntrie_iter_ops<NNK, VALUE, ALLOC, IK>;
 
     // ==================================================================
 
@@ -47,158 +50,56 @@ struct kntrie_iter_ops {
     // BITS: compile-time remaining key bits for NK narrowing.
     // ==================================================================
 
-    // --- leaf dispatch helpers (compile-time CO/BO) ---
-    // Suffix is NK-typed: stored value with remaining key in top bits of NK.
-    // To position in IK: shift left to top of IK, then right by consumed bits.
-    // Formula: prefix | ((IK(suffix) << (IK_BITS - NK_BITS)) >> bits)
-
-    template<typename IK>
-    static iter_ops_result_t<IK, VST> leaf_first(const uint64_t* node,
-                                                    const node_header_t* hdr,
-                                                    IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
-        if constexpr (sizeof(NK) == 1) {
-            size_t hs = 1 + (hdr->is_skip() ? 1 : 0);
-            auto r = BO::bitmap_iter_first(node, hs);
-            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
-            return {prefix | contrib, r.value, true};
-        } else {
-            auto r = CO::iter_first(node, hdr);
-            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
-            return {prefix | contrib, r.value, true};
-        }
-    }
-
-    template<typename IK>
-    static iter_ops_result_t<IK, VST> leaf_last(const uint64_t* node,
-                                                   const node_header_t* hdr,
-                                                   IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
-        if constexpr (sizeof(NK) == 1) {
-            size_t hs = 1 + (hdr->is_skip() ? 1 : 0);
-            auto r = BO::bitmap_iter_last(node, *hdr, hs);
-            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
-            return {prefix | contrib, r.value, true};
-        } else {
-            auto r = CO::iter_last(node, hdr);
-            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
-            return {prefix | contrib, r.value, true};
-        }
-    }
-
-    template<typename IK>
-    static iter_ops_result_t<IK, VST> leaf_next(const uint64_t* node,
-                                                   const node_header_t* hdr,
-                                                   NK suf, IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
-        if constexpr (sizeof(NK) == 1) {
-            size_t hs = 1 + (hdr->is_skip() ? 1 : 0);
-            auto r = BO::bitmap_iter_next(node, static_cast<uint8_t>(suf), hs);
-            if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
-            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
-            return {prefix | contrib, r.value, true};
-        } else {
-            auto r = CO::iter_next(node, hdr, suf);
-            if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
-            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
-            return {prefix | contrib, r.value, true};
-        }
-    }
-
-    template<typename IK>
-    static iter_ops_result_t<IK, VST> leaf_prev(const uint64_t* node,
-                                                   const node_header_t* hdr,
-                                                   NK suf, IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
-        if constexpr (sizeof(NK) == 1) {
-            size_t hs = 1 + (hdr->is_skip() ? 1 : 0);
-            auto r = BO::bitmap_iter_prev(node, static_cast<uint8_t>(suf), hs);
-            if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
-            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
-            return {prefix | contrib, r.value, true};
-        } else {
-            auto r = CO::iter_prev(node, hdr, suf);
-            if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
-            IK contrib = (IK(r.suffix) << (IK_BITS - NK_BITS)) >> bits;
-            return {prefix | contrib, r.value, true};
-        }
-    }
-
     // ==================================================================
     // descend_min: walk always-min path
     // Compile-time recursive through skips (leaf prefix + chain embed).
     // ==================================================================
 
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_min(uint64_t ptr,
                                                      IK prefix, int bits) noexcept {
         if (ptr & LEAF_BIT) {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             if (hdr->entries() == 0) return {IK{}, nullptr, false};
-            uint8_t skip = hdr->skip();
-            if (skip)
-                return descend_min_leaf_skip<BITS, IK>(
-                    node, hdr, hdr->prefix_u64(), skip, 0, prefix, bits);
-            return leaf_first<IK>(node, hdr, prefix, bits);
+            return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].min(
+                node, *hdr, prefix, bits);
         }
 
         const uint64_t* node = bm_to_node_const(ptr);
         uint8_t sc = get_header(node)->skip();
         if (sc > 0)
-            return descend_min_chain_skip<BITS, IK>(node, sc, 0, prefix, bits);
-        return descend_min_bm_final<BITS, IK>(node, sc, prefix, bits);
-    }
-
-    // Leaf prefix: accumulate bytes, compile-time narrow
-    template<int BITS, typename IK> requires (BITS >= 8)
-    static iter_ops_result_t<IK, VST> descend_min_leaf_skip(
-            const uint64_t* node, const node_header_t* hdr,
-            uint64_t pfx_u64, uint8_t skip, uint8_t pos,
-            IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= skip)
-            return leaf_first<IK>(node, hdr, prefix, bits);
-
-        prefix |= IK(pfx_byte(pfx_u64, pos)) << (IK_BITS - bits - 8);
-        if constexpr (BITS > 8) {
-            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                return NARROW::template descend_min_leaf_skip<BITS - 8, IK>(
-                    node, hdr, pfx_u64, skip, pos + 1, prefix, bits + 8);
-            else
-                return descend_min_leaf_skip<BITS - 8, IK>(
-                    node, hdr, pfx_u64, skip, pos + 1, prefix, bits + 8);
-        }
-        __builtin_unreachable();
+            return descend_min_chain_skip<BITS>(node, sc, 0, prefix, bits);
+        return descend_min_bm_final<BITS>(node, sc, prefix, bits);
     }
 
     // Chain embed: accumulate bytes, compile-time narrow
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_min_chain_skip(
             const uint64_t* node, uint8_t sc, uint8_t pos,
             IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
+        
         if (pos >= sc)
-            return descend_min_bm_final<BITS, IK>(node, sc, prefix, bits);
+            return descend_min_bm_final<BITS>(node, sc, prefix, bits);
 
         prefix |= IK(BO::skip_byte(node, pos)) << (IK_BITS - bits - 8);
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                return NARROW::template descend_min_chain_skip<BITS - 8, IK>(
+                return NARROW::template descend_min_chain_skip<BITS - 8>(
                     node, sc, pos + 1, prefix, bits + 8);
             else
-                return descend_min_chain_skip<BITS - 8, IK>(
+                return descend_min_chain_skip<BITS - 8>(
                     node, sc, pos + 1, prefix, bits + 8);
         }
         __builtin_unreachable();
     }
 
     // Final bitmap: first child, recurse
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_min_bm_final(
             const uint64_t* node, uint8_t sc,
             IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
+        
         const bitmap_256_t& fbm = BO::chain_bitmap(node, sc);
         uint8_t byte = fbm.first_set_bit();
         prefix |= IK(byte) << (IK_BITS - bits - 8);
@@ -206,10 +107,10 @@ struct kntrie_iter_ops {
 
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                return NARROW::template descend_min<BITS - 8, IK>(
+                return NARROW::template descend_min<BITS - 8>(
                     child, prefix, bits + 8);
             else
-                return descend_min<BITS - 8, IK>(child, prefix, bits + 8);
+                return descend_min<BITS - 8>(child, prefix, bits + 8);
         }
         __builtin_unreachable();
     }
@@ -218,71 +119,48 @@ struct kntrie_iter_ops {
     // descend_max: walk always-max path (same structure as min)
     // ==================================================================
 
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_max(uint64_t ptr,
                                                      IK prefix, int bits) noexcept {
         if (ptr & LEAF_BIT) {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             if (hdr->entries() == 0) return {IK{}, nullptr, false};
-            uint8_t skip = hdr->skip();
-            if (skip)
-                return descend_max_leaf_skip<BITS, IK>(
-                    node, hdr, hdr->prefix_u64(), skip, 0, prefix, bits);
-            return leaf_last<IK>(node, hdr, prefix, bits);
+            return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].max(
+                node, *hdr, prefix, bits);
         }
 
         const uint64_t* node = bm_to_node_const(ptr);
         uint8_t sc = get_header(node)->skip();
         if (sc > 0)
-            return descend_max_chain_skip<BITS, IK>(node, sc, 0, prefix, bits);
-        return descend_max_bm_final<BITS, IK>(node, sc, prefix, bits);
+            return descend_max_chain_skip<BITS>(node, sc, 0, prefix, bits);
+        return descend_max_bm_final<BITS>(node, sc, prefix, bits);
     }
 
-    template<int BITS, typename IK> requires (BITS >= 8)
-    static iter_ops_result_t<IK, VST> descend_max_leaf_skip(
-            const uint64_t* node, const node_header_t* hdr,
-            uint64_t pfx_u64, uint8_t skip, uint8_t pos,
-            IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= skip)
-            return leaf_last<IK>(node, hdr, prefix, bits);
-        prefix |= IK(pfx_byte(pfx_u64, pos)) << (IK_BITS - bits - 8);
-        if constexpr (BITS > 8) {
-            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                return NARROW::template descend_max_leaf_skip<BITS - 8, IK>(
-                    node, hdr, pfx_u64, skip, pos + 1, prefix, bits + 8);
-            else
-                return descend_max_leaf_skip<BITS - 8, IK>(
-                    node, hdr, pfx_u64, skip, pos + 1, prefix, bits + 8);
-        }
-        __builtin_unreachable();
-    }
-
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_max_chain_skip(
             const uint64_t* node, uint8_t sc, uint8_t pos,
             IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
+        
         if (pos >= sc)
-            return descend_max_bm_final<BITS, IK>(node, sc, prefix, bits);
+            return descend_max_bm_final<BITS>(node, sc, prefix, bits);
         prefix |= IK(BO::skip_byte(node, pos)) << (IK_BITS - bits - 8);
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                return NARROW::template descend_max_chain_skip<BITS - 8, IK>(
+                return NARROW::template descend_max_chain_skip<BITS - 8>(
                     node, sc, pos + 1, prefix, bits + 8);
             else
-                return descend_max_chain_skip<BITS - 8, IK>(
+                return descend_max_chain_skip<BITS - 8>(
                     node, sc, pos + 1, prefix, bits + 8);
         }
         __builtin_unreachable();
     }
 
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_max_bm_final(
             const uint64_t* node, uint8_t sc,
             IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
+        
         const bitmap_256_t& fbm = BO::chain_bitmap(node, sc);
         uint8_t byte = fbm.last_set_bit();
         int slot = get_header(node)->entries() - 1;
@@ -290,10 +168,10 @@ struct kntrie_iter_ops {
         uint64_t child = BO::chain_children(node, sc)[slot];
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                return NARROW::template descend_max<BITS - 8, IK>(
+                return NARROW::template descend_max<BITS - 8>(
                     child, prefix, bits + 8);
             else
-                return descend_max<BITS - 8, IK>(child, prefix, bits + 8);
+                return descend_max<BITS - 8>(child, prefix, bits + 8);
         }
         __builtin_unreachable();
     }
@@ -303,77 +181,40 @@ struct kntrie_iter_ops {
     // NK ik narrows byte-by-byte like find/erase.
     // ==================================================================
 
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> iter_next_node(uint64_t ptr, NK ik,
                                                         IK prefix, int bits) noexcept {
         // --- LEAF ---
         if (ptr & LEAF_BIT) [[unlikely]] {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
-            uint8_t skip = hdr->skip();
-            if (skip) [[unlikely]]
-                return iter_next_leaf_skip<BITS, IK>(
-                    node, hdr, ik, hdr->prefix_u64(), skip, 0, prefix, bits);
-            return leaf_next<IK>(node, hdr, ik, prefix, bits);
+            return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].next(
+                node, *hdr, ik, prefix, bits);
         }
 
         // --- BITMASK ---
         const uint64_t* node = bm_to_node_const(ptr);
         uint8_t sc = get_header(node)->skip();
         if (sc > 0)
-            return iter_next_chain_skip<BITS, IK>(node, sc, ik, 0, prefix, bits);
-        return iter_next_bm_final<BITS, IK>(node, sc, ik, prefix, bits);
-    }
-
-    // Leaf prefix: compare byte-by-byte, narrow NK
-    template<int BITS, typename IK> requires (BITS >= 8)
-    static iter_ops_result_t<IK, VST> iter_next_leaf_skip(
-            const uint64_t* node, const node_header_t* hdr,
-            NK ik, uint64_t pfx_u64, uint8_t skip, uint8_t pos,
-            IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= skip)
-            return leaf_next<IK>(node, hdr, ik, prefix, bits);
-
-        uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
-        uint8_t pb = pfx_byte(pfx_u64, pos);
-        if (kb < pb) [[unlikely]] {
-            // Prefix > key: descend min through remaining prefix
-            return descend_min_leaf_skip<BITS, IK>(
-                node, hdr, pfx_u64, skip, pos, prefix, bits);
-        }
-        if (kb > pb) [[unlikely]] return {IK{}, nullptr, false};
-
-        prefix |= IK(pb) << (IK_BITS - bits - 8);
-        if constexpr (BITS > 8) {
-            NK shifted = static_cast<NK>(ik << 8);
-            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                return NARROW::template iter_next_leaf_skip<BITS - 8, IK>(
-                    node, hdr,
-                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    pfx_u64, skip, pos + 1, prefix, bits + 8);
-            else
-                return iter_next_leaf_skip<BITS - 8, IK>(
-                    node, hdr, shifted, pfx_u64, skip, pos + 1, prefix, bits + 8);
-        }
-        __builtin_unreachable();
+            return iter_next_chain_skip<BITS>(node, sc, ik, 0, prefix, bits);
+        return iter_next_bm_final<BITS>(node, sc, ik, prefix, bits);
     }
 
     // Chain embed: compare byte-by-byte, narrow NK
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> iter_next_chain_skip(
             const uint64_t* node, uint8_t sc,
             NK ik, uint8_t pos,
             IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
+        
         if (pos >= sc)
-            return iter_next_bm_final<BITS, IK>(node, sc, ik, prefix, bits);
+            return iter_next_bm_final<BITS>(node, sc, ik, prefix, bits);
 
         uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
         uint8_t sb = BO::skip_byte(node, pos);
         if (kb < sb) [[unlikely]] {
             // Chain byte > key: descend min from here
-            return descend_min_chain_skip<BITS, IK>(node, sc, pos, prefix, bits);
+            return descend_min_chain_skip<BITS>(node, sc, pos, prefix, bits);
         }
         if (kb > sb) [[unlikely]] return {IK{}, nullptr, false};
 
@@ -381,12 +222,12 @@ struct kntrie_iter_ops {
         if constexpr (BITS > 8) {
             NK shifted = static_cast<NK>(ik << 8);
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                return NARROW::template iter_next_chain_skip<BITS - 8, IK>(
+                return NARROW::template iter_next_chain_skip<BITS - 8>(
                     node, sc,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
                     pos + 1, prefix, bits + 8);
             else
-                return iter_next_chain_skip<BITS - 8, IK>(
+                return iter_next_chain_skip<BITS - 8>(
                     node, sc, shifted, pos + 1, prefix, bits + 8);
         }
         __builtin_unreachable();
@@ -394,11 +235,11 @@ struct kntrie_iter_ops {
 
     // Final bitmap: lookup byte, recurse child or next sibling.
     // BRANCHLESS: single branchless scan, returns 1-based slot (0 = not found).
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> iter_next_bm_final(
             const uint64_t* node, uint8_t sc,
             NK ik, IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
+        
         const bitmap_256_t& fbm = BO::chain_bitmap(node, sc);
         const uint64_t* children = BO::chain_children(node, sc);
         uint8_t byte = static_cast<uint8_t>(ik >> (NK_BITS - 8));
@@ -412,12 +253,12 @@ struct kntrie_iter_ops {
                 NK shifted = static_cast<NK>(ik << 8);
                 iter_ops_result_t<IK, VST> r;
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                    r = NARROW::template iter_next_node<BITS - 8, IK>(
+                    r = NARROW::template iter_next_node<BITS - 8>(
                         children[slot - 1],
                         static_cast<NNK>(shifted >> (NK_BITS / 2)),
                         cp, bits + 8);
                 else
-                    r = iter_next_node<BITS - 8, IK>(
+                    r = iter_next_node<BITS - 8>(
                         children[slot - 1], shifted, cp, bits + 8);
                 if (r.found) [[likely]] return r;
             }
@@ -429,10 +270,10 @@ struct kntrie_iter_ops {
             IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
             if constexpr (BITS > 8) {
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                    return NARROW::template descend_min<BITS - 8, IK>(
+                    return NARROW::template descend_min<BITS - 8>(
                         children[adj.slot], np, bits + 8);
                 else
-                    return descend_min<BITS - 8, IK>(
+                    return descend_min<BITS - 8>(
                         children[adj.slot], np, bits + 8);
             }
         }
@@ -443,71 +284,36 @@ struct kntrie_iter_ops {
     // iter_prev_node: find largest key < ik (mirrors iter_next)
     // ==================================================================
 
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> iter_prev_node(uint64_t ptr, NK ik,
                                                         IK prefix, int bits) noexcept {
         if (ptr & LEAF_BIT) [[unlikely]] {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
-            uint8_t skip = hdr->skip();
-            if (skip) [[unlikely]]
-                return iter_prev_leaf_skip<BITS, IK>(
-                    node, hdr, ik, hdr->prefix_u64(), skip, 0, prefix, bits);
-            return leaf_prev<IK>(node, hdr, ik, prefix, bits);
+            return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].prev(
+                node, *hdr, ik, prefix, bits);
         }
 
         const uint64_t* node = bm_to_node_const(ptr);
         uint8_t sc = get_header(node)->skip();
         if (sc > 0)
-            return iter_prev_chain_skip<BITS, IK>(node, sc, ik, 0, prefix, bits);
-        return iter_prev_bm_final<BITS, IK>(node, sc, ik, prefix, bits);
+            return iter_prev_chain_skip<BITS>(node, sc, ik, 0, prefix, bits);
+        return iter_prev_bm_final<BITS>(node, sc, ik, prefix, bits);
     }
 
-    template<int BITS, typename IK> requires (BITS >= 8)
-    static iter_ops_result_t<IK, VST> iter_prev_leaf_skip(
-            const uint64_t* node, const node_header_t* hdr,
-            NK ik, uint64_t pfx_u64, uint8_t skip, uint8_t pos,
-            IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
-        if (pos >= skip)
-            return leaf_prev<IK>(node, hdr, ik, prefix, bits);
-
-        uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
-        uint8_t pb = pfx_byte(pfx_u64, pos);
-        if (kb > pb) [[unlikely]] {
-            return descend_max_leaf_skip<BITS, IK>(
-                node, hdr, pfx_u64, skip, pos, prefix, bits);
-        }
-        if (kb < pb) [[unlikely]] return {IK{}, nullptr, false};
-
-        prefix |= IK(pb) << (IK_BITS - bits - 8);
-        if constexpr (BITS > 8) {
-            NK shifted = static_cast<NK>(ik << 8);
-            if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                return NARROW::template iter_prev_leaf_skip<BITS - 8, IK>(
-                    node, hdr,
-                    static_cast<NNK>(shifted >> (NK_BITS / 2)),
-                    pfx_u64, skip, pos + 1, prefix, bits + 8);
-            else
-                return iter_prev_leaf_skip<BITS - 8, IK>(
-                    node, hdr, shifted, pfx_u64, skip, pos + 1, prefix, bits + 8);
-        }
-        __builtin_unreachable();
-    }
-
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> iter_prev_chain_skip(
             const uint64_t* node, uint8_t sc,
             NK ik, uint8_t pos,
             IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
+        
         if (pos >= sc)
-            return iter_prev_bm_final<BITS, IK>(node, sc, ik, prefix, bits);
+            return iter_prev_bm_final<BITS>(node, sc, ik, prefix, bits);
 
         uint8_t kb = static_cast<uint8_t>(ik >> (NK_BITS - 8));
         uint8_t sb = BO::skip_byte(node, pos);
         if (kb > sb) [[unlikely]] {
-            return descend_max_chain_skip<BITS, IK>(node, sc, pos, prefix, bits);
+            return descend_max_chain_skip<BITS>(node, sc, pos, prefix, bits);
         }
         if (kb < sb) [[unlikely]] return {IK{}, nullptr, false};
 
@@ -515,22 +321,22 @@ struct kntrie_iter_ops {
         if constexpr (BITS > 8) {
             NK shifted = static_cast<NK>(ik << 8);
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                return NARROW::template iter_prev_chain_skip<BITS - 8, IK>(
+                return NARROW::template iter_prev_chain_skip<BITS - 8>(
                     node, sc,
                     static_cast<NNK>(shifted >> (NK_BITS / 2)),
                     pos + 1, prefix, bits + 8);
             else
-                return iter_prev_chain_skip<BITS - 8, IK>(
+                return iter_prev_chain_skip<BITS - 8>(
                     node, sc, shifted, pos + 1, prefix, bits + 8);
         }
         __builtin_unreachable();
     }
 
-    template<int BITS, typename IK> requires (BITS >= 8)
+    template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> iter_prev_bm_final(
             const uint64_t* node, uint8_t sc,
             NK ik, IK prefix, int bits) noexcept {
-        constexpr int IK_BITS = sizeof(IK) * 8;
+        
         const bitmap_256_t& fbm = BO::chain_bitmap(node, sc);
         const uint64_t* children = BO::chain_children(node, sc);
         uint8_t byte = static_cast<uint8_t>(ik >> (NK_BITS - 8));
@@ -544,12 +350,12 @@ struct kntrie_iter_ops {
                 NK shifted = static_cast<NK>(ik << 8);
                 iter_ops_result_t<IK, VST> r;
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                    r = NARROW::template iter_prev_node<BITS - 8, IK>(
+                    r = NARROW::template iter_prev_node<BITS - 8>(
                         children[slot - 1],
                         static_cast<NNK>(shifted >> (NK_BITS / 2)),
                         cp, bits + 8);
                 else
-                    r = iter_prev_node<BITS - 8, IK>(
+                    r = iter_prev_node<BITS - 8>(
                         children[slot - 1], shifted, cp, bits + 8);
                 if (r.found) [[likely]] return r;
             }
@@ -561,10 +367,10 @@ struct kntrie_iter_ops {
             IK np = prefix | (IK(adj.idx) << (IK_BITS - bits - 8));
             if constexpr (BITS > 8) {
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
-                    return NARROW::template descend_max<BITS - 8, IK>(
+                    return NARROW::template descend_max<BITS - 8>(
                         children[adj.slot], np, bits + 8);
                 else
-                    return descend_max<BITS - 8, IK>(
+                    return descend_max<BITS - 8>(
                         children[adj.slot], np, bits + 8);
             }
         }

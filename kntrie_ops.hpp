@@ -5,18 +5,20 @@
 #include "kntrie_compact.hpp"
 
 #include <array>
+#include <bit>
 
 namespace gteitelbaum {
 
 // ======================================================================
-// kntrie_ops<NK, VALUE, ALLOC> — stateless trie operations.
+// kntrie_ops<NK, VALUE, ALLOC, IK> — stateless trie operations.
 //
 // NK = narrowed key type (u64/u32/u16/u8). As trie descent consumes
 // bytes, NK narrows at half-width boundaries via the NARROW alias.
-// This eliminates all runtime suffix_type dispatch.
+// IK = full internal key type, constant across all narrowing levels.
+//      Used by leaf dispatch for iteration key reconstruction.
 // ======================================================================
 
-template<typename NK, typename VALUE, typename ALLOC>
+template<typename NK, typename VALUE, typename ALLOC, typename IK = NK>
 struct kntrie_ops {
     using BO  = bitmask_ops<VALUE, ALLOC>;
     using VT  = value_traits<VALUE, ALLOC>;
@@ -25,67 +27,195 @@ struct kntrie_ops {
     using BLD = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
 
     static constexpr int NK_BITS = sizeof(NK) * 8;
+    static constexpr int IK_BITS = sizeof(IK) * 8;
 
     using NNK    = next_narrow_t<NK>;
-    using NARROW = kntrie_ops<NNK, VALUE, ALLOC>;
+    using NARROW = kntrie_ops<NNK, VALUE, ALLOC, IK>;
 
     // ==================================================================
-    // Find — leaf_dispatch<BITS> functor table for skip dispatch
+    // leaf_ops — combined functor entry + table for leaf dispatch.
     // ==================================================================
+
+    struct leaf_ops_entry_t {
+        using find_fn_t   = const VALUE* (*)(const uint64_t*, node_header_t, NK) noexcept;
+        using iter_fn_t   = iter_ops_result_t<IK, VST> (*)(const uint64_t*, node_header_t, NK, IK, int) noexcept;
+        using minmax_fn_t = iter_ops_result_t<IK, VST> (*)(const uint64_t*, node_header_t, IK, int) noexcept;
+
+        find_fn_t   find;
+        iter_fn_t   next;
+        iter_fn_t   prev;
+        minmax_fn_t min;
+        minmax_fn_t max;
+    };
 
     template<int BITS>
-    struct leaf_dispatch {
+    struct leaf_ops_t {
         static constexpr int MAX_LEAF_SKIP = (BITS - 8) / 8;
 
-        using leaf_fn_t = const VALUE* (*)(const uint64_t* node,
-                                           node_header_t hdr, NK ik) noexcept;
-
+        // --- Helpers ---
         template<int SKIP>
-        static const VALUE* leaf_at(const uint64_t* node,
-                                     node_header_t hdr, NK ik) noexcept {
-            // Prefix check via packed u64
-            if constexpr (SKIP > 0) {
-                uint64_t key64 = static_cast<uint64_t>(ik) << (64 - NK_BITS);
-                uint64_t prefix = node[1];
-                constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
-                if ((key64 ^ prefix) & MASK) [[unlikely]] return nullptr;
-            }
-
-            constexpr size_t HS = 1 + (SKIP > 0);
+        static auto narrow_suffix(NK ik) noexcept {
             constexpr int REMAINING = BITS - 8 * SKIP;
-
-            // Shift past prefix bytes
+            using RNK = nk_for_bits_t<REMAINING>;
             [[maybe_unused]] NK shifted;
-            if constexpr (SKIP == 0)
-                shifted = ik;
-            else
-                shifted = static_cast<NK>(ik << (8 * SKIP));
-
+            if constexpr (SKIP == 0) shifted = ik;
+            else shifted = static_cast<NK>(ik << (8 * SKIP));
             if constexpr (REMAINING <= 8) {
-                // Bitmap leaf
-                uint8_t suffix = static_cast<uint8_t>(shifted >> (NK_BITS - 8));
-                return BO::bitmap_find(node, hdr, suffix, HS);
+                return static_cast<uint8_t>(shifted >> (NK_BITS - 8));
+            } else if constexpr (std::is_same_v<RNK, NK>) {
+                return shifted;
             } else {
-                // Compact leaf — correct NK type for remaining bits
-                using RNK = nk_for_bits_t<REMAINING>;
-                using RCO = compact_ops<RNK, VALUE, ALLOC>;
-
-                RNK suffix;
-                if constexpr (std::is_same_v<RNK, NK>) {
-                    suffix = shifted;
-                } else {
-                    constexpr int RNK_BITS = static_cast<int>(sizeof(RNK) * 8);
-                    suffix = static_cast<RNK>(shifted >> (NK_BITS - RNK_BITS));
-                }
-                return RCO::find(node, hdr, suffix, HS);
+                constexpr int RNK_BITS = static_cast<int>(sizeof(RNK) * 8);
+                return static_cast<RNK>(shifted >> (NK_BITS - RNK_BITS));
             }
         }
 
+        template<int SKIP>
+        static void accum_prefix(uint64_t pfx, IK& prefix, int& bits) noexcept {
+            if constexpr (SKIP > 0) {
+                for (int i = 0; i < SKIP; ++i)
+                    prefix |= IK(pfx_byte(pfx, i)) << (IK_BITS - bits - 8 * (i + 1));
+                bits += 8 * SKIP;
+            }
+        }
+
+        template<typename SUF>
+        static IK suffix_to_ik(SUF suf, int bits) noexcept {
+            constexpr int SUF_BITS = static_cast<int>(sizeof(SUF) * 8);
+            return (IK(suf) << (IK_BITS - SUF_BITS)) >> bits;
+        }
+
+        // --- find_at<SKIP> ---
+        template<int SKIP>
+        static const VALUE* find_at(const uint64_t* node,
+                                     node_header_t hdr, NK ik) noexcept {
+            if constexpr (SKIP > 0) {
+                uint64_t key64 = static_cast<uint64_t>(ik) << (64 - NK_BITS);
+                constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
+                if ((key64 ^ node[1]) & MASK) [[unlikely]] return nullptr;
+            }
+            constexpr size_t HS = 1 + (SKIP > 0);
+            constexpr int REMAINING = BITS - 8 * SKIP;
+            auto suf = narrow_suffix<SKIP>(ik);
+            if constexpr (REMAINING <= 8)
+                return BO::bitmap_find(node, hdr, suf, HS);
+            else {
+                using RCO = compact_ops<nk_for_bits_t<REMAINING>, VALUE, ALLOC>;
+                return RCO::find(node, hdr, suf, HS);
+            }
+        }
+
+        // --- min_at<SKIP> ---
+        template<int SKIP>
+        static iter_ops_result_t<IK, VST> min_at(const uint64_t* node,
+                                                   node_header_t hdr, IK prefix, int bits) noexcept {
+            accum_prefix<SKIP>(node[1], prefix, bits);
+            constexpr size_t HS = 1 + (SKIP > 0);
+            constexpr int REMAINING = BITS - 8 * SKIP;
+            if constexpr (REMAINING <= 8) {
+                auto r = BO::bitmap_iter_first(node, HS);
+                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+            } else {
+                using RCO = compact_ops<nk_for_bits_t<REMAINING>, VALUE, ALLOC>;
+                auto r = RCO::iter_first(node, &hdr);
+                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+            }
+        }
+
+        // --- max_at<SKIP> ---
+        template<int SKIP>
+        static iter_ops_result_t<IK, VST> max_at(const uint64_t* node,
+                                                   node_header_t hdr, IK prefix, int bits) noexcept {
+            accum_prefix<SKIP>(node[1], prefix, bits);
+            constexpr size_t HS = 1 + (SKIP > 0);
+            constexpr int REMAINING = BITS - 8 * SKIP;
+            if constexpr (REMAINING <= 8) {
+                auto r = BO::bitmap_iter_last(node, hdr, HS);
+                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+            } else {
+                using RCO = compact_ops<nk_for_bits_t<REMAINING>, VALUE, ALLOC>;
+                auto r = RCO::iter_last(node, &hdr);
+                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+            }
+        }
+
+        // --- next_at<SKIP> ---
+        template<int SKIP>
+        static iter_ops_result_t<IK, VST> next_at(const uint64_t* node,
+                                                    node_header_t hdr, NK ik, IK prefix, int bits) noexcept {
+            if constexpr (SKIP > 0) {
+                uint64_t key64 = static_cast<uint64_t>(ik) << (64 - NK_BITS);
+                uint64_t pfx = node[1];
+                constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
+                uint64_t diff = (key64 ^ pfx) & MASK;
+                if (diff) [[unlikely]] {
+                    int shift = std::countl_zero(diff) & ~7;
+                    uint8_t kb = static_cast<uint8_t>(key64 >> (56 - shift));
+                    uint8_t pb = static_cast<uint8_t>(pfx >> (56 - shift));
+                    if (kb < pb) return min_at<SKIP>(node, hdr, prefix, bits);
+                    return {IK{}, nullptr, false};
+                }
+            }
+            accum_prefix<SKIP>(node[1], prefix, bits);
+            constexpr size_t HS = 1 + (SKIP > 0);
+            constexpr int REMAINING = BITS - 8 * SKIP;
+            auto suf = narrow_suffix<SKIP>(ik);
+            if constexpr (REMAINING <= 8) {
+                auto r = BO::bitmap_iter_next(node, suf, HS);
+                if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
+                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+            } else {
+                using RCO = compact_ops<nk_for_bits_t<REMAINING>, VALUE, ALLOC>;
+                auto r = RCO::iter_next(node, &hdr, suf);
+                if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
+                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+            }
+        }
+
+        // --- prev_at<SKIP> ---
+        template<int SKIP>
+        static iter_ops_result_t<IK, VST> prev_at(const uint64_t* node,
+                                                    node_header_t hdr, NK ik, IK prefix, int bits) noexcept {
+            if constexpr (SKIP > 0) {
+                uint64_t key64 = static_cast<uint64_t>(ik) << (64 - NK_BITS);
+                uint64_t pfx = node[1];
+                constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
+                uint64_t diff = (key64 ^ pfx) & MASK;
+                if (diff) [[unlikely]] {
+                    int shift = std::countl_zero(diff) & ~7;
+                    uint8_t kb = static_cast<uint8_t>(key64 >> (56 - shift));
+                    uint8_t pb = static_cast<uint8_t>(pfx >> (56 - shift));
+                    if (kb > pb) return max_at<SKIP>(node, hdr, prefix, bits);
+                    return {IK{}, nullptr, false};
+                }
+            }
+            accum_prefix<SKIP>(node[1], prefix, bits);
+            constexpr size_t HS = 1 + (SKIP > 0);
+            constexpr int REMAINING = BITS - 8 * SKIP;
+            auto suf = narrow_suffix<SKIP>(ik);
+            if constexpr (REMAINING <= 8) {
+                auto r = BO::bitmap_iter_prev(node, suf, HS);
+                if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
+                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+            } else {
+                using RCO = compact_ops<nk_for_bits_t<REMAINING>, VALUE, ALLOC>;
+                auto r = RCO::iter_prev(node, &hdr, suf);
+                if (!r.found) [[unlikely]] return {IK{}, nullptr, false};
+                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+            }
+        }
+
+        // --- Build table ---
         template<size_t... Is>
         static constexpr auto make_table(std::index_sequence<Is...>) {
-            // Using C array via initializer list
-            return std::array<leaf_fn_t, sizeof...(Is)>{
-                &leaf_at<static_cast<int>(Is)>...
+            return std::array<leaf_ops_entry_t, sizeof...(Is)>{
+                leaf_ops_entry_t{
+                    &find_at<static_cast<int>(Is)>,
+                    &next_at<static_cast<int>(Is)>,
+                    &prev_at<static_cast<int>(Is)>,
+                    &min_at<static_cast<int>(Is)>,
+                    &max_at<static_cast<int>(Is)>
+                }...
             };
         }
 
@@ -98,7 +228,7 @@ struct kntrie_ops {
         if (ptr & LEAF_BIT) [[unlikely]] {
             const uint64_t* node = reinterpret_cast<const uint64_t*>(ptr ^ LEAF_BIT);
             node_header_t hdr = *get_header(node);
-            return leaf_dispatch<BITS>::TABLE[hdr.skip()](node, hdr, ik);
+            return leaf_ops_t<BITS>::TABLE[hdr.skip()].find(node, hdr, ik);
         }
 
         const uint64_t* bm = reinterpret_cast<const uint64_t*>(ptr);

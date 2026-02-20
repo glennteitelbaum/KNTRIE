@@ -34,14 +34,14 @@ private:
     // NK0 = initial narrowed key type matching KEY width (>= 16 bits)
     using NK0 = std::conditional_t<KEY_BITS <= 16, uint16_t,
                 std::conditional_t<KEY_BITS <= 32, uint32_t, uint64_t>>;
-    using OPS      = kntrie_ops<NK0, VALUE, ALLOC>;
-    using ITER_OPS = kntrie_iter_ops<NK0, VALUE, ALLOC>;
+    using OPS      = kntrie_ops<NK0, VALUE, ALLOC, IK>;
+    using ITER_OPS = kntrie_iter_ops<NK0, VALUE, ALLOC, IK>;
 
     static constexpr int NK0_BITS = static_cast<int>(sizeof(NK0) * 8);
 
     using NNK0         = next_narrow_t<NK0>;
-    using NARROW_OPS   = kntrie_ops<NNK0, VALUE, ALLOC>;
-    using NARROW_ITER  = kntrie_iter_ops<NNK0, VALUE, ALLOC>;
+    using NARROW_OPS   = kntrie_ops<NNK0, VALUE, ALLOC, IK>;
+    using NARROW_ITER  = kntrie_iter_ops<NNK0, VALUE, ALLOC, IK>;
 
     using NNNK0  = next_narrow_t<NNK0>;
     using NNNNK0 = next_narrow_t<NNNK0>;   // uint8_t for u64 keys
@@ -71,8 +71,8 @@ private:
                         std::conditional_t<(BITS > NNK0_BITS / 2), NNK0,
                         std::conditional_t<(BITS > NNNK0_BITS / 2), NNNK0, NNNNK0>>>;
 
-        using OPS_TYPE  = kntrie_ops<NK_TYPE, VALUE, ALLOC>;
-        using ITER_TYPE = kntrie_iter_ops<NK_TYPE, VALUE, ALLOC>;
+        using OPS_TYPE  = kntrie_ops<NK_TYPE, VALUE, ALLOC, IK>;
+        using ITER_TYPE = kntrie_iter_ops<NK_TYPE, VALUE, ALLOC, IK>;
 
         // Shift and narrow nk to the correct type for this depth
         static NK_TYPE narrow(NK0 nk) noexcept {
@@ -220,43 +220,88 @@ public:
     size_t memory_needed() const noexcept { return bld_v.memory_needed(); }
 
     // ==================================================================
-    // Find — functor array, no loops, no switch in hot path.
+    // root_skip_ops — combined functor table for root skip dispatch.
+    // One entry per skip value with find/next/prev/min/max.
     // ==================================================================
 
-    using find_func_t = const VALUE* (*)(const uint64_t* root,
-                                         uint64_t prefix,
-                                         uint8_t skip, NK0 nk);
+    struct root_skip_ops_t {
+        using find_fn_t   = const VALUE* (*)(const uint64_t*, uint64_t, NK0) noexcept;
+        using minmax_fn_t = iter_ops_result_t<IK, VST> (*)(uint64_t, IK, int) noexcept;
+        using iter_fn_t   = iter_ops_result_t<IK, VST> (*)(uint64_t, NK0, IK, int) noexcept;
+
+        find_fn_t   find;
+        iter_fn_t   next;
+        iter_fn_t   prev;
+        minmax_fn_t min;
+        minmax_fn_t max;
+    };
 
     template<int SKIP>
-    static const VALUE* find_at(const uint64_t* root, uint64_t prefix,
-                                uint8_t /*skip*/, NK0 nk) noexcept {
+    static const VALUE* root_find_at(const uint64_t* root, uint64_t prefix,
+                                      NK0 nk) noexcept {
         if constexpr (SKIP > 0) {
             constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
             if ((nk_to_u64(nk) ^ prefix) & MASK) [[unlikely]] return nullptr;
         }
-
         uint8_t top = nk_byte(nk, SKIP);
         uint64_t child = root[top];
-
         constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
         using D = root_dispatch<BITS>;
         return D::OPS_TYPE::template find_node<BITS>(child, D::narrow(nk));
     }
 
-    static constexpr find_func_t find_func[] = {
-        &find_at<0>,
-        &find_at<(MAX_ROOT_SKIP >= 1) ? 1 : 0>,
-        &find_at<(MAX_ROOT_SKIP >= 2) ? 2 : 0>,
-        &find_at<(MAX_ROOT_SKIP >= 3) ? 3 : 0>,
-        &find_at<(MAX_ROOT_SKIP >= 4) ? 4 : 0>,
-        &find_at<(MAX_ROOT_SKIP >= 5) ? 5 : 0>,
-        &find_at<(MAX_ROOT_SKIP >= 6) ? 6 : 0>,
-    };
+    template<int SKIP>
+    static iter_ops_result_t<IK, VST> root_min_at(uint64_t child,
+                                                     IK prefix, int bits) noexcept {
+        constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
+        using D = root_dispatch<BITS>;
+        return D::ITER_TYPE::template descend_min<BITS>(child, prefix, bits);
+    }
+
+    template<int SKIP>
+    static iter_ops_result_t<IK, VST> root_max_at(uint64_t child,
+                                                     IK prefix, int bits) noexcept {
+        constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
+        using D = root_dispatch<BITS>;
+        return D::ITER_TYPE::template descend_max<BITS>(child, prefix, bits);
+    }
+
+    template<int SKIP>
+    static iter_ops_result_t<IK, VST> root_next_at(uint64_t child,
+                                                      NK0 nk, IK prefix, int bits) noexcept {
+        constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
+        using D = root_dispatch<BITS>;
+        return D::ITER_TYPE::template iter_next_node<BITS>(child, D::narrow(nk), prefix, bits);
+    }
+
+    template<int SKIP>
+    static iter_ops_result_t<IK, VST> root_prev_at(uint64_t child,
+                                                      NK0 nk, IK prefix, int bits) noexcept {
+        constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
+        using D = root_dispatch<BITS>;
+        return D::ITER_TYPE::template iter_prev_node<BITS>(child, D::narrow(nk), prefix, bits);
+    }
+
+    template<size_t... Is>
+    static constexpr auto make_root_table(std::index_sequence<Is...>) {
+        return std::array<root_skip_ops_t, sizeof...(Is)>{
+            root_skip_ops_t{
+                &root_find_at<static_cast<int>(Is)>,
+                &root_next_at<static_cast<int>(Is)>,
+                &root_prev_at<static_cast<int>(Is)>,
+                &root_min_at<static_cast<int>(Is)>,
+                &root_max_at<static_cast<int>(Is)>
+            }...
+        };
+    }
+
+    static constexpr auto ROOT_OPS = make_root_table(
+        std::make_index_sequence<MAX_ROOT_SKIP + 1>{});
 
     const VALUE* find_value(const KEY& key) const noexcept {
         IK ik = KO::to_internal(key);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        return find_func[root_skip_v](root_v, root_prefix_v, root_skip_v, nk);
+        return ROOT_OPS[root_skip_v].find(root_v, root_prefix_v, nk);
     }
 
     bool contains(const KEY& key) const noexcept {
@@ -356,87 +401,71 @@ public:
     struct iter_result_t { KEY key; VALUE value; bool found; };
 
     iter_result_t iter_first() const noexcept {
-        return skip_switch(root_skip_v, [&]<int BITS>() -> iter_result_t {
-            using D = root_dispatch<BITS>;
-            int pb = prefix_bits();
-            for (int i = 0; i < 256; ++i) {
-                IK pfx = make_prefix(static_cast<uint8_t>(i));
-                auto r = D::ITER_TYPE::template descend_min<BITS, IK>(
-                    root_v[i], pfx, pb);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            }
-            return {KEY{}, VALUE{}, false};
-        });
+        int pb = prefix_bits();
+        auto& ops = ROOT_OPS[root_skip_v];
+        for (int i = 0; i < 256; ++i) {
+            IK pfx = make_prefix(static_cast<uint8_t>(i));
+            auto r = ops.min(root_v[i], pfx, pb);
+            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
+        }
+        return {KEY{}, VALUE{}, false};
     }
 
     iter_result_t iter_last() const noexcept {
-        return skip_switch(root_skip_v, [&]<int BITS>() -> iter_result_t {
-            using D = root_dispatch<BITS>;
-            int pb = prefix_bits();
-            for (int i = 255; i >= 0; --i) {
-                IK pfx = make_prefix(static_cast<uint8_t>(i));
-                auto r = D::ITER_TYPE::template descend_max<BITS, IK>(
-                    root_v[i], pfx, pb);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            }
-            return {KEY{}, VALUE{}, false};
-        });
+        int pb = prefix_bits();
+        auto& ops = ROOT_OPS[root_skip_v];
+        for (int i = 255; i >= 0; --i) {
+            IK pfx = make_prefix(static_cast<uint8_t>(i));
+            auto r = ops.max(root_v[i], pfx, pb);
+            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
+        }
+        return {KEY{}, VALUE{}, false};
     }
 
     iter_result_t iter_next(KEY key) const noexcept {
         IK ik = KO::to_internal(key);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
         uint8_t top = nk_byte(nk, root_skip_v);
+        int pb = prefix_bits();
+        auto& ops = ROOT_OPS[root_skip_v];
 
-        return skip_switch(root_skip_v, [&]<int BITS>() -> iter_result_t {
-            using D = root_dispatch<BITS>;
-            int pb = prefix_bits();
+        // Try next within same slot
+        {
+            IK pfx = make_prefix(top);
+            auto r = ops.next(root_v[top], nk, pfx, pb);
+            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
+        }
 
-            // Try next within same slot
-            {
-                IK pfx = make_prefix(top);
-                auto r = D::ITER_TYPE::template iter_next_node<BITS, IK>(
-                    root_v[top], D::narrow(nk), pfx, pb);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            }
-
-            // Scan forward
-            for (int i = top + 1; i < 256; ++i) {
-                IK pfx = make_prefix(static_cast<uint8_t>(i));
-                auto r = D::ITER_TYPE::template descend_min<BITS, IK>(
-                    root_v[i], pfx, pb);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            }
-            return {KEY{}, VALUE{}, false};
-        });
+        // Scan forward
+        for (int i = top + 1; i < 256; ++i) {
+            IK pfx = make_prefix(static_cast<uint8_t>(i));
+            auto r = ops.min(root_v[i], pfx, pb);
+            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
+        }
+        return {KEY{}, VALUE{}, false};
     }
 
     iter_result_t iter_prev(KEY key) const noexcept {
         IK ik = KO::to_internal(key);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
         uint8_t top = nk_byte(nk, root_skip_v);
+        int pb = prefix_bits();
+        auto& ops = ROOT_OPS[root_skip_v];
 
-        return skip_switch(root_skip_v, [&]<int BITS>() -> iter_result_t {
-            using D = root_dispatch<BITS>;
-            int pb = prefix_bits();
+        // Try prev within same slot
+        {
+            IK pfx = make_prefix(top);
+            auto r = ops.prev(root_v[top], nk, pfx, pb);
+            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
+        }
 
-            // Try prev within same slot
-            {
-                IK pfx = make_prefix(top);
-                auto r = D::ITER_TYPE::template iter_prev_node<BITS, IK>(
-                    root_v[top], D::narrow(nk), pfx, pb);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            }
-
-            // Scan backward
-            for (int i = top - 1; i >= 0; --i) {
-                IK pfx = make_prefix(static_cast<uint8_t>(i));
-                auto r = D::ITER_TYPE::template descend_max<BITS, IK>(
-                    root_v[i], pfx, pb);
-                if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-            }
-            return {KEY{}, VALUE{}, false};
-        });
+        // Scan backward
+        for (int i = top - 1; i >= 0; --i) {
+            IK pfx = make_prefix(static_cast<uint8_t>(i));
+            auto r = ops.max(root_v[i], pfx, pb);
+            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
+        }
+        return {KEY{}, VALUE{}, false};
     }
 
 private:
