@@ -118,15 +118,23 @@ struct node_header_t {
     bool    is_skip() const noexcept { return skip_count_v & 0x07; }
     void set_skip(uint8_t s) noexcept { skip_count_v = (s & 0x07); }
 
-    // --- leaf prefix bytes (in node[1], only valid via get_header(node)->) ---
-    const uint8_t* prefix_bytes() const noexcept {
+    // --- leaf prefix: packed uint64_t in node[1], byte 0 at bits 63..56 ---
+    uint64_t prefix_u64() const noexcept {
         auto* p = reinterpret_cast<const uint64_t*>(this);
-        return reinterpret_cast<const uint8_t*>(p + 1);
+        return p[1];
+    }
+    uint8_t prefix_byte(uint8_t i) const noexcept {
+        return static_cast<uint8_t>(prefix_u64() >> (56 - 8 * i));
+    }
+    void set_prefix_u64(uint64_t v) noexcept {
+        auto* p = reinterpret_cast<uint64_t*>(this);
+        p[1] = v;
     }
     void set_prefix(const uint8_t* pfx, uint8_t len) noexcept {
-        auto* p = reinterpret_cast<uint64_t*>(this);
-        uint8_t* dst = reinterpret_cast<uint8_t*>(p + 1);
-        for (uint8_t i = 0; i < len; ++i) dst[i] = pfx[i];
+        uint64_t v = 0;
+        for (uint8_t i = 0; i < len; ++i)
+            v |= uint64_t(pfx[i]) << (56 - 8 * i);
+        set_prefix_u64(v);
     }
 
     // --- entries / alloc ---
@@ -143,6 +151,24 @@ static_assert(sizeof(node_header_t) == 8);
 
 inline node_header_t*       get_header(uint64_t* n)       noexcept { return reinterpret_cast<node_header_t*>(n); }
 inline const node_header_t* get_header(const uint64_t* n) noexcept { return reinterpret_cast<const node_header_t*>(n); }
+
+// --- Prefix u64 helpers (byte 0 at bits 63..56) ---
+inline uint8_t pfx_byte(uint64_t pfx, uint8_t i) noexcept {
+    return static_cast<uint8_t>(pfx >> (56 - 8 * i));
+}
+inline uint64_t pack_prefix(const uint8_t* bytes, uint8_t len) noexcept {
+    uint64_t v = 0;
+    for (uint8_t i = 0; i < len; ++i)
+        v |= uint64_t(bytes[i]) << (56 - 8 * i);
+    return v;
+}
+
+// --- NK type for a given remaining bit count ---
+template<int BITS>
+using nk_for_bits_t = std::conditional_t<(BITS > 32), uint64_t,
+                      std::conditional_t<(BITS > 16), uint32_t,
+                      std::conditional_t<(BITS > 8), uint16_t, uint8_t>>>;
+
 
 // --- Tagged pointer helpers ---
 // Bitmask ptr: points to bitmap (node+1), no LEAF_BIT. Use directly.
