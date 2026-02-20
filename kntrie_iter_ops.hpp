@@ -10,6 +10,7 @@ namespace gteitelbaum {
 // Standalone stats accumulator — shared across all NK instantiations.
 struct kntrie_stats_t {
     size_t total_bytes    = 0;
+    size_t needed_bytes   = 0;
     size_t total_entries  = 0;
     size_t bitmap_leaves  = 0;
     size_t compact_leaves = 0;
@@ -481,6 +482,12 @@ struct kntrie_iter_ops {
             s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
             s.total_entries += hdr->entries();
             uint8_t skip = hdr->skip();
+            size_t hs = 1 + (skip > 0 ? 1 : 0);
+            if constexpr (sizeof(NK) == 1) {
+                s.needed_bytes += BO::bitmap_leaf_size_u64(hdr->entries(), hs) * 8;
+            } else {
+                s.needed_bytes += CO::size_u64(hdr->total_slots(), hs) * 8;
+            }
             if (skip)
                 stats_leaf_skip<BITS>(node, skip, s);
             else {
@@ -493,9 +500,11 @@ struct kntrie_iter_ops {
         const uint64_t* node = bm_to_node_const(tagged);
         auto* hdr = get_header(node);
         s.total_bytes += static_cast<size_t>(hdr->alloc_u64()) * 8;
+        uint8_t sc = hdr->skip();
+        size_t hs = 1 + sc;
+        s.needed_bytes += BO::bitmask_size_u64(hdr->entries(), hs) * 8;
         s.bitmask_nodes++;
         s.bm_children += hdr->entries();
-        uint8_t sc = hdr->skip();
         if (sc > 0)
             stats_chain_skip<BITS>(node, sc, 0, s);
         else

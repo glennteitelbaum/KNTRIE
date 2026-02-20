@@ -218,7 +218,7 @@ public:
 
     void shrink_to_fit() noexcept { bld_v.shrink_to_fit(); }
     size_t memory_in_use() const noexcept { return bld_v.memory_in_use(); }
-    size_t memory_needed() const noexcept { return bld_v.memory_needed(); }
+    size_t memory_needed() const noexcept { return debug_stats().needed_bytes; }
 
     // ==================================================================
     // root_skip_ops — combined functor table for root skip dispatch.
@@ -368,6 +368,7 @@ public:
         size_t bm_children    = 0;
         size_t total_entries  = 0;
         size_t total_bytes    = 0;
+        size_t needed_bytes   = 0;
     };
 
     debug_stats_t debug_stats() const noexcept {
@@ -607,6 +608,7 @@ private:
             typename D::ITER_TYPE::stats_t os{};
             D::ITER_TYPE::template collect_stats<BITS>(tagged, os);
             s.total_bytes    += os.total_bytes;
+            s.needed_bytes   += os.needed_bytes;
             s.total_entries  += os.total_entries;
             s.bitmap_leaves  += os.bitmap_leaves;
             s.compact_leaves += os.compact_leaves;
