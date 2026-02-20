@@ -43,9 +43,8 @@ private:
     using NARROW_OPS   = kntrie_ops<NNK0, VALUE, ALLOC>;
     using NARROW_ITER  = kntrie_iter_ops<NNK0, VALUE, ALLOC>;
 
-    using NNNK0        = next_narrow_t<NNK0>;
-    using NARROW_OPS2  = kntrie_ops<NNNK0, VALUE, ALLOC>;
-    using NARROW_ITER2 = kntrie_iter_ops<NNNK0, VALUE, ALLOC>;
+    using NNNK0  = next_narrow_t<NNK0>;
+    using NNNNK0 = next_narrow_t<NNNK0>;   // uint8_t for u64 keys
 
     // MAX_ROOT_SKIP: leave 1 byte for root_v index + 1 byte for subtree
     // u16: 0  (no skip), u32: 2, u64: 6
@@ -53,6 +52,11 @@ private:
 
     // ======================================================================
     // root_dispatch<BITS>: compile-time trait for narrowing at a given depth
+    //
+    // KEY INVARIANT: We must choose NK_TYPE such that BITS > NK_TYPE_BITS/2
+    // (or NK_TYPE_BITS == 8). This prevents find_node/insert_node from
+    // narrowing internally, ensuring insert and find use the same NK type
+    // for leaf creation and lookup. Use strict > not >= for boundaries.
     // ======================================================================
 
     template<int BITS>
@@ -62,9 +66,10 @@ private:
         static constexpr int NNK0_BITS  = static_cast<int>(sizeof(NNK0) * 8);
         static constexpr int NNNK0_BITS = static_cast<int>(sizeof(NNNK0) * 8);
 
-        // Which NK type to use at this depth
-        using NK_TYPE = std::conditional_t<(BITS >= NK0_BITS / 2), NK0,
-                        std::conditional_t<(BITS >= NNK0_BITS / 2), NNK0, NNNK0>>;
+        // Strict >: ensures find_node won't narrow past what insert used
+        using NK_TYPE = std::conditional_t<(BITS > NK0_BITS / 2), NK0,
+                        std::conditional_t<(BITS > NNK0_BITS / 2), NNK0,
+                        std::conditional_t<(BITS > NNNK0_BITS / 2), NNNK0, NNNNK0>>>;
 
         using OPS_TYPE  = kntrie_ops<NK_TYPE, VALUE, ALLOC>;
         using ITER_TYPE = kntrie_iter_ops<NK_TYPE, VALUE, ALLOC>;
@@ -118,11 +123,21 @@ private:
         return static_cast<uint8_t>(nk >> (NK0_BITS - 8 * (i + 1)));
     }
 
-    // Build IK prefix from root_prefix_v[0..skip-1] + top byte
+    // Left-align NK0 into uint64_t (byte 0 at bits 63..56)
+    static uint64_t nk_to_u64(NK0 nk) noexcept {
+        return static_cast<uint64_t>(nk) << (64 - NK0_BITS);
+    }
+
+    // Extract byte i from packed prefix (byte 0 in MSB)
+    static uint8_t prefix_byte(uint64_t pfx, uint8_t i) noexcept {
+        return static_cast<uint8_t>(pfx >> (56 - 8 * i));
+    }
+
+    // Build IK prefix from root_prefix_v bytes [0..skip-1] + top byte
     IK make_prefix(uint8_t top) const noexcept {
         IK prefix = IK(0);
         for (uint8_t j = 0; j < root_skip_v; ++j)
-            prefix |= IK(root_prefix_v[j]) << (IK_BITS - 8 * (j + 1));
+            prefix |= IK(prefix_byte(root_prefix_v, j)) << (IK_BITS - 8 * (j + 1));
         prefix |= IK(top) << (IK_BITS - 8 * (root_skip_v + 1));
         return prefix;
     }
@@ -134,7 +149,7 @@ private:
     // --- Data members ---
     uint64_t  root_v[256];
     uint8_t   root_skip_v;
-    uint8_t   root_prefix_v[7];   // max 6 used (u64), 7th for alignment
+    uint64_t  root_prefix_v;   // packed big-endian: byte 0 in bits 63..56
     size_t    size_v;
     BLD       bld_v;
 
@@ -143,9 +158,8 @@ public:
     // Constructor / Destructor
     // ==================================================================
 
-    kntrie_impl() : root_skip_v(0), size_v(0), bld_v() {
+    kntrie_impl() : root_skip_v(0), root_prefix_v(0), size_v(0), bld_v() {
         std::fill(std::begin(root_v), std::end(root_v), SENTINEL_TAGGED);
-        std::memset(root_prefix_v, 0, sizeof(root_prefix_v));
     }
 
     ~kntrie_impl() { remove_all(); bld_v.drain(); }
@@ -154,12 +168,12 @@ public:
     kntrie_impl& operator=(const kntrie_impl&) = delete;
 
     kntrie_impl(kntrie_impl&& o) noexcept
-        : root_skip_v(o.root_skip_v), size_v(o.size_v), bld_v(std::move(o.bld_v)) {
+        : root_skip_v(o.root_skip_v), root_prefix_v(o.root_prefix_v),
+          size_v(o.size_v), bld_v(std::move(o.bld_v)) {
         std::memcpy(root_v, o.root_v, sizeof(root_v));
-        std::memcpy(root_prefix_v, o.root_prefix_v, sizeof(root_prefix_v));
         std::fill(std::begin(o.root_v), std::end(o.root_v), SENTINEL_TAGGED);
         o.root_skip_v = 0;
-        std::memset(o.root_prefix_v, 0, sizeof(o.root_prefix_v));
+        o.root_prefix_v = 0;
         o.size_v = 0;
     }
 
@@ -168,13 +182,13 @@ public:
             remove_all();
             bld_v.drain();
             std::memcpy(root_v, o.root_v, sizeof(root_v));
-            std::memcpy(root_prefix_v, o.root_prefix_v, sizeof(root_prefix_v));
+            root_prefix_v = o.root_prefix_v;
             root_skip_v = o.root_skip_v;
             size_v      = o.size_v;
             bld_v       = std::move(o.bld_v);
             std::fill(std::begin(o.root_v), std::end(o.root_v), SENTINEL_TAGGED);
             o.root_skip_v = 0;
-            std::memset(o.root_prefix_v, 0, sizeof(o.root_prefix_v));
+            o.root_prefix_v = 0;
             o.size_v = 0;
         }
         return *this;
@@ -186,10 +200,7 @@ public:
         std::memcpy(root_v, o.root_v, sizeof(root_v));
         std::memcpy(o.root_v, tmp, sizeof(root_v));
         std::swap(root_skip_v, o.root_skip_v);
-        uint8_t ptmp[7];
-        std::memcpy(ptmp, root_prefix_v, 7);
-        std::memcpy(root_prefix_v, o.root_prefix_v, 7);
-        std::memcpy(o.root_prefix_v, ptmp, 7);
+        std::swap(root_prefix_v, o.root_prefix_v);
         std::swap(size_v, o.size_v);
         bld_v.swap(o.bld_v);
     }
@@ -209,25 +220,43 @@ public:
     size_t memory_needed() const noexcept { return bld_v.memory_needed(); }
 
     // ==================================================================
-    // Find — prefix check loop + switch dispatch. No sentinel checks.
+    // Find — functor array, no loops, no switch in hot path.
     // ==================================================================
+
+    using find_func_t = const VALUE* (*)(const uint64_t* root,
+                                         uint64_t prefix,
+                                         uint8_t skip, NK0 nk);
+
+    template<int SKIP>
+    static const VALUE* find_at(const uint64_t* root, uint64_t prefix,
+                                uint8_t /*skip*/, NK0 nk) noexcept {
+        if constexpr (SKIP > 0) {
+            constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
+            if ((nk_to_u64(nk) ^ prefix) & MASK) [[unlikely]] return nullptr;
+        }
+
+        uint8_t top = nk_byte(nk, SKIP);
+        uint64_t child = root[top];
+
+        constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
+        using D = root_dispatch<BITS>;
+        return D::OPS_TYPE::template find_node<BITS>(child, D::narrow(nk));
+    }
+
+    static constexpr find_func_t find_func[] = {
+        &find_at<0>,
+        &find_at<(MAX_ROOT_SKIP >= 1) ? 1 : 0>,
+        &find_at<(MAX_ROOT_SKIP >= 2) ? 2 : 0>,
+        &find_at<(MAX_ROOT_SKIP >= 3) ? 3 : 0>,
+        &find_at<(MAX_ROOT_SKIP >= 4) ? 4 : 0>,
+        &find_at<(MAX_ROOT_SKIP >= 5) ? 5 : 0>,
+        &find_at<(MAX_ROOT_SKIP >= 6) ? 6 : 0>,
+    };
 
     const VALUE* find_value(const KEY& key) const noexcept {
         IK ik = KO::to_internal(key);
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-
-        // Fast prefix check — all in registers
-        for (uint8_t i = 0; i < root_skip_v; ++i)
-            if (nk_byte(nk, i) != root_prefix_v[i]) [[unlikely]]
-                return nullptr;
-
-        uint8_t top = nk_byte(nk, root_skip_v);
-        uint64_t child = root_v[top];
-
-        return skip_switch(root_skip_v, [&]<int BITS>() -> const VALUE* {
-            using D = root_dispatch<BITS>;
-            return D::OPS_TYPE::template find_node<BITS>(child, D::narrow(nk));
-        });
+        return find_func[root_skip_v](root_v, root_prefix_v, root_skip_v, nk);
     }
 
     bool contains(const KEY& key) const noexcept {
@@ -260,8 +289,10 @@ public:
         NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
 
         // Check prefix
-        for (uint8_t i = 0; i < root_skip_v; ++i)
-            if (nk_byte(nk, i) != root_prefix_v[i]) return false;
+        if (root_skip_v > 0) {
+            uint64_t mask = ~uint64_t(0) << (64 - 8 * root_skip_v);
+            if ((nk_to_u64(nk) ^ root_prefix_v) & mask) return false;
+        }
 
         uint8_t top = nk_byte(nk, root_skip_v);
         uint64_t child = root_v[top];
@@ -424,18 +455,22 @@ private:
             if (size_v == 0) [[unlikely]] {
                 if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
                 root_skip_v = static_cast<uint8_t>(MAX_ROOT_SKIP);
-                for (uint8_t i = 0; i < root_skip_v; ++i)
-                    root_prefix_v[i] = nk_byte(nk, i);
+                root_prefix_v = nk_to_u64(nk);
                 // Fall through to normal insert (root_v[top] is SENTINEL_TAGGED)
             }
         }
 
         // Check prefix — find first divergence
-        for (uint8_t i = 0; i < root_skip_v; ++i) {
-            if (nk_byte(nk, i) != root_prefix_v[i]) [[unlikely]] {
+        if (root_skip_v > 0) {
+            uint64_t nk64 = nk_to_u64(nk);
+            uint64_t diff = nk64 ^ root_prefix_v;
+            uint64_t mask = ~uint64_t(0) << (64 - 8 * root_skip_v);
+            if (diff & mask) [[unlikely]] {
                 if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
-                reduce_root_skip(i);
-                break;  // prefix now valid, fall through to normal insert
+                // Find first differing byte position
+                int clz = std::countl_zero(diff & mask);
+                uint8_t div_pos = static_cast<uint8_t>(clz / 8);
+                reduce_root_skip(div_pos);
             }
         }
 
@@ -493,7 +528,7 @@ private:
         if (chain_len > 0) {
             uint8_t chain_bytes[6];
             for (uint8_t i = 0; i < chain_len; ++i)
-                chain_bytes[i] = root_prefix_v[div_pos + 1 + i];
+                chain_bytes[i] = prefix_byte(root_prefix_v, div_pos + 1 + i);
             auto* node = BO::make_skip_chain(chain_bytes, chain_len,
                                               indices, tagged_ptrs, count, bld_v,
                                               size_v);
@@ -506,9 +541,9 @@ private:
 
         // Clear root_v, set new skip
         std::fill(std::begin(root_v), std::end(root_v), SENTINEL_TAGGED);
-        uint8_t old_byte = root_prefix_v[div_pos];
+        uint8_t old_byte = prefix_byte(root_prefix_v, div_pos);
         root_skip_v = div_pos;
-        // root_prefix_v[0..div_pos-1] unchanged, rest don't matter
+        // root_prefix_v bits [0..div_pos-1] unchanged, rest don't matter
 
         // Place old subtree under old prefix byte at div_pos
         root_v[old_byte] = old_subtree;

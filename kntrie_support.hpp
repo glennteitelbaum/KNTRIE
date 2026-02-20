@@ -38,31 +38,33 @@ using next_narrow_t = std::conditional_t<sizeof(NK) == 8, uint32_t,
 // ==========================================================================
 // Freelist size classes
 //
-// Allocations <= FREE_MAX u64s use 7 size-class bins for freelisting.
+// Allocations <= FREE_MAX u64s use size-class bins for freelisting.
 // Allocations > FREE_MAX use power-of-2 with midpoints for in-place growth.
 //
-// Bins: {4, 6, 8, 12, 18, 26, 34, 48, 68}
-// Bins 7-8 capture medium bitmask nodes (up to 61 children)
+// Bins: {4, 6, 8, 12, 18, 26, 34, 48, 69, 98, 128}
+// Bins 8-10 capture bitmap leaves with up to 128 entries (u8 level)
 // ==========================================================================
 
-inline constexpr size_t FREE_MAX  = 68;
-inline constexpr size_t NUM_BINS  = 9;
-inline constexpr size_t BIN_SIZES[NUM_BINS] = {4, 6, 8, 12, 18, 26, 34, 48, 68};
+inline constexpr size_t FREE_MAX  = 128;
+inline constexpr size_t NUM_BINS  = 11;
+inline constexpr size_t BIN_SIZES[NUM_BINS] = {4, 6, 8, 12, 18, 26, 34, 48, 69, 98, 128};
 
 // Page size for slab allocation (4K = 512 u64s)
 inline constexpr size_t PAGE_U64S = 512;
 
 // Map requested u64 count to bin index. Returns NUM_BINS if > FREE_MAX.
 inline constexpr int bin_for(size_t n) noexcept {
-    if (n <= 4)  return 0;
-    if (n <= 6)  return 1;
-    if (n <= 8)  return 2;
-    if (n <= 12) return 3;
-    if (n <= 18) return 4;
-    if (n <= 26) return 5;
-    if (n <= 34) return 6;
-    if (n <= 48) return 7;
-    if (n <= 68) return 8;
+    if (n <= 4)   return 0;
+    if (n <= 6)   return 1;
+    if (n <= 8)   return 2;
+    if (n <= 12)  return 3;
+    if (n <= 18)  return 4;
+    if (n <= 26)  return 5;
+    if (n <= 34)  return 6;
+    if (n <= 48)  return 7;
+    if (n <= 69)  return 8;
+    if (n <= 98)  return 9;
+    if (n <= 128) return 10;
     return NUM_BINS;
 }
 
@@ -417,26 +419,27 @@ struct value_traits {
 // Builder — owns allocator, handles node + value alloc/dealloc
 // ==========================================================================
 
-// Base builder: trivial values (A-type, bool) — page-based slab allocator
+// Base builder: trivial values (A-type, bool) — bump-from-mega slab allocator
 //
-// Three-level allocation:
-//   mega (growing) → pages (4K) → blocks (bin-sized)
+// Two-level allocation:
+//   mega (growing) → blocks (bin-sized, bump or freelist)
 //
 // Hot path: pop from bins_v[b].
-// Cold path: grow_bin → pop page from page_free_v → carve blocks.
-// Colder:    grow_pages → allocate mega → thread pages into page_free_v.
+// Cold path: bump mega cursor by bin size.
+// Colder:    allocate new mega when current is exhausted.
 template<typename VALUE, bool IS_TRIVIAL, typename ALLOC>
 struct builder;
 
 template<typename VALUE, typename ALLOC>
 struct builder<VALUE, true, ALLOC> {
     ALLOC      alloc_v;
-    uint64_t*  alloc_head_v = nullptr;   // intrusive chain of mega allocations
-    uint64_t*  page_free_v  = nullptr;   // uncarved pages
-    uint64_t*  bins_v[NUM_BINS] = {};    // per-bin block freelists
-    double     mega_pages_v = 1.0;       // pages in next mega (grows 1.25x)
-    size_t     mem_in_use_v = 0;         // block bytes handed out (bin-padded)
-    size_t     mem_needed_v = 0;         // block bytes requested (before padding)
+    uint64_t*  alloc_head_v  = nullptr;   // intrusive chain of mega allocations
+    uint64_t*  mega_cursor_v = nullptr;   // next free u64 in current mega
+    uint64_t*  mega_end_v    = nullptr;   // past-end of current mega
+    uint64_t*  bins_v[NUM_BINS] = {};     // per-bin block freelists
+    double     mega_grow_v = 1.0;         // pages-equivalent in next mega (grows 1.25x)
+    size_t     mem_in_use_v = 0;          // block bytes handed out (bin-padded)
+    size_t     mem_needed_v = 0;          // block bytes requested (before padding)
 
     builder() : alloc_v() {}
     explicit builder(const ALLOC& a) : alloc_v(a) {}
@@ -447,16 +450,18 @@ struct builder<VALUE, true, ALLOC> {
     builder(builder&& o) noexcept
         : alloc_v(std::move(o.alloc_v))
         , alloc_head_v(o.alloc_head_v)
-        , page_free_v(o.page_free_v)
-        , mega_pages_v(o.mega_pages_v)
+        , mega_cursor_v(o.mega_cursor_v)
+        , mega_end_v(o.mega_end_v)
+        , mega_grow_v(o.mega_grow_v)
         , mem_in_use_v(o.mem_in_use_v)
         , mem_needed_v(o.mem_needed_v)
     {
         std::memcpy(bins_v, o.bins_v, sizeof(bins_v));
-        o.alloc_head_v = nullptr;
-        o.page_free_v  = nullptr;
+        o.alloc_head_v  = nullptr;
+        o.mega_cursor_v = nullptr;
+        o.mega_end_v    = nullptr;
         std::memset(o.bins_v, 0, sizeof(o.bins_v));
-        o.mega_pages_v = 1.0;
+        o.mega_grow_v = 1.0;
         o.mem_in_use_v = 0;
         o.mem_needed_v = 0;
     }
@@ -465,16 +470,18 @@ struct builder<VALUE, true, ALLOC> {
         if (this != &o) {
             drain();
             alloc_v = std::move(o.alloc_v);
-            alloc_head_v = o.alloc_head_v;
-            page_free_v  = o.page_free_v;
-            mega_pages_v = o.mega_pages_v;
-            mem_in_use_v = o.mem_in_use_v;
-            mem_needed_v = o.mem_needed_v;
+            alloc_head_v  = o.alloc_head_v;
+            mega_cursor_v = o.mega_cursor_v;
+            mega_end_v    = o.mega_end_v;
+            mega_grow_v   = o.mega_grow_v;
+            mem_in_use_v  = o.mem_in_use_v;
+            mem_needed_v  = o.mem_needed_v;
             std::memcpy(bins_v, o.bins_v, sizeof(bins_v));
-            o.alloc_head_v = nullptr;
-            o.page_free_v  = nullptr;
+            o.alloc_head_v  = nullptr;
+            o.mega_cursor_v = nullptr;
+            o.mega_end_v    = nullptr;
             std::memset(o.bins_v, 0, sizeof(o.bins_v));
-            o.mega_pages_v = 1.0;
+            o.mega_grow_v = 1.0;
             o.mem_in_use_v = 0;
             o.mem_needed_v = 0;
         }
@@ -485,8 +492,9 @@ struct builder<VALUE, true, ALLOC> {
         using std::swap;
         swap(alloc_v, o.alloc_v);
         swap(alloc_head_v, o.alloc_head_v);
-        swap(page_free_v, o.page_free_v);
-        swap(mega_pages_v, o.mega_pages_v);
+        swap(mega_cursor_v, o.mega_cursor_v);
+        swap(mega_end_v, o.mega_end_v);
+        swap(mega_grow_v, o.mega_grow_v);
         swap(mem_in_use_v, o.mem_in_use_v);
         swap(mem_needed_v, o.mem_needed_v);
         for (size_t i = 0; i < NUM_BINS; ++i)
@@ -497,45 +505,31 @@ struct builder<VALUE, true, ALLOC> {
     size_t memory_in_use() const noexcept { return mem_in_use_v; }
     size_t memory_needed() const noexcept { return mem_needed_v; }
 
-    // --- Mega allocation: grow page_free_v ---
-    void grow_pages() {
-        size_t pages = static_cast<size_t>(mega_pages_v);
+    // --- Allocate new mega, set cursor/end ---
+    void grow_mega(size_t min_u64s) {
+        size_t pages = static_cast<size_t>(mega_grow_v);
         if (pages < 1) pages = 1;
         size_t u64s = 2 + pages * PAGE_U64S;
+        if (u64s < min_u64s + 2) u64s = min_u64s + 2;
 
         uint64_t* mega = alloc_v.allocate(u64s);
         mega[0] = reinterpret_cast<uint64_t>(alloc_head_v);
         mega[1] = u64s;
         alloc_head_v = mega;
 
-        uint64_t* base = mega + 2;
-        for (size_t i = 0; i < pages; ++i) {
-            uint64_t* page = base + i * PAGE_U64S;
-            page[0] = reinterpret_cast<uint64_t>(page_free_v);
-            page_free_v = page;
-        }
+        mega_cursor_v = mega + 2;
+        mega_end_v    = mega + u64s;
 
-        mega_pages_v *= 1.25;
+        mega_grow_v *= 1.25;
     }
 
-    // --- Carve a page into blocks for bin, thread into freelist ---
-    void grow_bin(int bin) {
-        if (!page_free_v) grow_pages();
-
-        uint64_t* page = page_free_v;
-        page_free_v = reinterpret_cast<uint64_t*>(page[0]);
-
-        size_t bs = BIN_SIZES[bin];
-        size_t count = PAGE_U64S / bs;
-
-        for (size_t i = 0; i < count; ++i) {
-            uint64_t* block = page + i * bs;
-            if (i + 1 < count)
-                block[0] = reinterpret_cast<uint64_t>(page + (i + 1) * bs);
-            else
-                block[0] = reinterpret_cast<uint64_t>(bins_v[bin]);
-        }
-        bins_v[bin] = page;
+    // --- Bump allocate from current mega ---
+    uint64_t* bump_alloc(size_t u64_count) {
+        if (mega_cursor_v + u64_count > mega_end_v) [[unlikely]]
+            grow_mega(u64_count);
+        uint64_t* p = mega_cursor_v;
+        mega_cursor_v += u64_count;
+        return p;
     }
 
     // --- Allocate a node ---
@@ -543,10 +537,13 @@ struct builder<VALUE, true, ALLOC> {
         int bin = bin_for(u64_count);
         if (bin < static_cast<int>(NUM_BINS)) {
             size_t actual = BIN_SIZES[bin];
-            if (!bins_v[bin]) [[unlikely]]
-                grow_bin(bin);
-            uint64_t* p = bins_v[bin];
-            bins_v[bin] = reinterpret_cast<uint64_t*>(p[0]);
+            uint64_t* p;
+            if (bins_v[bin]) [[likely]] {
+                p = bins_v[bin];
+                bins_v[bin] = reinterpret_cast<uint64_t*>(p[0]);
+            } else {
+                p = bump_alloc(actual);
+            }
             std::memset(p, 0, actual * 8);
             mem_in_use_v += actual * 8;
             mem_needed_v += u64_count * 8;
@@ -583,15 +580,16 @@ struct builder<VALUE, true, ALLOC> {
             alloc_v.deallocate(m, m[1]);
             m = next;
         }
-        alloc_head_v = nullptr;
-        page_free_v = nullptr;
+        alloc_head_v  = nullptr;
+        mega_cursor_v = nullptr;
+        mega_end_v    = nullptr;
         std::memset(bins_v, 0, sizeof(bins_v));
-        mega_pages_v = 1.0;
+        mega_grow_v = 1.0;
         mem_in_use_v = 0;
         mem_needed_v = 0;
     }
 
-    // --- shrink_to_fit: no-op (pages cannot be partially freed) ---
+    // --- shrink_to_fit: no-op (megas cannot be partially freed) ---
     void shrink_to_fit() noexcept {}
 
     using VT = value_traits<VALUE, ALLOC>;
