@@ -436,7 +436,7 @@ struct builder<VALUE, true, ALLOC> {
     // --- Buddy allocator: pow2 sizes, coalescing free ---
     // NumBuckets=10 → MAX_SIZE=1024 bytes (128 u64s)
     // PAGE_SIZE=65536 (64KB) → 64 chunks per page
-    static constexpr size_t BUDDY_PAGE   = 65536;
+    static constexpr size_t BUDDY_PAGE   = 4096;
     static constexpr size_t NUM_BUCKETS  = 10;
     static constexpr size_t MAX_BUDDY    = size_t{1} << NUM_BUCKETS;  // 1024 bytes
     static constexpr size_t MAX_BUDDY_U64 = MAX_BUDDY / 8;           // 128 u64s
@@ -476,7 +476,6 @@ struct builder<VALUE, true, ALLOC> {
     Page*      pages_v      = nullptr;
     size_t     num_empty_v  = 0;
     size_t     mem_in_use_v = 0;
-    size_t     mem_needed_v = 0;
 
     Page* alloc_page() {
         auto* raw = page_alloc_v.allocate(1);
@@ -622,14 +621,12 @@ struct builder<VALUE, true, ALLOC> {
         , pages_v(o.pages_v)
         , num_empty_v(o.num_empty_v)
         , mem_in_use_v(o.mem_in_use_v)
-        , mem_needed_v(o.mem_needed_v)
     {
         std::memcpy(free_lists_v, o.free_lists_v, sizeof(free_lists_v));
         o.pages_v = nullptr;
         o.num_empty_v = 0;
         std::memset(o.free_lists_v, 0, sizeof(o.free_lists_v));
         o.mem_in_use_v = 0;
-        o.mem_needed_v = 0;
     }
 
     builder& operator=(builder&& o) noexcept {
@@ -640,13 +637,11 @@ struct builder<VALUE, true, ALLOC> {
             pages_v      = o.pages_v;
             num_empty_v  = o.num_empty_v;
             mem_in_use_v = o.mem_in_use_v;
-            mem_needed_v = o.mem_needed_v;
             std::memcpy(free_lists_v, o.free_lists_v, sizeof(free_lists_v));
             o.pages_v = nullptr;
             o.num_empty_v = 0;
             std::memset(o.free_lists_v, 0, sizeof(o.free_lists_v));
             o.mem_in_use_v = 0;
-            o.mem_needed_v = 0;
         }
         return *this;
     }
@@ -658,14 +653,12 @@ struct builder<VALUE, true, ALLOC> {
         swap(pages_v, o.pages_v);
         swap(num_empty_v, o.num_empty_v);
         swap(mem_in_use_v, o.mem_in_use_v);
-        swap(mem_needed_v, o.mem_needed_v);
         for (size_t i = 0; i <= NUM_BUCKETS; ++i)
             swap(free_lists_v[i], o.free_lists_v[i]);
     }
 
     const ALLOC& get_allocator() const noexcept { return alloc_v; }
     size_t memory_in_use() const noexcept { return mem_in_use_v; }
-    size_t memory_needed() const noexcept { return mem_needed_v; }
 
     // --- Allocate a node ---
     // u64_count is updated to actual pow2 size allocated
@@ -676,14 +669,12 @@ struct builder<VALUE, true, ALLOC> {
             uint64_t* p = alloc_v.allocate(u64_count);
             std::memset(p, 0, bytes);
             mem_in_use_v += bytes;
-            mem_needed_v += bytes;
             return p;
         }
         size_t actual_bytes = size_for_bucket(bucket_for(bytes));
         uint64_t* p = static_cast<uint64_t*>(buddy_alloc(bytes));
         std::memset(p, 0, actual_bytes);
         mem_in_use_v += actual_bytes;
-        mem_needed_v += bytes;
         u64_count = actual_bytes / 8;
         return p;
     }
@@ -694,13 +685,11 @@ struct builder<VALUE, true, ALLOC> {
         if (bytes > MAX_BUDDY) {
             alloc_v.deallocate(p, u64_count);
             mem_in_use_v -= bytes;
-            mem_needed_v -= bytes;
             return;
         }
         size_t actual_bytes = size_for_bucket(bucket_for(bytes));
         buddy_free(p, bytes);
         mem_in_use_v -= actual_bytes;
-        mem_needed_v -= bytes;
     }
 
     // --- Free all pages. Only safe when all nodes are dead. ---
@@ -714,7 +703,6 @@ struct builder<VALUE, true, ALLOC> {
         }
         num_empty_v  = 0;
         mem_in_use_v = 0;
-        mem_needed_v = 0;
     }
 
     // --- shrink_to_fit: buddy can return empty pages ---
@@ -796,7 +784,6 @@ struct builder<VALUE, false, ALLOC> {
 
     void shrink_to_fit() noexcept { base_v.shrink_to_fit(); }
     size_t memory_in_use() const noexcept { return base_v.memory_in_use(); }
-    size_t memory_needed() const noexcept { return base_v.memory_needed(); }
 };
 
 // ==========================================================================
