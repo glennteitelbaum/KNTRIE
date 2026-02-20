@@ -246,6 +246,7 @@ public:
         }
         uint8_t top = nk_byte(nk, SKIP);
         uint64_t child = root[top];
+        if (child == SENTINEL_TAGGED) [[unlikely]] return nullptr;
         constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
         using D = root_dispatch<BITS>;
         return D::OPS_TYPE::template find_node<BITS>(child, D::narrow(nk));
