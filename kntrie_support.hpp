@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <cstring>
 #include <bit>
-#include <bitset>
 #include <memory>
 #include <new>
 #include <type_traits>
@@ -40,16 +39,26 @@ using next_narrow_t = std::conditional_t<sizeof(NK) == 8, uint32_t,
 // ==========================================================================
 // Freelist size classes
 //
-// Buddy allocator: pow2 sizes from 4 u64 (32 bytes) to 128 u64 (1024 bytes).
-// Allocations > FREE_MAX u64s use direct malloc.
+// ==========================================================================
+// Allocation size classes (1.5x growth scheme)
+//
+// ≤128 u64s: step sizes for in-place growth padding.
+// >128 u64s: power-of-2 with midpoints.
 // ==========================================================================
 
 inline constexpr size_t FREE_MAX  = 128;
+inline constexpr size_t NUM_BINS  = 12;
+inline constexpr size_t BIN_SIZES[NUM_BINS] = {4, 6, 8, 10, 14, 18, 26, 34, 48, 69, 98, 128};
 
-// round_up_u64: actual pow2 allocation size for any u64 request.
 inline constexpr size_t round_up_u64(size_t n) noexcept {
-    if (n <= 4) return 4;
-    return size_t{1} << std::bit_width(n - 1);
+    if (n <= FREE_MAX) {
+        for (size_t i = 0; i < NUM_BINS; ++i)
+            if (n <= BIN_SIZES[i]) return BIN_SIZES[i];
+    }
+    int bit  = static_cast<int>(std::bit_width(n - 1));
+    size_t pow2 = size_t{1} << bit;
+    size_t mid  = pow2 / 2 + pow2 / 4 + 2;
+    return (n <= mid) ? mid : pow2;
 }
 
 // Shrink when allocated exceeds the class for 2x the needed size.
@@ -433,280 +442,46 @@ struct builder;
 
 template<typename VALUE, typename ALLOC>
 struct builder<VALUE, true, ALLOC> {
-    // --- Buddy allocator: pow2 sizes, coalescing free ---
-    // NumBuckets=10 → MAX_SIZE=1024 bytes (128 u64s)
-    // PAGE_SIZE=65536 (64KB) → 64 chunks per page
-    static constexpr size_t BUDDY_PAGE   = 4096;
-    static constexpr size_t NUM_BUCKETS  = 10;
-    static constexpr size_t MAX_BUDDY    = size_t{1} << NUM_BUCKETS;  // 1024 bytes
-    static constexpr size_t MAX_BUDDY_U64 = MAX_BUDDY / 8;           // 128 u64s
-    static constexpr size_t MIN_BUDDY    = 32;  // 4 u64s minimum
-    static constexpr size_t MIN_BUCKET   = 5;   // log2(32)
-    static constexpr size_t CHUNKS_PER_PAGE = BUDDY_PAGE / MAX_BUDDY;
-    static constexpr size_t META_SIZE    = sizeof(void*) * 2 + sizeof(std::bitset<CHUNKS_PER_PAGE>);
-    static constexpr size_t META_CHUNKS  = (META_SIZE + MAX_BUDDY - 1) / MAX_BUDDY;
-    static constexpr size_t USABLE_CHUNKS = CHUNKS_PER_PAGE - META_CHUNKS;
-    static constexpr size_t MIN_EMPTY_PAGES = 4;
+    ALLOC alloc_v;
 
-    struct Block {
-        union {
-            Block* next;
-            char data[MAX_BUDDY];
-        };
-    };
-
-    struct Page;
-    struct PageMeta {
-        Page* next;
-        std::bitset<USABLE_CHUNKS> used_bitmap;
-    };
-    struct Page {
-        Block chunk[USABLE_CHUNKS];
-        PageMeta meta;
-    };
-    static_assert(sizeof(Page) <= BUDDY_PAGE);
-
-    // Aligned wrapper for allocator-based page allocation
-    struct alignas(BUDDY_PAGE) aligned_page_t { char data[BUDDY_PAGE]; };
-    using PAGE_ALLOC = typename std::allocator_traits<ALLOC>::template rebind_alloc<aligned_page_t>;
-
-    ALLOC      alloc_v;
-    PAGE_ALLOC page_alloc_v;
-    Block*     free_lists_v[NUM_BUCKETS + 1] = {};
-    Page*      pages_v      = nullptr;
-    size_t     num_empty_v  = 0;
-    size_t     mem_in_use_v = 0;
-
-    Page* alloc_page() {
-        auto* raw = page_alloc_v.allocate(1);
-        auto* page = reinterpret_cast<Page*>(raw);
-        std::memset(page, 0, sizeof(Page));
-        return page;
-    }
-
-    void dealloc_page(Page* page) {
-        page_alloc_v.deallocate(reinterpret_cast<aligned_page_t*>(page), 1);
-    }
-
-    static constexpr size_t bucket_for(size_t bytes) noexcept {
-        if (bytes <= MIN_BUDDY) return MIN_BUCKET;
-        return std::bit_width(bytes - 1);
-    }
-
-    static constexpr size_t size_for_bucket(size_t i) noexcept {
-        return size_t{1} << i;
-    }
-
-    void* buddy_alloc(size_t bytes) {
-        size_t i = bucket_for(bytes);
-
-        size_t j = i;
-        while (j <= NUM_BUCKETS && !free_lists_v[j])
-            j++;
-
-        if (j > NUM_BUCKETS) {
-            auto* page = alloc_page();
-            page->meta.next = pages_v;
-            pages_v = page;
-
-            for (size_t c = USABLE_CHUNKS; c > 0; c--) {
-                page->chunk[c-1].next = free_lists_v[NUM_BUCKETS];
-                free_lists_v[NUM_BUCKETS] = &page->chunk[c-1];
-            }
-            j = NUM_BUCKETS;
-        }
-
-        while (j > i) {
-            Block* block = free_lists_v[j];
-            free_lists_v[j] = block->next;
-
-            if (j == NUM_BUCKETS) {
-                auto* page = reinterpret_cast<Page*>(
-                    reinterpret_cast<uintptr_t>(block) & ~(BUDDY_PAGE - 1));
-                size_t ci = block - &page->chunk[0];
-                page->meta.used_bitmap.set(ci);
-            }
-
-            j--;
-            auto* first = block;
-            auto* second = reinterpret_cast<Block*>(
-                reinterpret_cast<char*>(block) + size_for_bucket(j));
-
-            Block** cursor = &free_lists_v[j];
-            while (*cursor && *cursor < first)
-                cursor = &(*cursor)->next;
-            first->next = second;
-            second->next = *cursor;
-            *cursor = first;
-        }
-
-        Block* ret = free_lists_v[i];
-        free_lists_v[i] = ret->next;
-
-        if (i == NUM_BUCKETS) {
-            auto* page = reinterpret_cast<Page*>(
-                reinterpret_cast<uintptr_t>(ret) & ~(BUDDY_PAGE - 1));
-            size_t ci = ret - &page->chunk[0];
-            page->meta.used_bitmap.set(ci);
-        }
-
-        return ret;
-    }
-
-    void buddy_free(void* ptr, size_t bytes) {
-        size_t i = bucket_for(bytes);
-        auto* block = static_cast<Block*>(ptr);
-
-        while (i < NUM_BUCKETS) {
-            auto* buddy = reinterpret_cast<Block*>(
-                reinterpret_cast<uintptr_t>(block) ^ size_for_bucket(i));
-
-            Block** cursor = &free_lists_v[i];
-            while (*cursor && *cursor < buddy)
-                cursor = &(*cursor)->next;
-
-            if (*cursor == buddy) {
-                *cursor = buddy->next;
-                if (buddy < block) block = buddy;
-                i++;
-            } else {
-                break;
-            }
-        }
-
-        Block** cursor = &free_lists_v[i];
-        while (*cursor && *cursor < block)
-            cursor = &(*cursor)->next;
-        block->next = *cursor;
-        *cursor = block;
-
-        if (i == NUM_BUCKETS) {
-            auto* page = reinterpret_cast<Page*>(
-                reinterpret_cast<uintptr_t>(block) & ~(BUDDY_PAGE - 1));
-            size_t ci = block - &page->chunk[0];
-            page->meta.used_bitmap.reset(ci);
-
-            if (page->meta.used_bitmap.none()) {
-                num_empty_v++;
-                if (num_empty_v > MIN_EMPTY_PAGES) {
-                    cursor = &free_lists_v[NUM_BUCKETS];
-                    while (*cursor) {
-                        auto pa = reinterpret_cast<uintptr_t>(page);
-                        auto ba = reinterpret_cast<uintptr_t>(*cursor);
-                        if ((ba & ~(BUDDY_PAGE - 1)) == pa)
-                            *cursor = (*cursor)->next;
-                        else
-                            cursor = &(*cursor)->next;
-                    }
-                    Page** pcursor = &pages_v;
-                    while (*pcursor != page)
-                        pcursor = &(*pcursor)->meta.next;
-                    *pcursor = page->meta.next;
-                    num_empty_v--;
-                    dealloc_page(page);
-                }
-            }
-        }
-    }
-
-    builder() : alloc_v(), page_alloc_v(alloc_v) {}
-    explicit builder(const ALLOC& a) : alloc_v(a), page_alloc_v(alloc_v) {}
+    builder() : alloc_v() {}
+    explicit builder(const ALLOC& a) : alloc_v(a) {}
 
     builder(const builder&) = delete;
     builder& operator=(const builder&) = delete;
 
-    builder(builder&& o) noexcept
-        : alloc_v(std::move(o.alloc_v))
-        , page_alloc_v(alloc_v)
-        , pages_v(o.pages_v)
-        , num_empty_v(o.num_empty_v)
-        , mem_in_use_v(o.mem_in_use_v)
-    {
-        std::memcpy(free_lists_v, o.free_lists_v, sizeof(free_lists_v));
-        o.pages_v = nullptr;
-        o.num_empty_v = 0;
-        std::memset(o.free_lists_v, 0, sizeof(o.free_lists_v));
-        o.mem_in_use_v = 0;
-    }
+    builder(builder&& o) noexcept : alloc_v(std::move(o.alloc_v)) {}
 
     builder& operator=(builder&& o) noexcept {
-        if (this != &o) {
-            drain();
+        if (this != &o)
             alloc_v = std::move(o.alloc_v);
-            page_alloc_v = PAGE_ALLOC(alloc_v);
-            pages_v      = o.pages_v;
-            num_empty_v  = o.num_empty_v;
-            mem_in_use_v = o.mem_in_use_v;
-            std::memcpy(free_lists_v, o.free_lists_v, sizeof(free_lists_v));
-            o.pages_v = nullptr;
-            o.num_empty_v = 0;
-            std::memset(o.free_lists_v, 0, sizeof(o.free_lists_v));
-            o.mem_in_use_v = 0;
-        }
         return *this;
     }
 
     void swap(builder& o) noexcept {
         using std::swap;
         swap(alloc_v, o.alloc_v);
-        swap(page_alloc_v, o.page_alloc_v);
-        swap(pages_v, o.pages_v);
-        swap(num_empty_v, o.num_empty_v);
-        swap(mem_in_use_v, o.mem_in_use_v);
-        for (size_t i = 0; i <= NUM_BUCKETS; ++i)
-            swap(free_lists_v[i], o.free_lists_v[i]);
     }
 
     const ALLOC& get_allocator() const noexcept { return alloc_v; }
-    size_t memory_in_use() const noexcept { return mem_in_use_v; }
 
     // --- Allocate a node ---
-    // u64_count is updated to actual pow2 size allocated
+    // u64_count is updated to actual rounded size
     uint64_t* alloc_node(size_t& u64_count) {
-        size_t bytes = u64_count * 8;
-        if (bytes > MAX_BUDDY) {
-            // Large allocation — direct malloc
-            uint64_t* p = alloc_v.allocate(u64_count);
-            std::memset(p, 0, bytes);
-            mem_in_use_v += bytes;
-            return p;
-        }
-        size_t actual_bytes = size_for_bucket(bucket_for(bytes));
-        uint64_t* p = static_cast<uint64_t*>(buddy_alloc(bytes));
-        std::memset(p, 0, actual_bytes);
-        mem_in_use_v += actual_bytes;
-        u64_count = actual_bytes / 8;
+        size_t actual = round_up_u64(u64_count);
+        uint64_t* p = alloc_v.allocate(actual);
+        std::memset(p, 0, actual * 8);
+        u64_count = actual;
         return p;
     }
 
     // --- Return a node ---
     void dealloc_node(uint64_t* p, size_t u64_count) noexcept {
-        size_t bytes = u64_count * 8;
-        if (bytes > MAX_BUDDY) {
-            alloc_v.deallocate(p, u64_count);
-            mem_in_use_v -= bytes;
-            return;
-        }
-        size_t actual_bytes = size_for_bucket(bucket_for(bytes));
-        buddy_free(p, bytes);
-        mem_in_use_v -= actual_bytes;
+        alloc_v.deallocate(p, u64_count);
     }
 
-    // --- Free all pages. Only safe when all nodes are dead. ---
-    void drain() noexcept {
-        for (auto& list : free_lists_v)
-            list = nullptr;
-        while (pages_v) {
-            auto* next = pages_v->meta.next;
-            dealloc_page(pages_v);
-            pages_v = next;
-        }
-        num_empty_v  = 0;
-        mem_in_use_v = 0;
-    }
-
-    // --- shrink_to_fit: buddy can return empty pages ---
-    void shrink_to_fit() noexcept {}
+    // --- drain: no-op, tree destructor frees nodes individually ---
+    void drain() noexcept {}
 
     using VT = value_traits<VALUE, ALLOC>;
     using slot_type = typename VT::slot_type;
@@ -781,9 +556,6 @@ struct builder<VALUE, false, ALLOC> {
     void drain() noexcept {
         base_v.drain();
     }
-
-    void shrink_to_fit() noexcept { base_v.shrink_to_fit(); }
-    size_t memory_in_use() const noexcept { return base_v.memory_in_use(); }
 };
 
 // ==========================================================================

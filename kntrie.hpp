@@ -197,9 +197,6 @@ public:
     }
 
     void clear() noexcept { impl_.clear(); }
-    void shrink_to_fit() noexcept { impl_.shrink_to_fit(); }
-    size_t memory_in_use() const noexcept { return impl_.memory_in_use(); }
-    size_t memory_needed() const noexcept { return impl_.memory_needed(); }
     size_type erase(const KEY& key) { return impl_.erase(to_unsigned(key)) ? 1 : 0; }
 
     iterator erase(const_iterator pos) {
