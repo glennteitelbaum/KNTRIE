@@ -210,11 +210,9 @@ inline size_t hdr_u64(const uint64_t* n) noexcept {
 // Must be large enough for safe bitmap read: header(2) + bitmap(4) = 6 u64s.
 // ==========================================================================
 
-alignas(64) inline constinit uint64_t SENTINEL_NODE[8] = {};
-
-// Tagged sentinel: SENTINEL_NODE with LEAF_BIT set (valid zeroed leaf)
-inline const uint64_t SENTINEL_TAGGED =
-    reinterpret_cast<uint64_t>(&SENTINEL_NODE[0]) | LEAF_BIT;
+// Sentinel: just the LEAF_BIT tag with no address.
+// Any code entering a leaf path checks ptr == LEAF_BIT first.
+static constexpr uint64_t SENTINEL_TAGGED = LEAF_BIT;
 
 // ==========================================================================
 // Tagged pointer entry counting (NK-independent)

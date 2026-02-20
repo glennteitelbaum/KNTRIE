@@ -60,6 +60,7 @@ struct kntrie_iter_ops {
     static iter_ops_result_t<IK, VST> descend_min(uint64_t ptr,
                                                      IK prefix) noexcept {
         if (ptr & LEAF_BIT) {
+            if (ptr == LEAF_BIT) [[unlikely]] return {IK{}, nullptr, false};
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].min(
@@ -123,6 +124,7 @@ struct kntrie_iter_ops {
     static iter_ops_result_t<IK, VST> descend_max(uint64_t ptr,
                                                      IK prefix) noexcept {
         if (ptr & LEAF_BIT) {
+            if (ptr == LEAF_BIT) [[unlikely]] return {IK{}, nullptr, false};
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].max(
@@ -187,6 +189,7 @@ struct kntrie_iter_ops {
                                                         IK full_ik) noexcept {
         // --- LEAF ---
         if (ptr & LEAF_BIT) [[unlikely]] {
+            if (ptr == LEAF_BIT) [[unlikely]] return {IK{}, nullptr, false};
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].next(
@@ -287,6 +290,7 @@ struct kntrie_iter_ops {
     static iter_ops_result_t<IK, VST> iter_prev_node(uint64_t ptr, NK ik,
                                                         IK full_ik) noexcept {
         if (ptr & LEAF_BIT) [[unlikely]] {
+            if (ptr == LEAF_BIT) [[unlikely]] return {IK{}, nullptr, false};
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].prev(
