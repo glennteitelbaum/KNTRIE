@@ -100,7 +100,7 @@ struct compact_ops {
         uint16_t ts = slots_for(count);
         constexpr size_t hu = 1;  // no skip prefix on fresh leaf
         size_t au64 = size_u64(ts, hu);
-        uint64_t* node = bld.alloc_node(au64);
+        uint64_t* node = bld.alloc_node(au64, false);
         auto* h = get_header(node);
         h->set_entries(count);
         h->set_alloc_u64(au64);
@@ -319,7 +319,7 @@ struct compact_ops {
         unsigned new_entries = entries + 1;
         uint16_t new_ts = slots_for(new_entries);
         size_t au64 = size_u64(new_ts, hs);
-        uint64_t* nn = bld.alloc_node(au64);
+        uint64_t* nn = bld.alloc_node(au64, false);
         auto* nh = get_header(nn);
         *nh = *h;
         if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
@@ -374,7 +374,7 @@ struct compact_ops {
         if (new_ts < ts) [[unlikely]] {
             // Realloc + re-seed at smaller slot count
             size_t au64 = size_u64(new_ts, hs);
-            uint64_t* nn = bld.alloc_node(au64);
+            uint64_t* nn = bld.alloc_node(au64, false);
             auto* nh = get_header(nn);
             *nh = *h;
             if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];

@@ -466,9 +466,10 @@ struct builder<VALUE, true, ALLOC> {
     const ALLOC& get_allocator() const noexcept { return alloc_v; }
 
     // --- Allocate a node ---
-    // u64_count is updated to actual rounded size
-    uint64_t* alloc_node(size_t& u64_count) {
-        size_t actual = round_up_u64(u64_count);
+    // pad=true: round up for in-place growth (bitmask nodes)
+    // pad=false: exact allocation (compact leaves, VALUE*)
+    uint64_t* alloc_node(size_t& u64_count, bool pad = true) {
+        size_t actual = pad ? round_up_u64(u64_count) : u64_count;
         uint64_t* p = alloc_v.allocate(actual);
         std::memset(p, 0, actual * 8);
         u64_count = actual;
@@ -526,13 +527,13 @@ struct builder<VALUE, false, ALLOC> {
 
     const ALLOC& get_allocator() const noexcept { return base_v.get_allocator(); }
 
-    uint64_t* alloc_node(size_t& u64_count) { return base_v.alloc_node(u64_count); }
+    uint64_t* alloc_node(size_t& u64_count, bool pad = true) { return base_v.alloc_node(u64_count, pad); }
     void dealloc_node(uint64_t* p, size_t u64_count) noexcept { base_v.dealloc_node(p, u64_count); }
 
     slot_type store_value(const VALUE& val) {
         if constexpr (VAL_U64 <= FREE_MAX) {
-            size_t sz = round_up_u64(VAL_U64);
-            uint64_t* p = base_v.alloc_node(sz);
+            size_t sz = VAL_U64;
+            uint64_t* p = base_v.alloc_node(sz, false);
             std::construct_at(reinterpret_cast<VALUE*>(p), val);
             return reinterpret_cast<VALUE*>(p);
         } else {
@@ -546,7 +547,7 @@ struct builder<VALUE, false, ALLOC> {
     void destroy_value(slot_type& s) noexcept {
         std::destroy_at(s);
         if constexpr (VAL_U64 <= FREE_MAX) {
-            base_v.dealloc_node(reinterpret_cast<uint64_t*>(s), round_up_u64(VAL_U64));
+            base_v.dealloc_node(reinterpret_cast<uint64_t*>(s), VAL_U64);
         } else {
             VA va(base_v.get_allocator());
             std::allocator_traits<VA>::deallocate(va, s, 1);
