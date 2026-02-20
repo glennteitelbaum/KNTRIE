@@ -40,7 +40,7 @@ struct kntrie_ops {
     struct leaf_ops_entry_t {
         using find_fn_t   = const VALUE* (*)(const uint64_t*, node_header_t, NK) noexcept;
         using iter_fn_t   = iter_ops_result_t<IK, VST> (*)(const uint64_t*, node_header_t, NK, IK) noexcept;
-        using minmax_fn_t = iter_ops_result_t<IK, VST> (*)(const uint64_t*, node_header_t, IK, int) noexcept;
+        using minmax_fn_t = iter_ops_result_t<IK, VST> (*)(const uint64_t*, node_header_t, IK) noexcept;
 
         find_fn_t   find;
         iter_fn_t   next;
@@ -71,20 +71,6 @@ struct kntrie_ops {
             }
         }
 
-        template<int SKIP>
-        static void accum_prefix(uint64_t pfx, IK& prefix, int& bits) noexcept {
-            if constexpr (SKIP > 0) {
-                for (int i = 0; i < SKIP; ++i)
-                    prefix |= IK(pfx_byte(pfx, i)) << (IK_BITS - bits - 8 * (i + 1));
-                bits += 8 * SKIP;
-            }
-        }
-
-        template<typename SUF>
-        static IK suffix_to_ik(SUF suf, int bits) noexcept {
-            constexpr int SUF_BITS = static_cast<int>(sizeof(SUF) * 8);
-            return (IK(suf) << (IK_BITS - SUF_BITS)) >> bits;
-        }
 
         // Derive prefix from full_ik at compile-time BITS depth.
         // REM = remaining key bits. IK position = REM + IK_OFF.
@@ -134,34 +120,42 @@ struct kntrie_ops {
         // --- min_at<SKIP> ---
         template<int SKIP>
         static iter_ops_result_t<IK, VST> min_at(const uint64_t* node,
-                                                   node_header_t hdr, IK prefix, int bits) noexcept {
-            accum_prefix<SKIP>(node[1], prefix, bits);
+                                                   node_header_t hdr, IK prefix) noexcept {
+            if constexpr (SKIP > 0) {
+                uint64_t pfx = node[1];
+                for (int i = 0; i < SKIP; ++i)
+                    prefix |= IK(pfx_byte(pfx, i)) << (IK_OFF + BITS - 8 * (i + 1));
+            }
             constexpr size_t HS = 1 + (SKIP > 0);
             constexpr int REMAINING = BITS - 8 * SKIP;
             if constexpr (REMAINING <= 8) {
                 auto r = BO::bitmap_iter_first(node, HS);
-                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+                return {prefix | suffix_to_ik_ct<REMAINING>(r.suffix), r.value, true};
             } else {
                 using RCO = compact_ops<nk_for_bits_t<REMAINING>, VALUE, ALLOC>;
                 auto r = RCO::iter_first(node, &hdr);
-                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+                return {prefix | suffix_to_ik_ct<REMAINING>(r.suffix), r.value, true};
             }
         }
 
         // --- max_at<SKIP> ---
         template<int SKIP>
         static iter_ops_result_t<IK, VST> max_at(const uint64_t* node,
-                                                   node_header_t hdr, IK prefix, int bits) noexcept {
-            accum_prefix<SKIP>(node[1], prefix, bits);
+                                                   node_header_t hdr, IK prefix) noexcept {
+            if constexpr (SKIP > 0) {
+                uint64_t pfx = node[1];
+                for (int i = 0; i < SKIP; ++i)
+                    prefix |= IK(pfx_byte(pfx, i)) << (IK_OFF + BITS - 8 * (i + 1));
+            }
             constexpr size_t HS = 1 + (SKIP > 0);
             constexpr int REMAINING = BITS - 8 * SKIP;
             if constexpr (REMAINING <= 8) {
                 auto r = BO::bitmap_iter_last(node, hdr, HS);
-                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+                return {prefix | suffix_to_ik_ct<REMAINING>(r.suffix), r.value, true};
             } else {
                 using RCO = compact_ops<nk_for_bits_t<REMAINING>, VALUE, ALLOC>;
                 auto r = RCO::iter_last(node, &hdr);
-                return {prefix | suffix_to_ik(r.suffix, bits), r.value, true};
+                return {prefix | suffix_to_ik_ct<REMAINING>(r.suffix), r.value, true};
             }
         }
 
@@ -180,9 +174,8 @@ struct kntrie_ops {
                     uint8_t kb = static_cast<uint8_t>(key64 >> (56 - shift));
                     uint8_t pb = static_cast<uint8_t>(pfx >> (56 - shift));
                     if (kb < pb) {
-                        constexpr int bits = IK_BITS - IK_OFF - BITS;
                         IK prefix = derive_prefix<BITS>(full_ik);
-                        return min_at<SKIP>(node, hdr, prefix, bits);
+                        return min_at<SKIP>(node, hdr, prefix);
                     }
                     return {IK{}, nullptr, false};
                 }
@@ -217,9 +210,8 @@ struct kntrie_ops {
                     uint8_t kb = static_cast<uint8_t>(key64 >> (56 - shift));
                     uint8_t pb = static_cast<uint8_t>(pfx >> (56 - shift));
                     if (kb > pb) {
-                        constexpr int bits = IK_BITS - IK_OFF - BITS;
                         IK prefix = derive_prefix<BITS>(full_ik);
-                        return max_at<SKIP>(node, hdr, prefix, bits);
+                        return max_at<SKIP>(node, hdr, prefix);
                     }
                     return {IK{}, nullptr, false};
                 }

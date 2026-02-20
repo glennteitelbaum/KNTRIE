@@ -227,7 +227,7 @@ public:
 
     struct root_skip_ops_t {
         using find_fn_t   = const VALUE* (*)(const uint64_t*, uint64_t, NK0) noexcept;
-        using minmax_fn_t = iter_ops_result_t<IK, VST> (*)(uint64_t, IK, int) noexcept;
+        using minmax_fn_t = iter_ops_result_t<IK, VST> (*)(uint64_t, IK) noexcept;
         using iter_fn_t   = iter_ops_result_t<IK, VST> (*)(uint64_t, NK0, IK) noexcept;
 
         find_fn_t   find;
@@ -254,18 +254,18 @@ public:
 
     template<int SKIP>
     static iter_ops_result_t<IK, VST> root_min_at(uint64_t child,
-                                                     IK prefix, int bits) noexcept {
+                                                     IK prefix) noexcept {
         constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
         using D = root_dispatch<BITS>;
-        return D::ITER_TYPE::template descend_min<BITS>(child, prefix, bits);
+        return D::ITER_TYPE::template descend_min<BITS>(child, prefix);
     }
 
     template<int SKIP>
     static iter_ops_result_t<IK, VST> root_max_at(uint64_t child,
-                                                     IK prefix, int bits) noexcept {
+                                                     IK prefix) noexcept {
         constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
         using D = root_dispatch<BITS>;
-        return D::ITER_TYPE::template descend_max<BITS>(child, prefix, bits);
+        return D::ITER_TYPE::template descend_max<BITS>(child, prefix);
     }
 
     template<int SKIP>
@@ -403,24 +403,22 @@ public:
     struct iter_result_t { KEY key; VALUE value; bool found; };
 
     iter_result_t iter_first() const noexcept {
-        int pb = prefix_bits();
         auto& ops = ROOT_OPS[root_skip_v];
         for (int i = 0; i < 256; ++i) {
             if (root_v[i] == SENTINEL_TAGGED) continue;
             IK pfx = make_prefix(static_cast<uint8_t>(i));
-            auto r = ops.min(root_v[i], pfx, pb);
+            auto r = ops.min(root_v[i], pfx);
             return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
         }
         return {KEY{}, VALUE{}, false};
     }
 
     iter_result_t iter_last() const noexcept {
-        int pb = prefix_bits();
         auto& ops = ROOT_OPS[root_skip_v];
         for (int i = 255; i >= 0; --i) {
             if (root_v[i] == SENTINEL_TAGGED) continue;
             IK pfx = make_prefix(static_cast<uint8_t>(i));
-            auto r = ops.max(root_v[i], pfx, pb);
+            auto r = ops.max(root_v[i], pfx);
             return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
         }
         return {KEY{}, VALUE{}, false};
@@ -439,11 +437,10 @@ public:
         }
 
         // Scan forward — non-sentinel root always has entries
-        int pb = prefix_bits();
         for (int i = top + 1; i < 256; ++i) {
             if (root_v[i] == SENTINEL_TAGGED) continue;
             IK pfx = make_prefix(static_cast<uint8_t>(i));
-            auto r = ops.min(root_v[i], pfx, pb);
+            auto r = ops.min(root_v[i], pfx);
             return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
         }
         return {KEY{}, VALUE{}, false};
@@ -462,11 +459,10 @@ public:
         }
 
         // Scan backward — non-sentinel root always has entries
-        int pb = prefix_bits();
         for (int i = top - 1; i >= 0; --i) {
             if (root_v[i] == SENTINEL_TAGGED) continue;
             IK pfx = make_prefix(static_cast<uint8_t>(i));
-            auto r = ops.max(root_v[i], pfx, pb);
+            auto r = ops.max(root_v[i], pfx);
             return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
         }
         return {KEY{}, VALUE{}, false};

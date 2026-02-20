@@ -58,38 +58,38 @@ struct kntrie_iter_ops {
 
     template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_min(uint64_t ptr,
-                                                     IK prefix, int bits) noexcept {
+                                                     IK prefix) noexcept {
         if (ptr & LEAF_BIT) {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].min(
-                node, *hdr, prefix, bits);
+                node, *hdr, prefix);
         }
 
         const uint64_t* node = bm_to_node_const(ptr);
         uint8_t sc = get_header(node)->skip();
         if (sc > 0)
-            return descend_min_chain_skip<BITS>(node, sc, 0, prefix, bits);
-        return descend_min_bm_final<BITS>(node, sc, prefix, bits);
+            return descend_min_chain_skip<BITS>(node, sc, 0, prefix);
+        return descend_min_bm_final<BITS>(node, sc, prefix);
     }
 
     // Chain embed: accumulate bytes, compile-time narrow
     template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_min_chain_skip(
             const uint64_t* node, uint8_t sc, uint8_t pos,
-            IK prefix, int bits) noexcept {
+            IK prefix) noexcept {
         
         if (pos >= sc)
-            return descend_min_bm_final<BITS>(node, sc, prefix, bits);
+            return descend_min_bm_final<BITS>(node, sc, prefix);
 
-        prefix |= IK(BO::skip_byte(node, pos)) << (IK_BITS - bits - 8);
+        prefix |= IK(BO::skip_byte(node, pos)) << (IK_OFF + BITS - 8);
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
                 return NARROW::template descend_min_chain_skip<BITS - 8>(
-                    node, sc, pos + 1, prefix, bits + 8);
+                    node, sc, pos + 1, prefix);
             else
                 return descend_min_chain_skip<BITS - 8>(
-                    node, sc, pos + 1, prefix, bits + 8);
+                    node, sc, pos + 1, prefix);
         }
         __builtin_unreachable();
     }
@@ -98,19 +98,19 @@ struct kntrie_iter_ops {
     template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_min_bm_final(
             const uint64_t* node, uint8_t sc,
-            IK prefix, int bits) noexcept {
+            IK prefix) noexcept {
         
         const bitmap_256_t& fbm = BO::chain_bitmap(node, sc);
         uint8_t byte = fbm.first_set_bit();
-        prefix |= IK(byte) << (IK_BITS - bits - 8);
+        prefix |= IK(byte) << (IK_OFF + BITS - 8);
         uint64_t child = BO::chain_children(node, sc)[0];
 
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
                 return NARROW::template descend_min<BITS - 8>(
-                    child, prefix, bits + 8);
+                    child, prefix);
             else
-                return descend_min<BITS - 8>(child, prefix, bits + 8);
+                return descend_min<BITS - 8>(child, prefix);
         }
         __builtin_unreachable();
     }
@@ -121,36 +121,36 @@ struct kntrie_iter_ops {
 
     template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_max(uint64_t ptr,
-                                                     IK prefix, int bits) noexcept {
+                                                     IK prefix) noexcept {
         if (ptr & LEAF_BIT) {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
             return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].max(
-                node, *hdr, prefix, bits);
+                node, *hdr, prefix);
         }
 
         const uint64_t* node = bm_to_node_const(ptr);
         uint8_t sc = get_header(node)->skip();
         if (sc > 0)
-            return descend_max_chain_skip<BITS>(node, sc, 0, prefix, bits);
-        return descend_max_bm_final<BITS>(node, sc, prefix, bits);
+            return descend_max_chain_skip<BITS>(node, sc, 0, prefix);
+        return descend_max_bm_final<BITS>(node, sc, prefix);
     }
 
     template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_max_chain_skip(
             const uint64_t* node, uint8_t sc, uint8_t pos,
-            IK prefix, int bits) noexcept {
+            IK prefix) noexcept {
         
         if (pos >= sc)
-            return descend_max_bm_final<BITS>(node, sc, prefix, bits);
-        prefix |= IK(BO::skip_byte(node, pos)) << (IK_BITS - bits - 8);
+            return descend_max_bm_final<BITS>(node, sc, prefix);
+        prefix |= IK(BO::skip_byte(node, pos)) << (IK_OFF + BITS - 8);
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
                 return NARROW::template descend_max_chain_skip<BITS - 8>(
-                    node, sc, pos + 1, prefix, bits + 8);
+                    node, sc, pos + 1, prefix);
             else
                 return descend_max_chain_skip<BITS - 8>(
-                    node, sc, pos + 1, prefix, bits + 8);
+                    node, sc, pos + 1, prefix);
         }
         __builtin_unreachable();
     }
@@ -158,19 +158,19 @@ struct kntrie_iter_ops {
     template<int BITS> requires (BITS >= 8)
     static iter_ops_result_t<IK, VST> descend_max_bm_final(
             const uint64_t* node, uint8_t sc,
-            IK prefix, int bits) noexcept {
+            IK prefix) noexcept {
         
         const bitmap_256_t& fbm = BO::chain_bitmap(node, sc);
         uint8_t byte = fbm.last_set_bit();
         int slot = get_header(node)->entries() - 1;
-        prefix |= IK(byte) << (IK_BITS - bits - 8);
+        prefix |= IK(byte) << (IK_OFF + BITS - 8);
         uint64_t child = BO::chain_children(node, sc)[slot];
         if constexpr (BITS > 8) {
             if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
                 return NARROW::template descend_max<BITS - 8>(
-                    child, prefix, bits + 8);
+                    child, prefix);
             else
-                return descend_max<BITS - 8>(child, prefix, bits + 8);
+                return descend_max<BITS - 8>(child, prefix);
         }
         __builtin_unreachable();
     }
@@ -216,8 +216,7 @@ struct kntrie_iter_ops {
         if (kb < sb) [[unlikely]] {
             // Chain byte > key: descend min from here
             IK prefix = full_ik & (~IK(0) << (BITS + IK_OFF));
-            constexpr int bits = IK_BITS - IK_OFF - BITS;
-            return descend_min_chain_skip<BITS>(node, sc, pos, prefix, bits);
+            return descend_min_chain_skip<BITS>(node, sc, pos, prefix);
         }
         if (kb > sb) [[unlikely]] return {IK{}, nullptr, false};
 
@@ -268,14 +267,13 @@ struct kntrie_iter_ops {
         if (adj.found) [[unlikely]] {
             IK prefix = full_ik & (~IK(0) << (BITS + IK_OFF));
             IK np = prefix | (IK(adj.idx) << (BITS - 8 + IK_OFF));
-            constexpr int bits_after = IK_BITS - IK_OFF - BITS + 8;
             if constexpr (BITS > 8) {
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
                     return NARROW::template descend_min<BITS - 8>(
-                        children[adj.slot], np, bits_after);
+                        children[adj.slot], np);
                 else
                     return descend_min<BITS - 8>(
-                        children[adj.slot], np, bits_after);
+                        children[adj.slot], np);
             }
         }
         return {IK{}, nullptr, false};
@@ -315,8 +313,7 @@ struct kntrie_iter_ops {
         uint8_t sb = BO::skip_byte(node, pos);
         if (kb > sb) [[unlikely]] {
             IK prefix = full_ik & (~IK(0) << (BITS + IK_OFF));
-            constexpr int bits = IK_BITS - IK_OFF - BITS;
-            return descend_max_chain_skip<BITS>(node, sc, pos, prefix, bits);
+            return descend_max_chain_skip<BITS>(node, sc, pos, prefix);
         }
         if (kb < sb) [[unlikely]] return {IK{}, nullptr, false};
 
@@ -366,14 +363,13 @@ struct kntrie_iter_ops {
         if (adj.found) [[unlikely]] {
             IK prefix = full_ik & (~IK(0) << (BITS + IK_OFF));
             IK np = prefix | (IK(adj.idx) << (BITS - 8 + IK_OFF));
-            constexpr int bits_after = IK_BITS - IK_OFF - BITS + 8;
             if constexpr (BITS > 8) {
                 if constexpr (BITS - 8 == NK_BITS / 2 && NK_BITS > 8)
                     return NARROW::template descend_max<BITS - 8>(
-                        children[adj.slot], np, bits_after);
+                        children[adj.slot], np);
                 else
                     return descend_max<BITS - 8>(
-                        children[adj.slot], np, bits_after);
+                        children[adj.slot], np);
             }
         }
         return {IK{}, nullptr, false};
