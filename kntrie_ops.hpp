@@ -131,7 +131,7 @@ struct kntrie_ops {
         if constexpr (sizeof(NK) == 1) {
             return BO::make_single_bitmap(static_cast<uint8_t>(suffix), value, bld);
         } else {
-            return CO::make_leaf(&suffix, &value, 1, 0, nullptr, bld);
+            return CO::make_leaf(&suffix, &value, 1, bld);
         }
     }
 
@@ -178,14 +178,12 @@ struct kntrie_ops {
         uint8_t old_idx = pfx_byte(pfx_u64, common);
         uint8_t old_rem = skip - 1 - common;
 
-        // Save common prefix bytes for wrap_in_chain (u8 array)
+        // Save common prefix bytes for wrap_in_chain (bitmask interface needs u8[])
         uint8_t saved_prefix[6] = {};
-        for (uint8_t j = 0; j < common; ++j)
-            saved_prefix[j] = pfx_byte(pfx_u64, j);
+        pfx_to_bytes(pfx_u64, saved_prefix, common);
 
         // Update old node: strip consumed prefix, keep remainder
         if (old_rem > 0) [[unlikely]] {
-            // Shift off common + divergence byte, remainder is left-aligned
             uint64_t rem_pfx = pfx_u64 << (8 * (common + 1));
             hdr->set_skip(old_rem);
             hdr->set_prefix_u64(rem_pfx);
@@ -194,15 +192,9 @@ struct kntrie_ops {
             hdr = get_header(node);
         }
 
-        // Extract prefix bytes from remaining ik (past divergence byte)
-        uint8_t new_prefix[6] = {};
-        {
-            NK tmp = static_cast<NK>(ik << 8);
-            for (uint8_t j = 0; j < old_rem; ++j) {
-                new_prefix[j] = static_cast<uint8_t>(tmp >> (NK_BITS - 8));
-                tmp = static_cast<NK>(tmp << 8);
-            }
-        }
+        // Build new prefix u64 from remaining ik bytes (past divergence byte)
+        uint64_t new_pfx_u64 = static_cast<uint64_t>(
+            static_cast<NK>(ik << 8)) << (64 - NK_BITS);
 
         // Build new leaf at correct NK depth via recursive narrowing.
         // Consume old_rem bytes past the divergence byte.
@@ -211,12 +203,10 @@ struct kntrie_ops {
             new_leaf = make_leaf_descended<BITS - 8>(
                 static_cast<NK>(ik << 8), value, old_rem, bld);
         } else {
-            // BITS==8: no skip possible on 8-bit leaf, unreachable
             new_leaf = make_single_leaf(ik, value, bld);
         }
         if (old_rem > 0) [[unlikely]]
-            new_leaf = prepend_skip(new_leaf, old_rem,
-                           pack_prefix(new_prefix, old_rem), bld);
+            new_leaf = prepend_skip(new_leaf, old_rem, new_pfx_u64, bld);
 
         // Create parent bitmask with 2 children
         uint8_t   bi[2];
@@ -324,7 +314,7 @@ struct kntrie_ops {
                 static_cast<uint32_t>(count), bld);
         } else {
             return CO::make_leaf(suf, vals,
-                static_cast<uint32_t>(count), 0, nullptr, bld);
+                static_cast<uint32_t>(count), bld);
         }
     }
 
@@ -462,7 +452,7 @@ struct kntrie_ops {
                 child_tagged = tag_leaf(leaf);
             } else {
                 uint8_t pfx_bytes[6];
-                for (uint8_t j = 0; j < ps; ++j) pfx_bytes[j] = pfx_byte(pfx_u64, j);
+                pfx_to_bytes(pfx_u64, pfx_bytes, ps);
                 uint64_t* bm_node = bm_to_node(child_tagged);
                 child_tagged = BO::wrap_in_chain(bm_node, pfx_bytes, ps, bld);
             }

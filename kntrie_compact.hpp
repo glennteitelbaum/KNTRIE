@@ -96,18 +96,15 @@ struct compact_ops {
     // ==================================================================
 
     static uint64_t* make_leaf(const K* sorted_keys, const VST* values,
-                               unsigned count, uint8_t skip,
-                               const uint8_t* prefix, BLD& bld) {
+                               unsigned count, BLD& bld) {
         uint16_t ts = slots_for(count);
-        size_t hu = 1 + (skip > 0);
+        constexpr size_t hu = 1;  // no skip prefix on fresh leaf
         size_t au64 = size_u64(ts, hu);
         uint64_t* node = bld.alloc_node(au64);
         auto* h = get_header(node);
         h->set_entries(count);
         h->set_alloc_u64(au64);
         h->set_total_slots(ts);
-        h->set_skip(skip);
-        if (skip > 0) h->set_prefix(prefix, skip);
 
         if (count > 0) {
             if constexpr (VT::IS_BOOL) {

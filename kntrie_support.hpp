@@ -162,6 +162,11 @@ inline uint64_t pack_prefix(const uint8_t* bytes, uint8_t len) noexcept {
         v |= uint64_t(bytes[i]) << (56 - 8 * i);
     return v;
 }
+// Extract bytes from packed u64 (for bitmask interface boundary)
+inline void pfx_to_bytes(uint64_t pfx, uint8_t* out, uint8_t len) noexcept {
+    for (uint8_t i = 0; i < len; ++i)
+        out[i] = static_cast<uint8_t>(pfx >> (56 - 8 * i));
+}
 
 // --- NK type for a given remaining bit count ---
 template<int BITS>
