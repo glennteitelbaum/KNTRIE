@@ -562,20 +562,28 @@ struct builder<VALUE, true, ALLOC> {
     }
 
     // --- Allocate a node ---
-    uint64_t* alloc_node(size_t u64_count) {
+    // u64_count is updated to actual allocated size (may be larger from bin steal)
+    uint64_t* alloc_node(size_t& u64_count) {
         int bin = bin_for(u64_count);
         if (bin < static_cast<int>(NUM_BINS)) {
-            size_t actual = BIN_SIZES[bin];
-            uint64_t* p;
-            if (bins_v[bin]) [[likely]] {
-                p = bins_v[bin];
-                bins_v[bin] = reinterpret_cast<uint64_t*>(p[0]);
-            } else {
-                p = bump_alloc(actual);
+            // Try exact bin, then steal from larger bins
+            uint64_t* p = nullptr;
+            int use_bin = bin;
+            for (int b = bin; b < static_cast<int>(NUM_BINS); ++b) {
+                if (bins_v[b]) {
+                    p = bins_v[b];
+                    bins_v[b] = reinterpret_cast<uint64_t*>(p[0]);
+                    use_bin = b;
+                    break;
+                }
             }
+            size_t actual = BIN_SIZES[use_bin];
+            if (!p)
+                p = bump_alloc(actual);
             std::memset(p, 0, actual * 8);
             mem_in_use_v += actual * 8;
             mem_needed_v += u64_count * 8;
+            u64_count = actual;
             return p;
         }
         // Large allocation — direct malloc
@@ -664,12 +672,13 @@ struct builder<VALUE, false, ALLOC> {
 
     const ALLOC& get_allocator() const noexcept { return base_v.get_allocator(); }
 
-    uint64_t* alloc_node(size_t u64_count) { return base_v.alloc_node(u64_count); }
+    uint64_t* alloc_node(size_t& u64_count) { return base_v.alloc_node(u64_count); }
     void dealloc_node(uint64_t* p, size_t u64_count) noexcept { base_v.dealloc_node(p, u64_count); }
 
     slot_type store_value(const VALUE& val) {
         if constexpr (VAL_U64 <= FREE_MAX) {
-            uint64_t* p = base_v.alloc_node(round_up_u64(VAL_U64));
+            size_t sz = round_up_u64(VAL_U64);
+            uint64_t* p = base_v.alloc_node(sz);
             std::construct_at(reinterpret_cast<VALUE*>(p), val);
             return reinterpret_cast<VALUE*>(p);
         } else {
