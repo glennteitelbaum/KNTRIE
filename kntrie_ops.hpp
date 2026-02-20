@@ -252,7 +252,7 @@ struct kntrie_ops {
     template<int BITS> requires (BITS > 8)
     static const VALUE* find_node(uint64_t ptr, NK ik) noexcept {
         if (ptr & LEAF_BIT) [[unlikely]] {
-            if (ptr == LEAF_BIT) [[unlikely]] return nullptr;
+            if (ptr == SENTINEL_TAGGED) [[unlikely]] return nullptr;
             const uint64_t* node = reinterpret_cast<const uint64_t*>(ptr ^ LEAF_BIT);
             node_header_t hdr = *get_header(node);
             return leaf_ops_t<BITS>::TABLE[hdr.skip()].find(node, hdr, ik);
@@ -274,7 +274,7 @@ struct kntrie_ops {
 
     template<int BITS> requires (BITS == 8)
     static const VALUE* find_node(uint64_t ptr, NK ik) noexcept {
-        if (ptr == LEAF_BIT) [[unlikely]] return nullptr;
+        if (ptr == SENTINEL_TAGGED) [[unlikely]] return nullptr;
         const uint64_t* node = reinterpret_cast<const uint64_t*>(ptr ^ LEAF_BIT);
         node_header_t hdr = *get_header(node);
         return BO::bitmap_find(node, hdr, static_cast<uint8_t>(ik), 1);
