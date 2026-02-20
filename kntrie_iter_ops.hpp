@@ -61,7 +61,6 @@ struct kntrie_iter_ops {
         if (ptr & LEAF_BIT) {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
-            if (hdr->entries() == 0) return {IK{}, nullptr, false};
             return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].min(
                 node, *hdr, prefix, bits);
         }
@@ -125,7 +124,6 @@ struct kntrie_iter_ops {
         if (ptr & LEAF_BIT) {
             const uint64_t* node = untag_leaf(ptr);
             auto* hdr = get_header(node);
-            if (hdr->entries() == 0) return {IK{}, nullptr, false};
             return OPS::template leaf_ops_t<BITS>::TABLE[hdr->skip()].max(
                 node, *hdr, prefix, bits);
         }
