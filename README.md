@@ -17,5 +17,8 @@ A **sorted**, **compressed** associative container for integer keys (`uint8_t` t
 * [Concepts](./concepts.md)
 
 
+Performance charts:
 
-* [Performance chart](https://glennteitelbaum.github.io/KNTRIE/chart.html)
+
+* [u16](https://glennteitelbaum.github.io/KNTRIE/chart16.html)
+* [u64](https://glennteitelbaum.github.io/KNTRIE/chart64.html)

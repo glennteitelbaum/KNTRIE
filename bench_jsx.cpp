@@ -618,8 +618,8 @@ static void bench_all(size_t target_n, const std::string& pattern,
 
     rows.push_back({pattern, n, "kntrie", k_fnd, k_nf, k_ins, k_ers, k_iter, kntrie_mem});
     if (do_map)
-        rows.push_back({pattern, n, "map", m_fnd, m_nf, m_ins, m_ers, m_iter, map_mem, 0});
-    rows.push_back({pattern, n, "umap", u_fnd, u_nf, u_ins, u_ers, u_iter, umap_mem, 0});
+        rows.push_back({pattern, n, "map", m_fnd, m_nf, m_ins, m_ers, m_iter, map_mem});
+    rows.push_back({pattern, n, "umap", u_fnd, u_nf, u_ins, u_ers, u_iter, umap_mem});
 }
 
 // ==========================================================================
