@@ -27,11 +27,12 @@ private:
     using VST  = typename VT::slot_type;
     using BO   = bitmask_ops<VALUE, ALLOC>;
     using BLD  = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
-    using OPS  = kntrie_ops<VALUE, ALLOC>;
-    using ITER_OPS = kntrie_iter_ops<VALUE, ALLOC>;
 
     static constexpr int IK_BITS  = KO::IK_BITS;
     static constexpr int KEY_BITS = KO::KEY_BITS;
+
+    using OPS  = kntrie_ops<VALUE, ALLOC, KEY_BITS>;
+    using ITER_OPS = kntrie_iter_ops<VALUE, ALLOC, KEY_BITS>;
 
     // MAX_ROOT_SKIP: leave 1 byte for subtree root dispatch + 1 byte minimum
     // u16: 0, u32: 2, u64: 6
@@ -83,7 +84,7 @@ private:
             if ((ik ^ prefix) & MASK) [[unlikely]] return nullptr;
         }
         constexpr int BITS = KEY_BITS - 8 * SKIP;
-        return OPS::template find_node<BITS>(ptr, ik << (8 * SKIP));
+        return OPS::template find_node<BITS>(ptr, ik);
     }
 
     // --- Root find_next_leaf: find leaf that may contain next key > ik ---
@@ -103,7 +104,7 @@ private:
                 return nullptr;
             }
         }
-        return OPS::template find_leaf_next<BITS>(ptr, ik << (8 * SKIP));
+        return OPS::template find_leaf_next<BITS>(ptr, ik);
     }
 
     // --- Root find_prev_leaf: find leaf that may contain prev key < ik ---
@@ -123,7 +124,7 @@ private:
                 return nullptr;
             }
         }
-        return OPS::template find_leaf_prev<BITS>(ptr, ik << (8 * SKIP));
+        return OPS::template find_leaf_prev<BITS>(ptr, ik);
     }
 
     // --- Build ROOT_FNS array ---
@@ -291,12 +292,7 @@ public:
         }
 
         bool erased = skip_switch([&]<int BITS>() -> bool {
-            uint64_t shifted = ik << (8 * (KEY_BITS / 8 - BITS / 8 - 1));
-            // BITS = KEY_BITS - 8*(skip+1) from skip_switch, but we need
-            // shifted = ik << (8 * skip) ... skip = KEY_BITS/8 - 1 - BITS/8
-            // Actually: skip = root_fn_v->skip, shifted = ik << (8 * skip)
-            uint64_t sik = ik << (8 * root_fn_v->skip);
-            auto r = OPS::template erase_node<BITS>(root_ptr_v, sik, bld_v);
+            auto r = OPS::template erase_node<BITS>(root_ptr_v, ik, bld_v);
             if (!r.erased) return false;
             root_ptr_v = r.tagged_ptr ? r.tagged_ptr : BO::SENTINEL_TAGGED;
             return true;
@@ -480,9 +476,8 @@ private:
 
         // Insert into subtree
         bool did_insert = skip_switch([&]<int BITS>() -> bool {
-            uint64_t sik = ik << (8 * root_fn_v->skip);
             auto r = OPS::template insert_node<BITS, INSERT, ASSIGN>(
-                root_ptr_v, sik, sv, bld_v);
+                root_ptr_v, ik, sv, bld_v);
             if (r.tagged_ptr != root_ptr_v) root_ptr_v = r.tagged_ptr;
             return r.inserted;
         });
@@ -506,15 +501,31 @@ private:
             uint8_t chain_bytes[6];
             for (uint8_t i = 0; i < remaining_skip; ++i)
                 chain_bytes[i] = pfx_byte(root_prefix_v, div_pos + 1 + i);
+            uint64_t pfx_packed = pack_prefix(chain_bytes, remaining_skip);
 
             if (root_ptr_v & LEAF_BIT) {
-                // Leaf: prepend skip to leaf
+                // Leaf: prepend skip — need BITS = KEY_BITS - 8*(div_pos+1)
                 uint64_t* leaf = untag_leaf_mut(root_ptr_v);
-                leaf = OPS::prepend_skip(leaf, remaining_skip,
-                                          pack_prefix(chain_bytes, remaining_skip), bld_v);
+                // div_pos switch to get compile-time BITS for fn pointer
+                auto do_prepend = [&]<int DIVP>() -> uint64_t* {
+                    constexpr int BITS = KEY_BITS - 8 * (DIVP + 1);
+                    return OPS::template prepend_skip<BITS>(
+                        leaf, remaining_skip, pfx_packed, bld_v);
+                };
+                if constexpr (MAX_ROOT_SKIP >= 1) {
+                    switch (div_pos) {
+                    case 0: leaf = do_prepend.template operator()<0>(); break;
+                    case 1: if constexpr (MAX_ROOT_SKIP >= 2) { leaf = do_prepend.template operator()<1>(); break; } [[fallthrough]];
+                    case 2: if constexpr (MAX_ROOT_SKIP >= 3) { leaf = do_prepend.template operator()<2>(); break; } [[fallthrough]];
+                    case 3: if constexpr (MAX_ROOT_SKIP >= 4) { leaf = do_prepend.template operator()<3>(); break; } [[fallthrough]];
+                    case 4: if constexpr (MAX_ROOT_SKIP >= 5) { leaf = do_prepend.template operator()<4>(); break; } [[fallthrough]];
+                    case 5: if constexpr (MAX_ROOT_SKIP >= 6) { leaf = do_prepend.template operator()<5>(); break; } [[fallthrough]];
+                    default: __builtin_unreachable();
+                    }
+                }
                 old_subtree = tag_leaf(leaf);
             } else {
-                // Bitmask: wrap in chain
+                // Bitmask: wrap in chain (doesn't need BITS)
                 uint64_t* bm_node = bm_to_node(root_ptr_v);
                 old_subtree = BO::wrap_in_chain(bm_node, chain_bytes, remaining_skip, bld_v);
             }
@@ -531,7 +542,6 @@ private:
 
         // Update skip
         set_root_skip(div_pos);
-        // root_prefix_v bits [0..div_pos-1] unchanged, rest don't matter
     }
 
     // ==================================================================

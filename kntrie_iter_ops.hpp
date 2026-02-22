@@ -24,13 +24,13 @@ struct kntrie_stats_t {
 // All functions take uint64_t ik. No NK narrowing.
 // ======================================================================
 
-template<typename VALUE, typename ALLOC>
+template<typename VALUE, typename ALLOC, int KEY_BITS>
 struct kntrie_iter_ops {
     using BO  = bitmask_ops<VALUE, ALLOC>;
     using VT  = value_traits<VALUE, ALLOC>;
     using VST = typename VT::slot_type;
     using BLD = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
-    using OPS = kntrie_ops<VALUE, ALLOC>;
+    using OPS = kntrie_ops<VALUE, ALLOC, KEY_BITS>;
 
     // ==================================================================
     // Destroy leaf: compile-time NK dispatch via BITS
