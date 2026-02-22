@@ -27,141 +27,172 @@ private:
     using VST  = typename VT::slot_type;
     using BO   = bitmask_ops<VALUE, ALLOC>;
     using BLD  = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
+    using OPS  = kntrie_ops<VALUE, ALLOC>;
+    using ITER_OPS = kntrie_iter_ops<VALUE, ALLOC>;
 
     static constexpr int IK_BITS  = KO::IK_BITS;
     static constexpr int KEY_BITS = KO::KEY_BITS;
-    static constexpr int IK_OFF   = IK_BITS - KEY_BITS;
 
-    // NK0 = initial narrowed key type matching KEY width (>= 16 bits)
-    using NK0 = std::conditional_t<KEY_BITS <= 16, uint16_t,
-                std::conditional_t<KEY_BITS <= 32, uint32_t, uint64_t>>;
-    using OPS      = kntrie_ops<NK0, VALUE, ALLOC, IK, IK_OFF>;
-    using ITER_OPS = kntrie_iter_ops<NK0, VALUE, ALLOC, IK, IK_OFF>;
-
-    static constexpr int NK0_BITS = static_cast<int>(sizeof(NK0) * 8);
-
-    using NNK0         = next_narrow_t<NK0>;
-    using NARROW_OPS   = kntrie_ops<NNK0, VALUE, ALLOC, IK, IK_OFF>;
-    using NARROW_ITER  = kntrie_iter_ops<NNK0, VALUE, ALLOC, IK, IK_OFF>;
-
-    using NNNK0  = next_narrow_t<NNK0>;
-    using NNNNK0 = next_narrow_t<NNNK0>;   // uint8_t for u64 keys
-
-    // MAX_ROOT_SKIP: leave 1 byte for root_v index + 1 byte for subtree
-    // u16: 0  (no skip), u32: 2, u64: 6
+    // MAX_ROOT_SKIP: leave 1 byte for subtree root dispatch + 1 byte minimum
+    // u16: 0, u32: 2, u64: 6
     static constexpr int MAX_ROOT_SKIP = KEY_BITS / 8 - 2;
 
-    // ======================================================================
-    // root_dispatch<BITS>: compile-time trait for narrowing at a given depth
-    //
-    // KEY INVARIANT: We must choose NK_TYPE such that BITS > NK_TYPE_BITS/2
-    // (or NK_TYPE_BITS == 8). This prevents find_node/insert_node from
-    // narrowing internally, ensuring insert and find use the same NK type
-    // for leaf creation and lookup. Use strict > not >= for boundaries.
-    // ======================================================================
+    // ==================================================================
+    // key_to_u64: left-align internal key in uint64_t
+    // ==================================================================
 
-    template<int BITS>
-    struct root_dispatch {
-        static_assert(BITS >= 8);
-        static constexpr int CONSUMED_BITS = KEY_BITS - BITS;
-        static constexpr int NNK0_BITS  = static_cast<int>(sizeof(NNK0) * 8);
-        static constexpr int NNNK0_BITS = static_cast<int>(sizeof(NNNK0) * 8);
+    static uint64_t key_to_u64(const KEY& key) noexcept {
+        IK internal = KO::to_internal(key);
+        return static_cast<uint64_t>(internal) << (64 - IK_BITS);
+    }
 
-        // Strict >: ensures find_node won't narrow past what insert used
-        using NK_TYPE = std::conditional_t<(BITS > NK0_BITS / 2), NK0,
-                        std::conditional_t<(BITS > NNK0_BITS / 2), NNK0,
-                        std::conditional_t<(BITS > NNNK0_BITS / 2), NNNK0, NNNNK0>>>;
+    // ==================================================================
+    // root_fn_t — function pointer table for root dispatch
+    // ==================================================================
 
-        using OPS_TYPE  = kntrie_ops<NK_TYPE, VALUE, ALLOC, IK, IK_OFF>;
-        using ITER_TYPE = kntrie_iter_ops<NK_TYPE, VALUE, ALLOC, IK, IK_OFF>;
+    using root_find_fn_t     = const VALUE* (*)(uint64_t ptr, uint64_t prefix,
+                                                 uint64_t ik) noexcept;
+    using root_findleaf_fn_t = const uint64_t* (*)(uint64_t ptr, uint64_t prefix,
+                                                    uint64_t ik) noexcept;
 
-        // Shift and narrow nk to the correct type for this depth
-        static NK_TYPE narrow(NK0 nk) noexcept {
-            NK0 shifted = static_cast<NK0>(nk << CONSUMED_BITS);
-            if constexpr (std::is_same_v<NK_TYPE, NK0>) {
-                return shifted;
-            } else {
-                constexpr int NK_TYPE_BITS = static_cast<int>(sizeof(NK_TYPE) * 8);
-                return static_cast<NK_TYPE>(shifted >> (NK0_BITS - NK_TYPE_BITS));
-            }
-        }
+    struct root_fn_t {
+        uint8_t             skip;
+        root_find_fn_t      find;
+        root_findleaf_fn_t  find_next;
+        root_findleaf_fn_t  find_prev;
     };
 
-    // ======================================================================
-    // skip_switch: dispatch a templated lambda at the correct BITS depth
-    // ======================================================================
+    // --- Sentinel root fn (empty trie) ---
+    static const VALUE* sentinel_root_find(uint64_t, uint64_t, uint64_t) noexcept {
+        return nullptr;
+    }
+    static const uint64_t* sentinel_root_findleaf(uint64_t, uint64_t, uint64_t) noexcept {
+        return nullptr;
+    }
+
+    static inline const root_fn_t SENTINEL_ROOT_FN = {
+        0, &sentinel_root_find, &sentinel_root_findleaf, &sentinel_root_findleaf,
+    };
+
+    // --- Root find implementation ---
+    template<int SKIP>
+    static const VALUE* root_find_impl(uint64_t ptr, uint64_t prefix,
+                                        uint64_t ik) noexcept {
+        if constexpr (SKIP > 0) {
+            constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
+            if ((ik ^ prefix) & MASK) [[unlikely]] return nullptr;
+        }
+        constexpr int BITS = KEY_BITS - 8 * SKIP;
+        return OPS::template find_node<BITS>(ptr, ik << (8 * SKIP));
+    }
+
+    // --- Root find_next_leaf: find leaf that may contain next key > ik ---
+    template<int SKIP>
+    static const uint64_t* root_find_next_impl(uint64_t ptr, uint64_t prefix,
+                                                uint64_t ik) noexcept {
+        constexpr int BITS = KEY_BITS - 8 * SKIP;
+        if constexpr (SKIP > 0) {
+            constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
+            uint64_t diff = (ik ^ prefix) & MASK;
+            if (diff) [[unlikely]] {
+                int shift = std::countl_zero(diff) & ~7;
+                uint8_t kb = static_cast<uint8_t>(ik >> (56 - shift));
+                uint8_t pb = static_cast<uint8_t>(prefix >> (56 - shift));
+                if (kb < pb)
+                    return OPS::template descend_min_leaf<BITS>(ptr);
+                return nullptr;
+            }
+        }
+        return OPS::template find_leaf_next<BITS>(ptr, ik << (8 * SKIP));
+    }
+
+    // --- Root find_prev_leaf: find leaf that may contain prev key < ik ---
+    template<int SKIP>
+    static const uint64_t* root_find_prev_impl(uint64_t ptr, uint64_t prefix,
+                                                uint64_t ik) noexcept {
+        constexpr int BITS = KEY_BITS - 8 * SKIP;
+        if constexpr (SKIP > 0) {
+            constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
+            uint64_t diff = (ik ^ prefix) & MASK;
+            if (diff) [[unlikely]] {
+                int shift = std::countl_zero(diff) & ~7;
+                uint8_t kb = static_cast<uint8_t>(ik >> (56 - shift));
+                uint8_t pb = static_cast<uint8_t>(prefix >> (56 - shift));
+                if (kb > pb)
+                    return OPS::template descend_max_leaf<BITS>(ptr);
+                return nullptr;
+            }
+        }
+        return OPS::template find_leaf_prev<BITS>(ptr, ik << (8 * SKIP));
+    }
+
+    // --- Build ROOT_FNS array ---
+    template<size_t... Is>
+    static constexpr auto make_root_fns(std::index_sequence<Is...>) {
+        return std::array<root_fn_t, sizeof...(Is)>{
+            root_fn_t{
+                static_cast<uint8_t>(Is),
+                &root_find_impl<static_cast<int>(Is)>,
+                &root_find_next_impl<static_cast<int>(Is)>,
+                &root_find_prev_impl<static_cast<int>(Is)>,
+            }...
+        };
+    }
+
+    static constexpr auto ROOT_FNS = make_root_fns(
+        std::make_index_sequence<MAX_ROOT_SKIP + 1>{});
+
+    // ==================================================================
+    // skip_switch — still needed for write path (insert/erase)
+    // ==================================================================
 
     template<typename F>
-    static decltype(auto) skip_switch(uint8_t skip, F&& fn_) {
+    decltype(auto) skip_switch(F&& fn_) const {
         if constexpr (MAX_ROOT_SKIP <= 0) {
-            return fn_.template operator()<KEY_BITS - 8>();
+            return fn_.template operator()<KEY_BITS>();
         } else if constexpr (MAX_ROOT_SKIP <= 2) {
-            switch (skip) {
-            case 0: return fn_.template operator()<KEY_BITS - 8>();
-            case 1: return fn_.template operator()<KEY_BITS - 16>();
-            case 2: return fn_.template operator()<KEY_BITS - 24>();
+            switch (root_fn_v->skip) {
+            case 0: return fn_.template operator()<KEY_BITS>();
+            case 1: return fn_.template operator()<KEY_BITS - 8>();
+            case 2: return fn_.template operator()<KEY_BITS - 16>();
             default: __builtin_unreachable();
             }
         } else {
-            switch (skip) {
-            case 0: return fn_.template operator()<KEY_BITS - 8>();
-            case 1: return fn_.template operator()<KEY_BITS - 16>();
-            case 2: return fn_.template operator()<KEY_BITS - 24>();
-            case 3: return fn_.template operator()<KEY_BITS - 32>();
-            case 4: return fn_.template operator()<KEY_BITS - 40>();
-            case 5: return fn_.template operator()<KEY_BITS - 48>();
-            case 6: return fn_.template operator()<KEY_BITS - 56>();
+            switch (root_fn_v->skip) {
+            case 0: return fn_.template operator()<KEY_BITS>();
+            case 1: return fn_.template operator()<KEY_BITS - 8>();
+            case 2: return fn_.template operator()<KEY_BITS - 16>();
+            case 3: return fn_.template operator()<KEY_BITS - 24>();
+            case 4: return fn_.template operator()<KEY_BITS - 32>();
+            case 5: return fn_.template operator()<KEY_BITS - 40>();
+            case 6: return fn_.template operator()<KEY_BITS - 48>();
             default: __builtin_unreachable();
             }
         }
     }
 
-    // ======================================================================
-    // nk_byte: extract byte i (0-based from MSB) from NK0
-    // ======================================================================
-
-    static uint8_t nk_byte(NK0 nk, uint8_t i) noexcept {
-        return static_cast<uint8_t>(nk >> (NK0_BITS - 8 * (i + 1)));
-    }
-
-    // Left-align NK0 into uint64_t (byte 0 at bits 63..56)
-    static uint64_t nk_to_u64(NK0 nk) noexcept {
-        return static_cast<uint64_t>(nk) << (64 - NK0_BITS);
-    }
-
-    // Extract byte i from packed prefix (byte 0 in MSB)
-    static uint8_t prefix_byte(uint64_t pfx, uint8_t i) noexcept {
-        return static_cast<uint8_t>(pfx >> (56 - 8 * i));
-    }
-
-    // Build IK prefix from root_prefix_v bytes [0..skip-1] + top byte
-    IK make_prefix(uint8_t top) const noexcept {
-        IK prefix = IK(0);
-        for (uint8_t j = 0; j < root_skip_v; ++j)
-            prefix |= IK(prefix_byte(root_prefix_v, j)) << (IK_BITS - 8 * (j + 1));
-        prefix |= IK(top) << (IK_BITS - 8 * (root_skip_v + 1));
-        return prefix;
-    }
-
-    int prefix_bits() const noexcept {
-        return 8 * (root_skip_v + 1);
-    }
-
     // --- Data members ---
-    uint64_t  root_v[256];
-    uint8_t   root_skip_v;
-    uint64_t  root_prefix_v;   // packed big-endian: byte 0 in bits 63..56
+    const root_fn_t* root_fn_v;
+    uint64_t  root_ptr_v;       // tagged child (SENTINEL, leaf, or bitmask)
+    uint64_t  root_prefix_v;    // shared prefix bytes, left-aligned
     size_t    size_v;
     BLD       bld_v;
+
+    void set_root_skip(uint8_t skip) noexcept {
+        root_fn_v = &ROOT_FNS[skip];
+    }
 
 public:
     // ==================================================================
     // Constructor / Destructor
     // ==================================================================
 
-    kntrie_impl() : root_skip_v(0), root_prefix_v(0), size_v(0), bld_v() {
-        std::fill(std::begin(root_v), std::end(root_v), SENTINEL_TAGGED);
-    }
+    kntrie_impl()
+        : root_fn_v(&SENTINEL_ROOT_FN),
+          root_ptr_v(BO::SENTINEL_TAGGED),
+          root_prefix_v(0),
+          size_v(0),
+          bld_v() {}
 
     ~kntrie_impl() { remove_all(); bld_v.drain(); }
 
@@ -169,11 +200,13 @@ public:
     kntrie_impl& operator=(const kntrie_impl&) = delete;
 
     kntrie_impl(kntrie_impl&& o) noexcept
-        : root_skip_v(o.root_skip_v), root_prefix_v(o.root_prefix_v),
-          size_v(o.size_v), bld_v(std::move(o.bld_v)) {
-        std::memcpy(root_v, o.root_v, sizeof(root_v));
-        std::fill(std::begin(o.root_v), std::end(o.root_v), SENTINEL_TAGGED);
-        o.root_skip_v = 0;
+        : root_fn_v(o.root_fn_v),
+          root_ptr_v(o.root_ptr_v),
+          root_prefix_v(o.root_prefix_v),
+          size_v(o.size_v),
+          bld_v(std::move(o.bld_v)) {
+        o.root_fn_v = &SENTINEL_ROOT_FN;
+        o.root_ptr_v = BO::SENTINEL_TAGGED;
         o.root_prefix_v = 0;
         o.size_v = 0;
     }
@@ -182,13 +215,13 @@ public:
         if (this != &o) {
             remove_all();
             bld_v.drain();
-            std::memcpy(root_v, o.root_v, sizeof(root_v));
+            root_fn_v = o.root_fn_v;
+            root_ptr_v = o.root_ptr_v;
             root_prefix_v = o.root_prefix_v;
-            root_skip_v = o.root_skip_v;
-            size_v      = o.size_v;
-            bld_v       = std::move(o.bld_v);
-            std::fill(std::begin(o.root_v), std::end(o.root_v), SENTINEL_TAGGED);
-            o.root_skip_v = 0;
+            size_v = o.size_v;
+            bld_v = std::move(o.bld_v);
+            o.root_fn_v = &SENTINEL_ROOT_FN;
+            o.root_ptr_v = BO::SENTINEL_TAGGED;
             o.root_prefix_v = 0;
             o.size_v = 0;
         }
@@ -196,11 +229,8 @@ public:
     }
 
     void swap(kntrie_impl& o) noexcept {
-        uint64_t tmp[256];
-        std::memcpy(tmp, root_v, sizeof(root_v));
-        std::memcpy(root_v, o.root_v, sizeof(root_v));
-        std::memcpy(o.root_v, tmp, sizeof(root_v));
-        std::swap(root_skip_v, o.root_skip_v);
+        std::swap(root_fn_v, o.root_fn_v);
+        std::swap(root_ptr_v, o.root_ptr_v);
         std::swap(root_prefix_v, o.root_prefix_v);
         std::swap(size_v, o.size_v);
         bld_v.swap(o.bld_v);
@@ -217,89 +247,12 @@ public:
     }
 
     // ==================================================================
-    // root_skip_ops — combined functor table for root skip dispatch.
-    // One entry per skip value with find/next/prev/min/max.
+    // Find — no sentinel checks, sentinel fn returns nullptr
     // ==================================================================
 
-    struct root_skip_ops_t {
-        using find_fn_t   = const VALUE* (*)(const uint64_t*, uint64_t, NK0) noexcept;
-        using minmax_fn_t = iter_ops_result_t<IK, VST> (*)(uint64_t, IK) noexcept;
-        using iter_fn_t   = iter_ops_result_t<IK, VST> (*)(uint64_t, NK0, IK) noexcept;
-
-        find_fn_t   find;
-        iter_fn_t   next;
-        iter_fn_t   prev;
-        minmax_fn_t min;
-        minmax_fn_t max;
-    };
-
-    template<int SKIP>
-    static const VALUE* root_find_at(const uint64_t* root, uint64_t prefix,
-                                      NK0 nk) noexcept {
-        if constexpr (SKIP > 0) {
-            constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
-            if ((nk_to_u64(nk) ^ prefix) & MASK) [[unlikely]] return nullptr;
-        }
-        uint8_t top = nk_byte(nk, SKIP);
-        uint64_t child = root[top];
-        if (child == SENTINEL_TAGGED) [[unlikely]] return nullptr;
-        constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
-        using D = root_dispatch<BITS>;
-        return D::OPS_TYPE::template find_node<BITS>(child, D::narrow(nk));
-    }
-
-    template<int SKIP>
-    static iter_ops_result_t<IK, VST> root_min_at(uint64_t child,
-                                                     IK prefix) noexcept {
-        constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
-        using D = root_dispatch<BITS>;
-        return D::ITER_TYPE::template descend_min<BITS>(child, prefix);
-    }
-
-    template<int SKIP>
-    static iter_ops_result_t<IK, VST> root_max_at(uint64_t child,
-                                                     IK prefix) noexcept {
-        constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
-        using D = root_dispatch<BITS>;
-        return D::ITER_TYPE::template descend_max<BITS>(child, prefix);
-    }
-
-    template<int SKIP>
-    static iter_ops_result_t<IK, VST> root_next_at(uint64_t child,
-                                                      NK0 nk, IK full_ik) noexcept {
-        constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
-        using D = root_dispatch<BITS>;
-        return D::ITER_TYPE::template iter_next_node<BITS>(child, D::narrow(nk), full_ik);
-    }
-
-    template<int SKIP>
-    static iter_ops_result_t<IK, VST> root_prev_at(uint64_t child,
-                                                      NK0 nk, IK full_ik) noexcept {
-        constexpr int BITS = KEY_BITS - 8 * (SKIP + 1);
-        using D = root_dispatch<BITS>;
-        return D::ITER_TYPE::template iter_prev_node<BITS>(child, D::narrow(nk), full_ik);
-    }
-
-    template<size_t... Is>
-    static constexpr auto make_root_table(std::index_sequence<Is...>) {
-        return std::array<root_skip_ops_t, sizeof...(Is)>{
-            root_skip_ops_t{
-                &root_find_at<static_cast<int>(Is)>,
-                &root_next_at<static_cast<int>(Is)>,
-                &root_prev_at<static_cast<int>(Is)>,
-                &root_min_at<static_cast<int>(Is)>,
-                &root_max_at<static_cast<int>(Is)>
-            }...
-        };
-    }
-
-    static constexpr auto ROOT_OPS = make_root_table(
-        std::make_index_sequence<MAX_ROOT_SKIP + 1>{});
-
     const VALUE* find_value(const KEY& key) const noexcept {
-        IK ik = KO::to_internal(key);
-        NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        return ROOT_OPS[root_skip_v].find(root_v, root_prefix_v, nk);
+        uint64_t ik = key_to_u64(key);
+        return root_fn_v->find(root_ptr_v, root_prefix_v, ik);
     }
 
     bool contains(const KEY& key) const noexcept {
@@ -324,32 +277,39 @@ public:
     }
 
     // ==================================================================
-    // Erase — sentinel check (write path)
+    // Erase
     // ==================================================================
 
     bool erase(const KEY& key) {
-        IK ik = KO::to_internal(key);
-        NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
+        uint64_t ik = key_to_u64(key);
 
         // Check prefix
-        if (root_skip_v > 0) {
-            uint64_t mask = ~uint64_t(0) << (64 - 8 * root_skip_v);
-            if ((nk_to_u64(nk) ^ root_prefix_v) & mask) return false;
+        uint8_t skip = root_fn_v->skip;
+        if (skip > 0) {
+            uint64_t mask = ~uint64_t(0) << (64 - 8 * skip);
+            if ((ik ^ root_prefix_v) & mask) return false;
         }
 
-        uint8_t top = nk_byte(nk, root_skip_v);
-        uint64_t child = root_v[top];
-        if (child == SENTINEL_TAGGED) return false;
-
-        bool erased = skip_switch(root_skip_v, [&]<int BITS>() -> bool {
-            using D = root_dispatch<BITS>;
-            auto r = D::OPS_TYPE::template erase_node<BITS>(child, D::narrow(nk), bld_v);
+        bool erased = skip_switch([&]<int BITS>() -> bool {
+            uint64_t shifted = ik << (8 * (KEY_BITS / 8 - BITS / 8 - 1));
+            // BITS = KEY_BITS - 8*(skip+1) from skip_switch, but we need
+            // shifted = ik << (8 * skip) ... skip = KEY_BITS/8 - 1 - BITS/8
+            // Actually: skip = root_fn_v->skip, shifted = ik << (8 * skip)
+            uint64_t sik = ik << (8 * root_fn_v->skip);
+            auto r = OPS::template erase_node<BITS>(root_ptr_v, sik, bld_v);
             if (!r.erased) return false;
-            root_v[top] = r.tagged_ptr ? r.tagged_ptr : SENTINEL_TAGGED;
+            root_ptr_v = r.tagged_ptr ? r.tagged_ptr : BO::SENTINEL_TAGGED;
             return true;
         });
 
-        if (erased) --size_v;
+        if (erased) {
+            --size_v;
+            if (size_v == 0) {
+                root_fn_v = &SENTINEL_ROOT_FN;
+                root_ptr_v = BO::SENTINEL_TAGGED;
+                root_prefix_v = 0;
+            }
+        }
         return erased;
     }
 
@@ -368,10 +328,19 @@ public:
 
     debug_stats_t debug_stats() const noexcept {
         debug_stats_t s{};
-        s.total_bytes = sizeof(root_v);
-        for (int i = 0; i < 256; ++i) {
-            if (root_v[i] != SENTINEL_TAGGED)
-                collect_stats_one(root_v[i], s);
+        s.total_bytes = sizeof(*this);
+        if (root_ptr_v != BO::SENTINEL_TAGGED) {
+            skip_switch([&]<int BITS>() -> int {
+                typename ITER_OPS::stats_t os{};
+                ITER_OPS::template collect_stats<BITS>(root_ptr_v, os);
+                s.total_bytes    += os.total_bytes;
+                s.total_entries  += os.total_entries;
+                s.bitmap_leaves  += os.bitmap_leaves;
+                s.compact_leaves += os.compact_leaves;
+                s.bitmask_nodes  += os.bitmask_nodes;
+                s.bm_children    += os.bm_children;
+                return 0;
+            });
         }
         return s;
     }
@@ -384,142 +353,137 @@ public:
     };
 
     root_info_t debug_root_info() const {
-        uint16_t count = 0;
-        for (int i = 0; i < 256; ++i)
-            if (root_v[i] != SENTINEL_TAGGED) ++count;
-        return {count, root_skip_v, false};
+        bool is_leaf = (root_ptr_v & LEAF_BIT) != 0;
+        uint16_t entries = 0;
+        if (root_ptr_v != BO::SENTINEL_TAGGED) {
+            if (is_leaf)
+                entries = get_header(untag_leaf(root_ptr_v))->entries();
+            else
+                entries = get_header(bm_to_node_const(root_ptr_v))->entries();
+        }
+        return {entries, root_fn_v->skip, is_leaf};
     }
 
-    const uint64_t* debug_root() const noexcept { return root_v; }
+    const uint64_t* debug_root() const noexcept {
+        if (root_ptr_v == BO::SENTINEL_TAGGED) return nullptr;
+        if (root_ptr_v & LEAF_BIT) return untag_leaf(root_ptr_v);
+        return bm_to_node_const(root_ptr_v);
+    }
 
     // ==================================================================
-    // Iterator support — no sentinel checks, sentinel returns found=false
+    // Iterator support
     // ==================================================================
 
     struct iter_result_t { KEY key; VALUE value; bool found; };
 
+    iter_result_t to_iter_result(const typename BO::leaf_result_t& r) const noexcept {
+        IK internal = static_cast<IK>(r.key >> (64 - IK_BITS));
+        return {KO::to_key(internal), *VT::as_ptr(*r.value), true};
+    }
+
     iter_result_t iter_first() const noexcept {
-        auto& ops = ROOT_OPS[root_skip_v];
-        for (int i = 0; i < 256; ++i) {
-            if (root_v[i] == SENTINEL_TAGGED) continue;
-            IK pfx = make_prefix(static_cast<uint8_t>(i));
-            auto r = ops.min(root_v[i], pfx);
-            return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-        }
-        return {KEY{}, VALUE{}, false};
+        if (root_ptr_v == BO::SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
+        const uint64_t* leaf = skip_switch([&]<int BITS>() -> const uint64_t* {
+            return OPS::template descend_min_leaf<BITS>(root_ptr_v);
+        });
+        if (!leaf) return {KEY{}, VALUE{}, false};
+        auto r = BO::leaf_fn(leaf)->first(leaf);
+        if (!r.found) return {KEY{}, VALUE{}, false};
+        return to_iter_result(r);
     }
 
     iter_result_t iter_last() const noexcept {
-        auto& ops = ROOT_OPS[root_skip_v];
-        for (int i = 255; i >= 0; --i) {
-            if (root_v[i] == SENTINEL_TAGGED) continue;
-            IK pfx = make_prefix(static_cast<uint8_t>(i));
-            auto r = ops.max(root_v[i], pfx);
-            return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-        }
-        return {KEY{}, VALUE{}, false};
+        if (root_ptr_v == BO::SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
+        const uint64_t* leaf = skip_switch([&]<int BITS>() -> const uint64_t* {
+            return OPS::template descend_max_leaf<BITS>(root_ptr_v);
+        });
+        if (!leaf) return {KEY{}, VALUE{}, false};
+        auto r = BO::leaf_fn(leaf)->last(leaf);
+        if (!r.found) return {KEY{}, VALUE{}, false};
+        return to_iter_result(r);
     }
 
     iter_result_t iter_next(KEY key) const noexcept {
-        IK ik = KO::to_internal(key);
-        NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        uint8_t top = nk_byte(nk, root_skip_v);
-        auto& ops = ROOT_OPS[root_skip_v];
+        uint64_t ik = key_to_u64(key);
+        const uint64_t* leaf = root_fn_v->find_next(root_ptr_v, root_prefix_v, ik);
+        if (!leaf) return {KEY{}, VALUE{}, false};
 
-        // Try next within same slot
-        if (root_v[top] != SENTINEL_TAGGED) {
-            auto r = ops.next(root_v[top], nk, ik);
-            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-        }
+        auto r = BO::leaf_fn(leaf)->next(leaf, ik);
+        if (r.found) return to_iter_result(r);
 
-        // Scan forward — non-sentinel root always has entries
-        for (int i = top + 1; i < 256; ++i) {
-            if (root_v[i] == SENTINEL_TAGGED) continue;
-            IK pfx = make_prefix(static_cast<uint8_t>(i));
-            auto r = ops.min(root_v[i], pfx);
-            return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-        }
-        return {KEY{}, VALUE{}, false};
+        // Leaf exhausted — step to next leaf
+        auto last = BO::leaf_fn(leaf)->last(leaf);
+        if (!last.found) return {KEY{}, VALUE{}, false};
+        uint64_t next_ik = last.key + (uint64_t(1) << (64 - KEY_BITS));
+        if (next_ik == 0) return {KEY{}, VALUE{}, false};  // wrapped
+        const uint64_t* next_leaf = root_fn_v->find_next(root_ptr_v, root_prefix_v, next_ik);
+        if (!next_leaf) return {KEY{}, VALUE{}, false};
+        auto r2 = BO::leaf_fn(next_leaf)->first(next_leaf);
+        if (!r2.found) return {KEY{}, VALUE{}, false};
+        return to_iter_result(r2);
     }
 
     iter_result_t iter_prev(KEY key) const noexcept {
-        IK ik = KO::to_internal(key);
-        NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
-        uint8_t top = nk_byte(nk, root_skip_v);
-        auto& ops = ROOT_OPS[root_skip_v];
+        uint64_t ik = key_to_u64(key);
+        const uint64_t* leaf = root_fn_v->find_prev(root_ptr_v, root_prefix_v, ik);
+        if (!leaf) return {KEY{}, VALUE{}, false};
 
-        // Try prev within same slot
-        if (root_v[top] != SENTINEL_TAGGED) {
-            auto r = ops.prev(root_v[top], nk, ik);
-            if (r.found) return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-        }
+        auto r = BO::leaf_fn(leaf)->prev(leaf, ik);
+        if (r.found) return to_iter_result(r);
 
-        // Scan backward — non-sentinel root always has entries
-        for (int i = top - 1; i >= 0; --i) {
-            if (root_v[i] == SENTINEL_TAGGED) continue;
-            IK pfx = make_prefix(static_cast<uint8_t>(i));
-            auto r = ops.max(root_v[i], pfx);
-            return {KO::to_key(r.key), *VT::as_ptr(*r.value), true};
-        }
-        return {KEY{}, VALUE{}, false};
+        // Leaf exhausted — step to prev leaf
+        auto first = BO::leaf_fn(leaf)->first(leaf);
+        if (!first.found) return {KEY{}, VALUE{}, false};
+        uint64_t prev_ik = first.key - (uint64_t(1) << (64 - KEY_BITS));
+        if (prev_ik > first.key) return {KEY{}, VALUE{}, false};  // underflow
+        const uint64_t* prev_leaf = root_fn_v->find_prev(root_ptr_v, root_prefix_v, prev_ik);
+        if (!prev_leaf) return {KEY{}, VALUE{}, false};
+        auto r2 = BO::leaf_fn(prev_leaf)->last(prev_leaf);
+        if (!r2.found) return {KEY{}, VALUE{}, false};
+        return to_iter_result(r2);
     }
 
 private:
     // ==================================================================
-    // Insert dispatch — prefix check + initial skip + reduce + switch
+    // Insert dispatch
     // ==================================================================
 
     template<bool INSERT, bool ASSIGN>
     std::pair<bool, bool> insert_dispatch(const KEY& key, const VALUE& value) {
-        IK ik = KO::to_internal(key);
+        uint64_t ik = key_to_u64(key);
         VST sv = bld_v.store_value(value);
-        NK0 nk = static_cast<NK0>(ik >> (IK_BITS - KEY_BITS));
 
         // First insert: establish max skip prefix
         if constexpr (MAX_ROOT_SKIP > 0) {
             if (size_v == 0) [[unlikely]] {
                 if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
-                root_skip_v = static_cast<uint8_t>(MAX_ROOT_SKIP);
-                root_prefix_v = nk_to_u64(nk);
-                // Fall through to normal insert (root_v[top] is SENTINEL_TAGGED)
+                set_root_skip(MAX_ROOT_SKIP);
+                root_prefix_v = ik;
+                // Fall through to normal insert
             }
         }
 
+        uint8_t skip = root_fn_v->skip;
+
         // Check prefix — find first divergence
-        if (root_skip_v > 0) {
-            uint64_t nk64 = nk_to_u64(nk);
-            uint64_t diff = nk64 ^ root_prefix_v;
-            uint64_t mask = ~uint64_t(0) << (64 - 8 * root_skip_v);
+        if (skip > 0) {
+            uint64_t diff = ik ^ root_prefix_v;
+            uint64_t mask = ~uint64_t(0) << (64 - 8 * skip);
             if (diff & mask) [[unlikely]] {
                 if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
-                // Find first differing byte position
                 int clz = std::countl_zero(diff & mask);
                 uint8_t div_pos = static_cast<uint8_t>(clz / 8);
                 reduce_root_skip(div_pos);
+                skip = root_fn_v->skip;
             }
         }
 
-        uint8_t top = nk_byte(nk, root_skip_v);
-        uint64_t child = root_v[top];
-
-        // Empty slot: create leaf
-        if (child == SENTINEL_TAGGED) {
-            if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
-            uint64_t* leaf = skip_switch(root_skip_v, [&]<int BITS>() -> uint64_t* {
-                using D = root_dispatch<BITS>;
-                return D::OPS_TYPE::make_single_leaf(D::narrow(nk), sv, bld_v);
-            });
-            root_v[top] = tag_leaf(leaf);
-            ++size_v;
-            return {true, true};
-        }
-
-        // Non-empty slot: recurse
-        bool did_insert = skip_switch(root_skip_v, [&]<int BITS>() -> bool {
-            using D = root_dispatch<BITS>;
-            auto r = D::OPS_TYPE::template insert_node<BITS, INSERT, ASSIGN>(
-                child, D::narrow(nk), sv, bld_v);
-            if (r.tagged_ptr != child) root_v[top] = r.tagged_ptr;
+        // Insert into subtree
+        bool did_insert = skip_switch([&]<int BITS>() -> bool {
+            uint64_t sik = ik << (8 * root_fn_v->skip);
+            auto r = OPS::template insert_node<BITS, INSERT, ASSIGN>(
+                root_ptr_v, sik, sv, bld_v);
+            if (r.tagged_ptr != root_ptr_v) root_ptr_v = r.tagged_ptr;
             return r.inserted;
         });
 
@@ -533,83 +497,56 @@ private:
     // ==================================================================
 
     void reduce_root_skip(uint8_t div_pos) {
-        uint8_t old_skip = root_skip_v;
+        uint8_t old_skip = root_fn_v->skip;
+        uint8_t remaining_skip = old_skip - div_pos - 1;
 
-        // Collect non-sentinel entries from old root_v
-        uint8_t indices[256];
-        uint64_t tagged_ptrs[256];
-        unsigned count = 0;
-        for (int i = 0; i < 256; ++i) {
-            if (root_v[i] != SENTINEL_TAGGED) {
-                indices[count] = static_cast<uint8_t>(i);
-                tagged_ptrs[count] = root_v[i];
-                ++count;
-            }
-        }
-
-        // Create bitmask node (or skip chain) for old subtree
+        // Build prefix bytes for intermediate skip chain
         uint64_t old_subtree;
-        uint8_t chain_len = old_skip - div_pos - 1;  // intermediate skip bytes
-        if (chain_len > 0) {
+        if (remaining_skip > 0) {
             uint8_t chain_bytes[6];
-            for (uint8_t i = 0; i < chain_len; ++i)
-                chain_bytes[i] = prefix_byte(root_prefix_v, div_pos + 1 + i);
-            auto* node = BO::make_skip_chain(chain_bytes, chain_len,
-                                              indices, tagged_ptrs, count, bld_v,
-                                              size_v);
-            old_subtree = tag_bitmask(node);
+            for (uint8_t i = 0; i < remaining_skip; ++i)
+                chain_bytes[i] = pfx_byte(root_prefix_v, div_pos + 1 + i);
+
+            if (root_ptr_v & LEAF_BIT) {
+                // Leaf: prepend skip to leaf
+                uint64_t* leaf = untag_leaf_mut(root_ptr_v);
+                leaf = OPS::prepend_skip(leaf, remaining_skip,
+                                          pack_prefix(chain_bytes, remaining_skip), bld_v);
+                old_subtree = tag_leaf(leaf);
+            } else {
+                // Bitmask: wrap in chain
+                uint64_t* bm_node = bm_to_node(root_ptr_v);
+                old_subtree = BO::wrap_in_chain(bm_node, chain_bytes, remaining_skip, bld_v);
+            }
         } else {
-            auto* node = BO::make_bitmask(indices, tagged_ptrs, count, bld_v,
-                                           size_v);
-            old_subtree = tag_bitmask(node);
+            old_subtree = root_ptr_v;
         }
 
-        // Clear root_v, set new skip
-        std::fill(std::begin(root_v), std::end(root_v), SENTINEL_TAGGED);
-        uint8_t old_byte = prefix_byte(root_prefix_v, div_pos);
-        root_skip_v = div_pos;
-        // root_prefix_v bits [0..div_pos-1] unchanged, rest don't matter
+        // Create a new bitmask with single child at the divergence byte
+        uint8_t old_byte = pfx_byte(root_prefix_v, div_pos);
+        uint8_t indices[1] = {old_byte};
+        uint64_t children[1] = {old_subtree};
+        auto* bm_node = BO::make_bitmask(indices, children, 1, bld_v, size_v);
+        root_ptr_v = tag_bitmask(bm_node);
 
-        // Place old subtree under old prefix byte at div_pos
-        root_v[old_byte] = old_subtree;
+        // Update skip
+        set_root_skip(div_pos);
+        // root_prefix_v bits [0..div_pos-1] unchanged, rest don't matter
     }
 
     // ==================================================================
-    // Remove all — write path, switch outside loop
+    // Remove all
     // ==================================================================
 
     void remove_all() noexcept {
-        skip_switch(root_skip_v, [&]<int BITS>() -> int {
-            using D = root_dispatch<BITS>;
-            for (int i = 0; i < 256; ++i) {
-                if (root_v[i] != SENTINEL_TAGGED) {
-                    D::ITER_TYPE::template remove_subtree<BITS>(root_v[i], bld_v);
-                    root_v[i] = SENTINEL_TAGGED;
-                }
-            }
+        if (root_ptr_v == BO::SENTINEL_TAGGED) return;
+        skip_switch([&]<int BITS>() -> int {
+            ITER_OPS::template remove_subtree<BITS>(root_ptr_v, bld_v);
             return 0;
         });
-        root_skip_v = 0;
-        size_v = 0;
-    }
-
-    // ==================================================================
-    // Stats collection — diagnostic path
-    // ==================================================================
-
-    void collect_stats_one(uint64_t tagged, debug_stats_t& s) const noexcept {
-        skip_switch(root_skip_v, [&]<int BITS>() -> int {
-            using D = root_dispatch<BITS>;
-            typename D::ITER_TYPE::stats_t os{};
-            D::ITER_TYPE::template collect_stats<BITS>(tagged, os);
-            s.total_bytes    += os.total_bytes;
-            s.total_entries  += os.total_entries;
-            s.bitmap_leaves  += os.bitmap_leaves;
-            s.compact_leaves += os.compact_leaves;
-            s.bitmask_nodes  += os.bitmask_nodes;
-            s.bm_children    += os.bm_children;
-            return 0;
-        });
+        root_fn_v = &SENTINEL_ROOT_FN;
+        root_ptr_v = BO::SENTINEL_TAGGED;
+        root_prefix_v = 0;
     }
 };
 

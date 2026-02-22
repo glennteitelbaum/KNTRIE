@@ -217,6 +217,71 @@ struct bitmask_ops {
     using BLD  = builder<VALUE, VT::IS_TRIVIAL, ALLOC>;
 
     // ==================================================================
+    // leaf_fn_t — function pointer table stored in leaf node[1].
+    // One static instance per (BITS, SKIP). Indexes: LEAF_FNS<BITS>[skip].
+    // ==================================================================
+
+    struct leaf_result_t {
+        uint64_t     key;     // full IK, left-aligned in u64
+        const VST*   value;
+        bool         found;
+    };
+
+    struct leaf_fn_t {
+        uint8_t skip;
+        const VALUE* (*find)(const uint64_t*, uint64_t) noexcept;
+        leaf_result_t (*next)(const uint64_t*, uint64_t) noexcept;
+        leaf_result_t (*prev)(const uint64_t*, uint64_t) noexcept;
+        leaf_result_t (*first)(const uint64_t*) noexcept;
+        leaf_result_t (*last)(const uint64_t*) noexcept;
+    };
+
+    // --- Typed leaf accessors ---
+    static const leaf_fn_t* leaf_fn(const uint64_t* node) noexcept {
+        return reinterpret_cast<const leaf_fn_t*>(node[1]);
+    }
+    static void set_leaf_fn(uint64_t* node, const leaf_fn_t* fn) noexcept {
+        node[1] = reinterpret_cast<uint64_t>(fn);
+    }
+
+    // ==================================================================
+    // Sentinel — branchless miss target for bitmask children[0] and
+    // empty trie paths. All fn pointers return nullptr / not_found.
+    // ==================================================================
+
+    static const VALUE* sentinel_find(const uint64_t*, uint64_t) noexcept {
+        return nullptr;
+    }
+    static leaf_result_t sentinel_iter(const uint64_t*, uint64_t) noexcept {
+        return {0, nullptr, false};
+    }
+    static leaf_result_t sentinel_bound(const uint64_t*) noexcept {
+        return {0, nullptr, false};
+    }
+
+    static inline const leaf_fn_t SENTINEL_FN = {
+        0, &sentinel_find, &sentinel_iter, &sentinel_iter,
+        &sentinel_bound, &sentinel_bound,
+    };
+
+    // 3 u64s: header(entries=0), fn_ptr, prefix(0)
+    static const uint64_t* sentinel_node_ptr() noexcept {
+        alignas(8) static const uint64_t SENTINEL_NODE[3] = {
+            0,
+            reinterpret_cast<uint64_t>(&SENTINEL_FN),
+            0,
+        };
+        return SENTINEL_NODE;
+    }
+
+    static uint64_t sentinel_tagged() noexcept {
+        return tag_leaf(sentinel_node_ptr());
+    }
+
+    // Cache it — one call per instantiation
+    static inline const uint64_t SENTINEL_TAGGED = sentinel_tagged();
+
+    // ==================================================================
     // Size calculations
     // ==================================================================
 
@@ -224,7 +289,7 @@ struct bitmask_ops {
         return hu + BITMAP_256_U64 + 1 + n_children + desc_u64(n_children);
     }
 
-    static constexpr size_t bitmap_leaf_size_u64(size_t count, size_t hu = HEADER_U64) noexcept {
+    static constexpr size_t bitmap_leaf_size_u64(size_t count, size_t hu = LEAF_HEADER_U64) noexcept {
         if constexpr (VT::IS_BOOL) {
             return hu + BITMAP_256_U64 + BITMAP_256_U64;  // presence + value bitmap
         } else {
@@ -749,7 +814,7 @@ struct bitmask_ops {
     static insert_result_t bitmap_insert(uint64_t* node, uint8_t suffix,
                                           VST value, BLD& bld) {
         auto* h = get_header(node);
-        size_t hs = hdr_u64(node);
+        size_t hs = LEAF_HEADER_U64;
         bitmap_256_t& bm = bm_mut(node, hs);
         unsigned count = h->entries();
 
@@ -776,8 +841,7 @@ struct bitmask_ops {
             size_t au64 = round_up_u64(new_sz);
             uint64_t* nn = bld.alloc_node(au64);
             auto* nh = get_header(nn);
-            *nh = *h;
-            if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
+            copy_leaf_header(node, nn);
             nh->set_entries(nc);
             nh->set_alloc_u64(au64);
             bm_mut(nn, hs) = bm;
@@ -815,8 +879,7 @@ struct bitmask_ops {
             size_t au64 = round_up_u64(new_sz);
             uint64_t* nn = bld.alloc_node(au64);
             auto* nh = get_header(nn);
-            *nh = *h;
-            if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
+            copy_leaf_header(node, nn);
             nh->set_entries(nc);
             nh->set_alloc_u64(au64);
             bitmap_256_t& nbm = bm_mut(nn, hs);
@@ -840,7 +903,7 @@ struct bitmask_ops {
     static erase_result_t bitmap_erase(uint64_t* node, uint8_t suffix,
                                         BLD& bld) {
         auto* h = get_header(node);
-        size_t hs = hdr_u64(node);
+        size_t hs = LEAF_HEADER_U64;
         bitmap_256_t& bm = bm_mut(node, hs);
         if (!bm.has_bit(suffix)) return {tag_leaf(node), false, 0};
 
@@ -861,8 +924,7 @@ struct bitmask_ops {
                 size_t au64 = round_up_u64(new_sz);
                 uint64_t* nn = bld.alloc_node(au64);
                 auto* nh = get_header(nn);
-                *nh = *h;
-                if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
+                copy_leaf_header(node, nn);
                 nh->set_alloc_u64(au64);
                 bm_mut(nn, hs) = bm;
                 val_bm_mut(nn, hs) = val_bm(node, hs);
@@ -893,8 +955,7 @@ struct bitmask_ops {
             size_t au64 = round_up_u64(new_sz);
             uint64_t* nn = bld.alloc_node(au64);
             auto* nh = get_header(nn);
-            *nh = *h;
-            if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
+            copy_leaf_header(node, nn);
             nh->set_entries(nc);
             nh->set_alloc_u64(au64);
             bm_mut(nn, hs) = bm;
@@ -916,7 +977,7 @@ struct bitmask_ops {
     static uint64_t* make_bitmap_leaf(const uint8_t* sorted_suffixes,
                                        const VST* values, unsigned count,
                                        BLD& bld) {
-        constexpr size_t hs = 1;
+        constexpr size_t hs = LEAF_HEADER_U64;
         size_t sz = round_up_u64(bitmap_leaf_size_u64(count));
         uint64_t* node = bld.alloc_node(sz);
         auto* h = get_header(node);
@@ -943,7 +1004,7 @@ struct bitmask_ops {
     // ==================================================================
 
     static uint64_t* make_single_bitmap(uint8_t suffix, VST value, BLD& bld) {
-        constexpr size_t hs = 1;
+        constexpr size_t hs = LEAF_HEADER_U64;
         size_t sz = round_up_u64(bitmap_leaf_size_u64(1));
         uint64_t* node = bld.alloc_node(sz);
         auto* h = get_header(node);
@@ -964,7 +1025,7 @@ struct bitmask_ops {
 
     template<typename Fn>
     static void for_each_bitmap(const uint64_t* node, Fn&& cb) {
-        size_t hs = hdr_u64(node);
+        size_t hs = LEAF_HEADER_U64;
         const bitmap_256_t& bmp = bm(node, hs);
         if constexpr (VT::IS_BOOL) {
             const bitmap_256_t& vbm = val_bm(node, hs);
@@ -995,7 +1056,7 @@ struct bitmask_ops {
         auto* h = get_header(node);
         if constexpr (VT::HAS_DESTRUCTOR) {
             uint16_t count = h->entries();
-            VST* vd = bl_vals_mut(node, hdr_u64(node));
+            VST* vd = bl_vals_mut(node, LEAF_HEADER_U64);
             for (uint16_t i = 0; i < count; ++i)
                 bld.destroy_value(vd[i]);
         }

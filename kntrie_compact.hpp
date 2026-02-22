@@ -62,7 +62,7 @@ struct compact_ops {
 
     // --- exact u64 size for a given slot count ---
 
-    static constexpr size_t size_u64(size_t slots, size_t hu = HEADER_U64) noexcept {
+    static constexpr size_t size_u64(size_t slots, size_t hu = LEAF_HEADER_U64) noexcept {
         size_t kb = slots * sizeof(K);
         kb = (kb + 7) & ~size_t{7};
         size_t vb;
@@ -98,7 +98,7 @@ struct compact_ops {
     static uint64_t* make_leaf(const K* sorted_keys, const VST* values,
                                unsigned count, BLD& bld) {
         uint16_t ts = slots_for(count);
-        constexpr size_t hu = 1;  // no skip prefix on fresh leaf
+        constexpr size_t hu = LEAF_HEADER_U64;
         size_t au64 = size_u64(ts, hu);
         uint64_t* node = bld.alloc_node(au64, false);
         auto* h = get_header(node);
@@ -127,7 +127,7 @@ struct compact_ops {
     template<typename Fn>
     static void for_each(const uint64_t* node, const node_header_t* h, Fn&& cb) {
         unsigned ts = h->total_slots();
-        size_t hs = hdr_u64(node);
+        size_t hs = LEAF_HEADER_U64;
         const K* kd = keys(node, hs);
         if constexpr (VT::IS_BOOL) {
             auto bv = bool_vals(node, ts, hs);
@@ -155,7 +155,7 @@ struct compact_ops {
     static iter_leaf_result iter_first(const uint64_t* node,
                                         const node_header_t* h) noexcept {
         unsigned ts = h->total_slots();
-        size_t hs = hdr_u64(node);
+        size_t hs = LEAF_HEADER_U64;
         const K* kd = keys(node, hs);
         if constexpr (VT::IS_BOOL)
             return {kd[0], bool_vals(node, ts, hs).ptr_at(0), true};
@@ -168,7 +168,7 @@ struct compact_ops {
     static iter_leaf_result iter_last(const uint64_t* node,
                                        const node_header_t* h) noexcept {
         unsigned ts = h->total_slots();
-        size_t hs = hdr_u64(node);
+        size_t hs = LEAF_HEADER_U64;
         const K* kd = keys(node, hs);
         if constexpr (VT::IS_BOOL)
             return {kd[ts - 1], bool_vals(node, ts, hs).ptr_at(ts - 1), true};
@@ -183,7 +183,7 @@ struct compact_ops {
                                        const node_header_t* h,
                                        K suffix) noexcept {
         unsigned ts = h->total_slots();
-        size_t hs = hdr_u64(node);
+        size_t hs = LEAF_HEADER_U64;
         const K* kd = keys(node, hs);
         const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
         unsigned pos = static_cast<unsigned>(base - kd) + (*base <= suffix);
@@ -201,7 +201,7 @@ struct compact_ops {
                                        const node_header_t* h,
                                        K suffix) noexcept {
         unsigned ts = h->total_slots();
-        size_t hs = hdr_u64(node);
+        size_t hs = LEAF_HEADER_U64;
         const K* kd = keys(node, hs);
         const K* base = adaptive_search<K>::find_base(kd, ts, suffix);
         unsigned pos = static_cast<unsigned>(base - kd);
@@ -225,7 +225,7 @@ struct compact_ops {
         if constexpr (VT::HAS_DESTRUCTOR) {
             // C-type (pointer): dups share pointers — destroy unique only
             unsigned ts = h->total_slots();
-            size_t hs = hdr_u64(node);
+            size_t hs = LEAF_HEADER_U64;
             const K* kd = keys(node, hs);
             VST* vd = vals_mut(node, ts, hs);
             bld.destroy_value(vd[0]);
@@ -250,7 +250,7 @@ struct compact_ops {
                                   K suffix, VST value, BLD& bld) {
         unsigned entries = h->entries();
         unsigned ts = h->total_slots();
-        size_t hs = hdr_u64(node);
+        size_t hs = LEAF_HEADER_U64;
         K*   kd = keys(node, hs);
 
         const K* base = adaptive_search<K>::find_base(
@@ -321,8 +321,7 @@ struct compact_ops {
         size_t au64 = size_u64(new_ts, hs);
         uint64_t* nn = bld.alloc_node(au64, false);
         auto* nh = get_header(nn);
-        *nh = *h;
-        if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
+        copy_leaf_header(node, nn);
         nh->set_entries(new_entries);
         nh->set_alloc_u64(au64);
         nh->set_total_slots(new_ts);
@@ -353,7 +352,7 @@ struct compact_ops {
                                 K suffix, BLD& bld) {
         unsigned entries = h->entries();
         unsigned ts = h->total_slots();
-        size_t hs = hdr_u64(node);
+        size_t hs = LEAF_HEADER_U64;
         K*   kd = keys(node, hs);
 
         const K* base = adaptive_search<K>::find_base(
@@ -376,8 +375,7 @@ struct compact_ops {
             size_t au64 = size_u64(new_ts, hs);
             uint64_t* nn = bld.alloc_node(au64, false);
             auto* nh = get_header(nn);
-            *nh = *h;
-            if (h->is_skip()) nn[1] = reinterpret_cast<const uint64_t*>(h)[1];
+            copy_leaf_header(node, nn);
             nh->set_entries(nc);
             nh->set_alloc_u64(au64);
             nh->set_total_slots(new_ts);

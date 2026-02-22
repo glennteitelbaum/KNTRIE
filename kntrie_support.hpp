@@ -20,7 +20,8 @@ namespace gteitelbaum {
 inline constexpr size_t BITMAP_256_U64 = 4;   // 32 bytes
 inline constexpr size_t COMPACT_MAX   = 4096;
 inline constexpr size_t BOT_LEAF_MAX  = 4096;
-inline constexpr size_t HEADER_U64    = 1;   // base header is 1 u64 (8 bytes), +1 if skip
+inline constexpr size_t HEADER_U64    = 1;   // bitmask node header is 1 u64 (8 bytes)
+inline constexpr size_t LEAF_HEADER_U64 = 3; // leaf header: [0]=hdr, [1]=fn_ptr, [2]=prefix
 
 // u64s needed for descendants count (single u64 at end of bitmask node)
 inline constexpr size_t desc_u64(size_t) noexcept { return 1; }
@@ -28,13 +29,8 @@ inline constexpr size_t desc_u64(size_t) noexcept { return 1; }
 // Tagged pointer: bit 63 = leaf (sign bit for fast test)
 static constexpr uint64_t LEAF_BIT = uint64_t(1) << 63;
 
-// ==========================================================================
-// NK narrowing: u64 → u32 → u16 → u8
-// ==========================================================================
-
-template<typename NK>
-using next_narrow_t = std::conditional_t<sizeof(NK) == 8, uint32_t,
-                      std::conditional_t<sizeof(NK) == 4, uint16_t, uint8_t>>;
+// (NK narrowing aliases removed — u64-everywhere: routing uses uint64_t,
+//  NK only at leaf storage boundary via nk_for_bits_t<BITS>)
 
 // ==========================================================================
 // Freelist size classes
@@ -179,21 +175,41 @@ inline const uint64_t* bm_to_node_const(uint64_t ptr) noexcept {
     return reinterpret_cast<const uint64_t*>(ptr) - 1;
 }
 
-// Dynamic header size: 1 (base) + 1 (if skip present)
-inline size_t hdr_u64(const uint64_t* n) noexcept {
-    return 1 + (get_header(n)->is_skip() ? 1 : 0);
+// Dynamic header size: only for bitmask nodes (always 1 u64).
+// Leaves always use LEAF_HEADER_U64 = 3.
+
+// ==========================================================================
+// Leaf node accessors for fn_ptr (node[1]) and prefix (node[2])
+// ==========================================================================
+
+inline const void* leaf_fn_raw(const uint64_t* node) noexcept {
+    return reinterpret_cast<const void*>(node[1]);
+}
+inline void set_leaf_fn_raw(uint64_t* node, const void* fn) noexcept {
+    node[1] = reinterpret_cast<uint64_t>(fn);
+}
+inline uint64_t leaf_prefix(const uint64_t* node) noexcept {
+    return node[2];
+}
+inline void set_leaf_prefix(uint64_t* node, uint64_t pfx) noexcept {
+    node[2] = pfx;
+}
+
+// Copy full leaf header (3 u64s) from src to dst
+inline void copy_leaf_header(const uint64_t* src, uint64_t* dst) noexcept {
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = src[2];
 }
 
 // ==========================================================================
 // Global sentinel -- zeroed block, valid as:
-//   - Leaf with suffix_type=0, entries=0 -> bitmap_find returns nullptr
+//   - Leaf with entries=0 -> find returns nullptr
 //   - Branchless miss target -> bitmap all zeros -> FAST_EXIT returns -1
-// Must be large enough for safe bitmap read: header(2) + bitmap(4) = 6 u64s.
 // ==========================================================================
 
-// Sentinel: just the LEAF_BIT tag with no address.
-// Any code entering a leaf path checks ptr == LEAF_BIT first.
-static constexpr uint64_t SENTINEL_TAGGED = LEAF_BIT;
+// Old SENTINEL_TAGGED removed — each kntrie_impl defines its own sentinel
+// with proper fn pointers for branchless dispatch.
 
 // ==========================================================================
 // Tagged pointer entry counting (NK-independent)
