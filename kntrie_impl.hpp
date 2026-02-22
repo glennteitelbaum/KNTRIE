@@ -176,11 +176,29 @@ private:
     const root_fn_t* root_fn_v;
     uint64_t  root_ptr_v;       // tagged child (SENTINEL, leaf, or bitmask)
     uint64_t  root_prefix_v;    // shared prefix bytes, left-aligned
+    uint64_t  begin_v;          // tagged ptr to min leaf
+    uint64_t  end_v;            // tagged ptr to max leaf
     size_t    size_v;
     BLD       bld_v;
 
     void set_root_skip(uint8_t skip) noexcept {
         root_fn_v = &ROOT_FNS[skip];
+    }
+
+    uint64_t refresh_begin() const noexcept {
+        if (root_ptr_v == BO::SENTINEL_TAGGED) return BO::SENTINEL_TAGGED;
+        const uint64_t* leaf = skip_switch([&]<int BITS>() -> const uint64_t* {
+            return OPS::template descend_min_leaf<BITS>(root_ptr_v);
+        });
+        return leaf ? tag_leaf(leaf) : BO::SENTINEL_TAGGED;
+    }
+
+    uint64_t refresh_end() const noexcept {
+        if (root_ptr_v == BO::SENTINEL_TAGGED) return BO::SENTINEL_TAGGED;
+        const uint64_t* leaf = skip_switch([&]<int BITS>() -> const uint64_t* {
+            return OPS::template descend_max_leaf<BITS>(root_ptr_v);
+        });
+        return leaf ? tag_leaf(leaf) : BO::SENTINEL_TAGGED;
     }
 
 public:
@@ -192,6 +210,8 @@ public:
         : root_fn_v(&SENTINEL_ROOT_FN),
           root_ptr_v(BO::SENTINEL_TAGGED),
           root_prefix_v(0),
+          begin_v(BO::SENTINEL_TAGGED),
+          end_v(BO::SENTINEL_TAGGED),
           size_v(0),
           bld_v() {}
 
@@ -204,11 +224,15 @@ public:
         : root_fn_v(o.root_fn_v),
           root_ptr_v(o.root_ptr_v),
           root_prefix_v(o.root_prefix_v),
+          begin_v(o.begin_v),
+          end_v(o.end_v),
           size_v(o.size_v),
           bld_v(std::move(o.bld_v)) {
         o.root_fn_v = &SENTINEL_ROOT_FN;
         o.root_ptr_v = BO::SENTINEL_TAGGED;
         o.root_prefix_v = 0;
+        o.begin_v = BO::SENTINEL_TAGGED;
+        o.end_v = BO::SENTINEL_TAGGED;
         o.size_v = 0;
     }
 
@@ -219,11 +243,15 @@ public:
             root_fn_v = o.root_fn_v;
             root_ptr_v = o.root_ptr_v;
             root_prefix_v = o.root_prefix_v;
+            begin_v = o.begin_v;
+            end_v = o.end_v;
             size_v = o.size_v;
             bld_v = std::move(o.bld_v);
             o.root_fn_v = &SENTINEL_ROOT_FN;
             o.root_ptr_v = BO::SENTINEL_TAGGED;
             o.root_prefix_v = 0;
+            o.begin_v = BO::SENTINEL_TAGGED;
+            o.end_v = BO::SENTINEL_TAGGED;
             o.size_v = 0;
         }
         return *this;
@@ -233,6 +261,8 @@ public:
         std::swap(root_fn_v, o.root_fn_v);
         std::swap(root_ptr_v, o.root_ptr_v);
         std::swap(root_prefix_v, o.root_prefix_v);
+        std::swap(begin_v, o.begin_v);
+        std::swap(end_v, o.end_v);
         std::swap(size_v, o.size_v);
         bld_v.swap(o.bld_v);
     }
@@ -245,6 +275,8 @@ public:
         remove_all();
         bld_v.drain();
         size_v = 0;
+        begin_v = BO::SENTINEL_TAGGED;
+        end_v = BO::SENTINEL_TAGGED;
     }
 
     // ==================================================================
@@ -282,6 +314,7 @@ public:
     // ==================================================================
 
     bool erase(const KEY& key) {
+        if (size_v == 0) return false;
         uint64_t ik = key_to_u64(key);
 
         // Check prefix
@@ -290,6 +323,13 @@ public:
             uint64_t mask = ~uint64_t(0) << (64 - 8 * skip);
             if ((ik ^ root_prefix_v) & mask) return false;
         }
+
+        // Capture begin/end state before mutation
+        const uint64_t* bl = untag_leaf(begin_v);
+        const uint64_t* el = untag_leaf(end_v);
+        uint64_t min_key = BO::leaf_fn(bl)->first(bl).key;
+        uint64_t max_key = BO::leaf_fn(el)->last(el).key;
+        bld_v.set_watches(bl, el);
 
         bool erased = skip_switch([&]<int BITS>() -> bool {
             auto r = OPS::template erase_node<BITS>(root_ptr_v, ik, bld_v);
@@ -304,8 +344,16 @@ public:
                 root_fn_v = &SENTINEL_ROOT_FN;
                 root_ptr_v = BO::SENTINEL_TAGGED;
                 root_prefix_v = 0;
+                begin_v = BO::SENTINEL_TAGGED;
+                end_v = BO::SENTINEL_TAGGED;
+            } else {
+                if (ik == min_key || bld_v.freed_a())
+                    begin_v = refresh_begin();
+                if (ik == max_key || bld_v.freed_b())
+                    end_v = refresh_end();
             }
         }
+        bld_v.clear_watches();
         return erased;
     }
 
@@ -378,22 +426,16 @@ public:
     }
 
     iter_result_t iter_first() const noexcept {
-        if (root_ptr_v == BO::SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
-        const uint64_t* leaf = skip_switch([&]<int BITS>() -> const uint64_t* {
-            return OPS::template descend_min_leaf<BITS>(root_ptr_v);
-        });
-        if (!leaf) return {KEY{}, VALUE{}, false};
+        if (begin_v == BO::SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
+        const uint64_t* leaf = untag_leaf(begin_v);
         auto r = BO::leaf_fn(leaf)->first(leaf);
         if (!r.found) return {KEY{}, VALUE{}, false};
         return to_iter_result(r);
     }
 
     iter_result_t iter_last() const noexcept {
-        if (root_ptr_v == BO::SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
-        const uint64_t* leaf = skip_switch([&]<int BITS>() -> const uint64_t* {
-            return OPS::template descend_max_leaf<BITS>(root_ptr_v);
-        });
-        if (!leaf) return {KEY{}, VALUE{}, false};
+        if (end_v == BO::SENTINEL_TAGGED) return {KEY{}, VALUE{}, false};
+        const uint64_t* leaf = untag_leaf(end_v);
         auto r = BO::leaf_fn(leaf)->last(leaf);
         if (!r.found) return {KEY{}, VALUE{}, false};
         return to_iter_result(r);
@@ -459,6 +501,17 @@ private:
             }
         }
 
+        // Capture begin/end state before mutation
+        bool is_first = (size_v == 0);
+        uint64_t min_key = 0, max_key = 0;
+        if (!is_first) {
+            const uint64_t* bl = untag_leaf(begin_v);
+            const uint64_t* el = untag_leaf(end_v);
+            min_key = BO::leaf_fn(bl)->first(bl).key;
+            max_key = BO::leaf_fn(el)->last(el).key;
+            bld_v.set_watches(bl, el);
+        }
+
         uint8_t skip = root_fn_v->skip;
 
         // Check prefix — find first divergence
@@ -466,7 +519,7 @@ private:
             uint64_t diff = ik ^ root_prefix_v;
             uint64_t mask = ~uint64_t(0) << (64 - 8 * skip);
             if (diff & mask) [[unlikely]] {
-                if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
+                if constexpr (!INSERT) { bld_v.destroy_value(sv); bld_v.clear_watches(); return {true, false}; }
                 int clz = std::countl_zero(diff & mask);
                 uint8_t div_pos = static_cast<uint8_t>(clz / 8);
                 reduce_root_skip(div_pos);
@@ -482,7 +535,21 @@ private:
             return r.inserted;
         });
 
-        if (did_insert) { ++size_v; return {true, true}; }
+        if (did_insert) {
+            ++size_v;
+            if (is_first) [[unlikely]] {
+                begin_v = refresh_begin();
+                end_v = refresh_end();
+            } else {
+                if (ik < min_key || bld_v.freed_a())
+                    begin_v = refresh_begin();
+                if (ik > max_key || bld_v.freed_b())
+                    end_v = refresh_end();
+            }
+            bld_v.clear_watches();
+            return {true, true};
+        }
+        bld_v.clear_watches();
         bld_v.destroy_value(sv);
         return {true, false};
     }
@@ -557,6 +624,8 @@ private:
         root_fn_v = &SENTINEL_ROOT_FN;
         root_ptr_v = BO::SENTINEL_TAGGED;
         root_prefix_v = 0;
+        begin_v = BO::SENTINEL_TAGGED;
+        end_v = BO::SENTINEL_TAGGED;
     }
 };
 

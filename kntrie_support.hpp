@@ -494,8 +494,26 @@ struct builder<VALUE, true, ALLOC> {
 
     // --- Return a node ---
     void dealloc_node(uint64_t* p, size_t u64_count) noexcept {
+        if (p == watch_a_v) freed_a_v = true;
+        if (p == watch_b_v) freed_b_v = true;
         alloc_v.deallocate(p, u64_count);
     }
+
+    // --- Watch: detect if begin/end leaf freed during mutation ---
+    const uint64_t* watch_a_v = nullptr;
+    const uint64_t* watch_b_v = nullptr;
+    bool freed_a_v = false;
+    bool freed_b_v = false;
+
+    void set_watches(const uint64_t* a, const uint64_t* b) noexcept {
+        watch_a_v = a; watch_b_v = b;
+        freed_a_v = false; freed_b_v = false;
+    }
+    void clear_watches() noexcept {
+        watch_a_v = nullptr; watch_b_v = nullptr;
+    }
+    bool freed_a() const noexcept { return freed_a_v; }
+    bool freed_b() const noexcept { return freed_b_v; }
 
     // --- drain: no-op, tree destructor frees nodes individually ---
     void drain() noexcept {}
@@ -545,6 +563,11 @@ struct builder<VALUE, false, ALLOC> {
 
     uint64_t* alloc_node(size_t& u64_count, bool pad = true) { return base_v.alloc_node(u64_count, pad); }
     void dealloc_node(uint64_t* p, size_t u64_count) noexcept { base_v.dealloc_node(p, u64_count); }
+
+    void set_watches(const uint64_t* a, const uint64_t* b) noexcept { base_v.set_watches(a, b); }
+    void clear_watches() noexcept { base_v.clear_watches(); }
+    bool freed_a() const noexcept { return base_v.freed_a_v; }
+    bool freed_b() const noexcept { return base_v.freed_b_v; }
 
     slot_type store_value(const VALUE& val) {
         if constexpr (VAL_U64 <= FREE_MAX) {
