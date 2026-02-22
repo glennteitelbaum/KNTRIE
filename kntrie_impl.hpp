@@ -55,12 +55,16 @@ private:
                                                  uint64_t ik) noexcept;
     using root_findleaf_fn_t = const uint64_t* (*)(uint64_t ptr, uint64_t prefix,
                                                     uint64_t ik) noexcept;
+    using root_iter_fn_t     = typename BO::leaf_result_t (*)(uint64_t ptr, uint64_t prefix,
+                                                               uint64_t ik) noexcept;
 
     struct root_fn_t {
         uint8_t             skip;
         root_find_fn_t      find;
         root_findleaf_fn_t  find_next;
         root_findleaf_fn_t  find_prev;
+        root_iter_fn_t      iter_next;
+        root_iter_fn_t      iter_prev;
     };
 
     // --- Sentinel root fn (empty trie) ---
@@ -70,9 +74,13 @@ private:
     static const uint64_t* sentinel_root_findleaf(uint64_t, uint64_t, uint64_t) noexcept {
         return nullptr;
     }
+    static typename BO::leaf_result_t sentinel_root_iter(uint64_t, uint64_t, uint64_t) noexcept {
+        return {0, nullptr, false};
+    }
 
     static inline const root_fn_t SENTINEL_ROOT_FN = {
         0, &sentinel_root_find, &sentinel_root_findleaf, &sentinel_root_findleaf,
+        &sentinel_root_iter, &sentinel_root_iter,
     };
 
     // --- Root find implementation ---
@@ -127,6 +135,46 @@ private:
         return OPS::template find_leaf_prev<BITS>(ptr, ik);
     }
 
+    // --- Root iter_next: find smallest entry with key > ik ---
+    template<int SKIP>
+    static typename BO::leaf_result_t root_iter_next_impl(
+            uint64_t ptr, uint64_t prefix, uint64_t ik) noexcept {
+        constexpr int BITS = KEY_BITS - 8 * SKIP;
+        if constexpr (SKIP > 0) {
+            constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
+            uint64_t diff = (ik ^ prefix) & MASK;
+            if (diff) [[unlikely]] {
+                int shift = std::countl_zero(diff) & ~7;
+                uint8_t kb = static_cast<uint8_t>(ik >> (56 - shift));
+                uint8_t pb = static_cast<uint8_t>(prefix >> (56 - shift));
+                if (kb < pb)
+                    return OPS::template descend_first<BITS>(ptr);
+                return {0, nullptr, false};
+            }
+        }
+        return OPS::template iter_next_tree<BITS>(ptr, ik);
+    }
+
+    // --- Root iter_prev: find largest entry with key < ik ---
+    template<int SKIP>
+    static typename BO::leaf_result_t root_iter_prev_impl(
+            uint64_t ptr, uint64_t prefix, uint64_t ik) noexcept {
+        constexpr int BITS = KEY_BITS - 8 * SKIP;
+        if constexpr (SKIP > 0) {
+            constexpr uint64_t MASK = ~uint64_t(0) << (64 - 8 * SKIP);
+            uint64_t diff = (ik ^ prefix) & MASK;
+            if (diff) [[unlikely]] {
+                int shift = std::countl_zero(diff) & ~7;
+                uint8_t kb = static_cast<uint8_t>(ik >> (56 - shift));
+                uint8_t pb = static_cast<uint8_t>(prefix >> (56 - shift));
+                if (kb > pb)
+                    return OPS::template descend_last<BITS>(ptr);
+                return {0, nullptr, false};
+            }
+        }
+        return OPS::template iter_prev_tree<BITS>(ptr, ik);
+    }
+
     // --- Build ROOT_FNS array ---
     template<size_t... Is>
     static constexpr auto make_root_fns(std::index_sequence<Is...>) {
@@ -136,6 +184,8 @@ private:
                 &root_find_impl<static_cast<int>(Is)>,
                 &root_find_next_impl<static_cast<int>(Is)>,
                 &root_find_prev_impl<static_cast<int>(Is)>,
+                &root_iter_next_impl<static_cast<int>(Is)>,
+                &root_iter_prev_impl<static_cast<int>(Is)>,
             }...
         };
     }
@@ -443,42 +493,16 @@ public:
 
     iter_result_t iter_next(KEY key) const noexcept {
         uint64_t ik = key_to_u64(key);
-        const uint64_t* leaf = root_fn_v->find_next(root_ptr_v, root_prefix_v, ik);
-        if (!leaf) return {KEY{}, VALUE{}, false};
-
-        auto r = BO::leaf_fn(leaf)->next(leaf, ik);
-        if (r.found) return to_iter_result(r);
-
-        // Leaf exhausted — step to next leaf
-        auto last = BO::leaf_fn(leaf)->last(leaf);
-        if (!last.found) return {KEY{}, VALUE{}, false};
-        uint64_t next_ik = last.key + (uint64_t(1) << (64 - KEY_BITS));
-        if (next_ik == 0) return {KEY{}, VALUE{}, false};  // wrapped
-        const uint64_t* next_leaf = root_fn_v->find_next(root_ptr_v, root_prefix_v, next_ik);
-        if (!next_leaf) return {KEY{}, VALUE{}, false};
-        auto r2 = BO::leaf_fn(next_leaf)->first(next_leaf);
-        if (!r2.found) return {KEY{}, VALUE{}, false};
-        return to_iter_result(r2);
+        auto r = root_fn_v->iter_next(root_ptr_v, root_prefix_v, ik);
+        if (!r.found) return {KEY{}, VALUE{}, false};
+        return to_iter_result(r);
     }
 
     iter_result_t iter_prev(KEY key) const noexcept {
         uint64_t ik = key_to_u64(key);
-        const uint64_t* leaf = root_fn_v->find_prev(root_ptr_v, root_prefix_v, ik);
-        if (!leaf) return {KEY{}, VALUE{}, false};
-
-        auto r = BO::leaf_fn(leaf)->prev(leaf, ik);
-        if (r.found) return to_iter_result(r);
-
-        // Leaf exhausted — step to prev leaf
-        auto first = BO::leaf_fn(leaf)->first(leaf);
-        if (!first.found) return {KEY{}, VALUE{}, false};
-        uint64_t prev_ik = first.key - (uint64_t(1) << (64 - KEY_BITS));
-        if (prev_ik > first.key) return {KEY{}, VALUE{}, false};  // underflow
-        const uint64_t* prev_leaf = root_fn_v->find_prev(root_ptr_v, root_prefix_v, prev_ik);
-        if (!prev_leaf) return {KEY{}, VALUE{}, false};
-        auto r2 = BO::leaf_fn(prev_leaf)->last(prev_leaf);
-        if (!r2.found) return {KEY{}, VALUE{}, false};
-        return to_iter_result(r2);
+        auto r = root_fn_v->iter_prev(root_ptr_v, root_prefix_v, ik);
+        if (!r.found) return {KEY{}, VALUE{}, false};
+        return to_iter_result(r);
     }
 
 private:
@@ -491,14 +515,13 @@ private:
         uint64_t ik = key_to_u64(key);
         VST sv = bld_v.store_value(value);
 
-        // First insert: establish max skip prefix
-        if constexpr (MAX_ROOT_SKIP > 0) {
-            if (size_v == 0) [[unlikely]] {
-                if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
-                set_root_skip(MAX_ROOT_SKIP);
+        // First insert: establish root fn and optional prefix
+        if (size_v == 0) [[unlikely]] {
+            if constexpr (!INSERT) { bld_v.destroy_value(sv); return {true, false}; }
+            set_root_skip(MAX_ROOT_SKIP);
+            if constexpr (MAX_ROOT_SKIP > 0)
                 root_prefix_v = ik;
-                // Fall through to normal insert
-            }
+            // Fall through to normal insert
         }
 
         // Capture begin/end state before mutation
